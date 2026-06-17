@@ -111,6 +111,42 @@ pub struct AggregatedStatus {
     pub internal_providers: BTreeMap<String, ProviderDetail>,
 }
 
+// ── /api/v1/scoring (public roster — Flow A projection) ──────────────────────
+/// One opted-in agent in the public scoring roster. The consent-gated
+/// projection of that agent's `capacity:*` `scores` rows (design §3).
+#[derive(Serialize, Clone)]
+pub struct RosterEntry {
+    pub key_id: String,
+    /// `capacity:composite` (𝒞_CIRIS).
+    pub capacity_composite: Option<f64>,
+    /// The five factors, if requested / available.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub factors: BTreeMap<String, f64>,
+    /// Freshness — the earliest `valid_until` across the rows behind this entry.
+    pub valid_until: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct Roster {
+    pub timestamp: String,
+    /// `consent` / `public_sample` — which projection tier this is.
+    pub projection: String,
+    pub agents: Vec<RosterEntry>,
+}
+
+// ── /api/v1/scoring/live + /api/v1/status/live (SSE/WS push payloads) ─────────
+/// A live delta pushed over the websocket/SSE socket: the current roster +
+/// aggregated service-health snapshot (design §3 "extra website sockets").
+#[derive(Serialize, Clone)]
+pub struct LiveDelta {
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roster: Option<Roster>,
+    /// Aggregated `operational|degraded|outage` overall string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overall: Option<String>,
+}
+
 // ── /api/v1/status/history ───────────────────────────────────────────────────
 #[derive(Serialize, Clone)]
 pub struct ServiceUptime {

@@ -17,6 +17,29 @@ Drop-in for the Lens nginx route (`agents.ciris.ai/lens/api/…` → this servic
 | `GET /v1/status` | Local providers (postgresql + grafana), live, only if configured |
 | `GET /api/v1/status` | Aggregated multi-region: regions (billing/proxy), infrastructure (Vultr/Hetzner/GHCR), LLM/auth/database/internal provider buckets — all live |
 | `GET /api/v1/status/history?days=&region=` | Daily uptime rollup from SQLite. `days` 1–365 (default 30), `region` ∈ `us\|eu\|global` |
+| `GET /api/v1/scoring` | **Public scoring roster** (Flow A): opted-in agents `{key_id, capacity_composite, factors?, valid_until}`, consent-gated. Replaces lens-python's scoring feed. Served from cache (empty in the default build; populated when run as a fabric node). |
+| `GET /api/v1/scoring/live`, `GET /api/v1/status/live` | **SSE** live-push of roster + overall-health deltas (the "extra website sockets"). |
+| `GET /api/v1/status/ws` | **WebSocket** variant of the same live-push. |
+
+### Fabric node (monitoring cards — `--features fabric`)
+
+The default build is the cost-safe outbound prober + SQLite uptime + the website
+sockets (roster served from cache). Built with `cargo build --features fabric`
+and configured (see `.env.example`), ciris-status becomes **Node B** of
+`FSD/MONITORING_NODE_DESIGN.md`:
+
+- **Flow B** — each poll, probe results become a signed CEG `scores` attestation
+  on dimension `health:liveness:v1` (`witness_relation: external`,
+  operational/degraded/outage → `+1/0/-1`), per keyed CIRIS service. Non-keyed
+  infra (LLM/search providers, regions) folds in as `evidence_refs`, not as
+  separate subjects. Hybrid-signed (Ed25519 + ML-DSA-65) via persist v8.4.0 /
+  verify v5.10.0 and written with `FederationDirectory::put_attestation`.
+- **Flow A** — reads `capacity:*` `scores` from the corpus (public-tier
+  `CallerScope::Unauthenticated`, i.e. the consent / `public_sample` projection)
+  and projects the roster `/api/v1/scoring` serves.
+
+Cost discipline is unchanged: Flow B reuses the same aggregated probe and never
+authed-probes paid providers in the loop.
 
 Response shapes match the Lens API field-for-field (status strings
 `operational\|degraded\|outage`; aggregate overall
