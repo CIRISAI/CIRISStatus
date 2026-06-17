@@ -22,8 +22,12 @@ default = []
 #     attestations into the federation directory (persist + verify hybrid sign).
 #   * Flow A — READ `capacity:*` / `system:*` signed `scores` from the corpus and
 #     project the consent-gated public roster.
+#   * Self-registration of Node B's own witness key + (config-gated) peer key A
+#     + a directed `consent:replication:v1` grant, and bidirectional A<->B
+#     anti-entropy replication of `Attestation`-kind envelopes via ciris-edge's
+#     `ReplicationRuntime` over the lightweight HTTP transport.
 # Pulled in only under this feature so the default status-page build is unaffected.
-fabric = ["dep:ciris-persist", "dep:ciris-verify-core", "dep:ciris-keyring", "dep:hex", "dep:base64", "dep:sha2"]
+fabric = ["dep:ciris-persist", "dep:ciris-verify-core", "dep:ciris-keyring", "dep:ciris-edge", "dep:hex", "dep:base64", "dep:sha2"]
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
@@ -51,9 +55,20 @@ anyhow = "1"
 #   - verify::canonicalize_envelope_for_signing   (JCS RFC 8785, CEG §0.9)
 #   - FederationDirectory::put_attestation         (Flow B emit)
 #   - ReadEngine::list_attestations(dimension_prefixes, valid_at, scope) (Flow A)
-ciris-persist     = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v8.6.0", features = ["sqlite"], optional = true }
+ciris-persist     = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v8.8.0", features = ["sqlite"], optional = true }
 ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.11.0", optional = true }
 ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.11.0", version = "5", features = ["software", "pqc-ml-dsa"], optional = true }
+# ciris-edge — the federation REPLICATION spine (Round 2). Pinned byte-for-byte
+# to CIRISServer/Cargo.lock (edge v4.5.0, rev 86eb59c) so Node A and Node B share
+# one edge ABI; this edge pins persist v8.6.0 (== our pin above) so the graph
+# carries a SINGLE ciris-persist. `transport-http` is chosen over
+# `transport-reticulum`: Node B is an out-of-group external MONITOR — a lighter
+# transport (no Reticulum/Leviculum stack, no RNS identity, no announce loop) is
+# the right least-privilege footprint, and the consent-attestation wire contract
+# is transport-agnostic so HTTP interops with A's Reticulum plane through any
+# bridge. `ReplicationRuntime` (the API used) is compiled unconditionally — the
+# feature only selects which `Transport` impl links.
+ciris-edge        = { git = "https://github.com/CIRISAI/CIRISEdge", tag = "v4.5.1", features = ["transport-http"], optional = true }
 hex               = { version = "0.4", optional = true }
 base64            = { version = "0.22", optional = true }
 sha2              = { version = "0.10", optional = true }

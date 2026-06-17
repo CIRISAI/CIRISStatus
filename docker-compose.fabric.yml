@@ -1,8 +1,8 @@
 # Node B — ciris-status as a fabric monitoring node (FSD/MONITORING_NODE_DESIGN.md §5).
 #
 # Runs the `--features fabric` image: Flow A reads `capacity:*` signed `scores`
-# from ciris-server's corpus and projects the public roster; Flow B probes
-# off-fabric infra and emits signed `health:liveness` attestations back into the
+# from Node B's OWN corpus and projects the public roster; Flow B probes
+# off-fabric infra and emits signed `health:liveness` attestations into that same
 # corpus. Serves the website surface (`/api/v1/scoring`, SSE/WS, status, history)
 # that ciris.ai consumes.
 #
@@ -10,11 +10,11 @@
 #   1. copy .env.example → .env and fill the STATUS_* fabric vars (see DEPLOY.md)
 #   2. docker compose -f docker-compose.fabric.yml up -d
 #
-# The corpus is SHARED with Node A (ciris-server). In the canonical topology Node
-# A owns the corpus and Node B reads/writes it via STATUS_CORPUS_DSN. Mount it
-# read-write (Flow B emits health:liveness). If Node A runs on a different host,
-# point STATUS_CORPUS_DSN at the replicated/networked corpus instead of a bind
-# mount.
+# Round-2 topology: Node B owns its OWN corpus (a B-local file, NOT a shared DB
+# with Node A). Node A's `capacity:*` data arrives by ANTI-ENTROPY REPLICATION
+# over the federation transport, authorized by a DIRECTED consent grant + mutual
+# key registration — NOT by mounting A's database. Set the STATUS_PEER_A_* vars
+# to enable the peer leg; without them B runs solo (self-attests, no replication).
 
 services:
   ciris-status:
@@ -30,6 +30,8 @@ services:
     # Bind to the host loopback; nginx/Caddy terminates TLS and proxies in.
     ports:
       - "127.0.0.1:8200:8200"
+      # Node B's replication intake (/edge/inbound) — where Node A pushes frames.
+      - "${STATUS_REPLICATION_PORT:-8201}:8201"
     env_file:
       - .env
     environment:
@@ -39,18 +41,27 @@ services:
       # ── Fabric node (Node B) — REQUIRED for the fabric flows ──────────────
       # All of these must be set or the flows stay disabled (binary runs as the
       # plain prober; roster stays empty). See DEPLOY.md for the full reference.
-      STATUS_CORPUS_DSN: ${STATUS_CORPUS_DSN:?set the shared ciris-server corpus DSN}
+      # Node B's OWN corpus — a B-local file, distinct from Node A's. A's data
+      # arrives by replication, not by sharing this file.
+      STATUS_CORPUS_DSN: ${STATUS_CORPUS_DSN:-sqlite:///corpus/corpus.db}
       STATUS_NODE_KEY_ID: ${STATUS_NODE_KEY_ID:?set the node Ed25519 key_id}
       STATUS_NODE_KEY_PATH: /secrets/ed25519.seed
       STATUS_NODE_PQC_KEY_ID: ${STATUS_NODE_PQC_KEY_ID:?set the node ML-DSA key_id}
       STATUS_NODE_PQC_KEY_PATH: /secrets/mldsa65.seed
       # region-key → keyed CIRIS service node key_id (providers fold in as evidence)
       STATUS_SERVICE_KEYS: ${STATUS_SERVICE_KEYS:-}
+      # ── Round-2 federation peer (Node A) — OPTIONAL; enables replication ──────
+      STATUS_PEER_A_KEY_ID: ${STATUS_PEER_A_KEY_ID:-}
+      # v8.8.0 §5.6.8.15: A's OWN self-signed SignedKeyRecord (serde_json), not
+      # raw pubkeys — the admission gate verifies A's proof-of-possession.
+      STATUS_PEER_A_KEY_RECORD: ${STATUS_PEER_A_KEY_RECORD:-}
+      STATUS_PEER_A_INBOUND_URL: ${STATUS_PEER_A_INBOUND_URL:-}
+      STATUS_REPLICATION_LISTEN: 0.0.0.0:8201
     volumes:
       # Uptime history DB (Node B's own SQLite, NOT the corpus).
       - status-data:/data
-      # The shared fabric corpus (Node A's). Adjust the host path / DSN to your
-      # deployment; STATUS_CORPUS_DSN must resolve INSIDE the container.
+      # Node B's OWN fabric corpus (distinct from Node A's). STATUS_CORPUS_DSN
+      # must resolve INSIDE the container (default: /corpus/corpus.db).
       - ${CIRIS_CORPUS_HOST_PATH:-./corpus}:/corpus
       # Node identity seeds (ed25519 + ml-dsa-65, 32 raw bytes each, chmod 600).
       - ${CIRIS_STATUS_SECRETS:-./secrets}:/secrets:ro
