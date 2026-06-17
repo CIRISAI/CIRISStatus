@@ -1,7 +1,11 @@
 name: CI
 
-# fmt + clippy(-D warnings) + build + test. Single Linux target — this is a
-# server-side service (no cross-platform wheel/binary matrix).
+# fmt + clippy(-D warnings) + build + test, for BOTH build modes:
+#   * default      — the cost-safe prober + uptime + sockets (self-contained).
+#   * fabric       — Node B: links the persist/verify substrate (Flow A/B). This
+#                    is the only build that serves real mesh data, so it is the
+#                    load-bearing lane — it needs the substrate build deps.
+# Single Linux target — this is a server-side service (no wheel/binary matrix).
 
 on:
   push:
@@ -23,9 +27,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
         run: cargo fmt --check
-      - name: clippy
+      - name: clippy (default)
         run: cargo clippy --all-targets -- -D warnings
-      - name: build
+      - name: build (default)
         run: cargo build --release
-      - name: test
+      - name: test (default)
         run: cargo test
+
+  fabric:
+    name: build + test (--features fabric)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install substrate build deps
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fabric
+      - name: clippy (fabric)
+        run: cargo clippy --all-targets --features fabric -- -D warnings
+      - name: build (fabric, release)
+        run: cargo build --release --features fabric
+      - name: test (fabric) — Flow A real-data + Flow B sign proofs
+        run: cargo test --features fabric

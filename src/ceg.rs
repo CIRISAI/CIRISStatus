@@ -306,3 +306,126 @@ mod tests {
         assert!(v["valid_until"].is_string());
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Flow B — REAL probe→emit sign path proof.
+//
+// Builds a `LivenessEnvelope`, JCS-canonicalizes it with persist's OWN
+// canonicalizer (`canonicalize_envelope_for_signing`, the exact signing basis),
+// computes the SHA-256 content hash, and HYBRID-SIGNS the canonical bytes via a
+// real `LocalSigner` (Ed25519 + ML-DSA-65 software, loaded from seed files the
+// way production does). This proves the probe→signed-`health:liveness` pipeline
+// up to a verifiable hybrid signature — the prompt's Flow B bar ("construct +
+// sign the attestation"). The dimension carries the mandatory `:v1` segment so
+// it would survive persist's admission gate.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(all(test, feature = "fabric"))]
+mod flow_b_sign {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use ciris_persist::prelude::{
+        canonicalize_envelope_for_signing, Engine, LocalSigner, LocalSignerConfig,
+    };
+    use sha2::{Digest, Sha256};
+
+    /// Temp seed-file dir (32-byte raw seeds for Ed25519 + ML-DSA-65).
+    struct SeedDir {
+        dir: std::path::PathBuf,
+    }
+    impl SeedDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("ciris-status-ceg-seed-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            SeedDir { dir }
+        }
+        fn seed(&self, name: &str, b: [u8; 32]) -> std::path::PathBuf {
+            let p = self.dir.join(name);
+            std::fs::write(&p, b).unwrap();
+            p
+        }
+    }
+    impl Drop for SeedDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn sample_env() -> LivenessEnvelope {
+        LivenessEnvelope {
+            attested_key_id: "k_service_us".into(),
+            score: liveness_score(crate::model::OPERATIONAL),
+            confidence: 0.9,
+            context: "US (Chicago) — region us".into(),
+            evidence: vec![EvidenceRef {
+                ref_id: "provider:openrouter".into(),
+                status: "operational".into(),
+                latency_ms: Some(120),
+                detail: None,
+            }],
+            valid_until: chrono::Utc::now() + chrono::Duration::seconds(60),
+            asserted_at: chrono::Utc::now(),
+            epistemic_mode: EpistemicMode::Derivative,
+        }
+    }
+
+    #[tokio::test]
+    async fn liveness_envelope_canonicalizes_and_hybrid_signs() {
+        let seeds = SeedDir::new();
+        let ed = seeds.seed("ed.seed", [0x42; 32]);
+        let pqc = seeds.seed("pqc.seed", [0x77; 32]);
+
+        let signer = std::sync::Arc::new(
+            LocalSigner::from_config(&LocalSignerConfig {
+                key_id: "ciris-status-monitor".into(),
+                key_path: ed,
+                pqc_key_id: Some("ciris-status-monitor-pqc".into()),
+                pqc_key_path: Some(pqc),
+            })
+            .expect("LocalSigner::from_config with PQC"),
+        );
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("Engine::with_signer");
+
+        let env = sample_env();
+        let envelope = env.to_envelope();
+        assert_eq!(envelope["dimension"], DIMENSION); // health:liveness:v1
+
+        // The EXACT signing basis: persist's JCS canonicalizer (CEG §0.9).
+        let canonical =
+            canonicalize_envelope_for_signing(&envelope).expect("canonicalize envelope");
+        assert!(!canonical.is_empty());
+
+        // Content hash anchor (what emit_liveness records as original_content_hash).
+        let content_hash = hex::encode(Sha256::digest(&canonical));
+        assert_eq!(content_hash.len(), 64, "SHA-256 hex");
+
+        // Hybrid sign the canonical bytes — Ed25519 + ML-DSA-65.
+        let sig = engine
+            .sign_hybrid(&canonical)
+            .await
+            .expect("hybrid-sign canonical envelope");
+        assert!(!sig.classical.signature.is_empty(), "Ed25519 half present");
+        assert!(!sig.pqc.signature.is_empty(), "ML-DSA-65 half present");
+        // Both halves base64-encode (the shape ceg::emit stores).
+        assert!(!B64.encode(&sig.classical.signature).is_empty());
+        assert!(!B64.encode(&sig.pqc.signature).is_empty());
+
+        // The signer alias is the attesting key_id ceg::emit stamps.
+        assert_eq!(engine.signer().current_alias(), "ciris-status-monitor");
+    }
+
+    #[tokio::test]
+    async fn degraded_and_outage_map_to_zero_and_negative() {
+        // Cost-safe: pure construction, no probe, no network.
+        let mut env = sample_env();
+        env.score = liveness_score(crate::model::DEGRADED);
+        assert_eq!(env.to_envelope()["score"], 0.0);
+        env.score = liveness_score(crate::model::OUTAGE);
+        assert_eq!(env.to_envelope()["score"], -1.0);
+    }
+}

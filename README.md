@@ -98,6 +98,19 @@ STATUS_LISTEN_ADDR=127.0.0.1:8200 STATUS_DB_PATH=/var/lib/ciris-status/status.db
 
 ## Deploy (replacing the Lens API container)
 
+**Node B (the fabric monitoring node) — see [`DEPLOY.md`](DEPLOY.md)** for the
+full runbook: the GHCR image, `docker-compose.fabric.yml`, the env reference, the
+lens→status cutover ordering, and the DNS/Caddy/nginx routing. The release
+workflow publishes `ghcr.io/cirisai/cirisstatus:<vTAG>` (fabric, serves real
+data) and `:<vTAG>-status` (default prober) on a `v*` tag.
+
+Quick local build of the two images:
+
+```sh
+docker build --build-arg FEATURES=fabric -t ciris-status:fabric .   # Node B
+docker build -t ciris-status:status .                               # prober only
+```
+
 Build the image and point the existing nginx `location /lens/api/` upstream at it
 (it listens on the same `:8200`). See `Dockerfile`. The nginx mapping is unchanged:
 

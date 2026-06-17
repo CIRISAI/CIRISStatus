@@ -1,0 +1,215 @@
+name: Release
+
+# On a `v*` tag: build + publish the ciris-status container image to GHCR (the
+# "blessed release" the CIRISBridge ansible role stands Node B up from), plus a
+# stripped x86_64 + aarch64 binary attached to the GitHub Release.
+#
+# The image is built with `--features fabric` (Node B — the only build that
+# serves real mesh data). A second `:status` tag is the default-feature
+# status-page-only build for deployments that just want the prober.
+#
+# Mirrors CIRISServer's release patterns: native x86_64 + aarch64 runners (the
+# TPM/keyring backend can't cross-compile, so aarch64 builds NATIVELY on an ARM
+# runner), allow-fail on the hard lanes so they never block the release.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/${{ github.repository }}
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write   # Sigstore keyless signing
+
+jobs:
+  # ── Container image → GHCR (the bridge's contract) ──────────────────────────
+  image:
+    name: Image (${{ matrix.platform }}, ${{ matrix.variant }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Node B (fabric) — the real monitoring node. amd64 native.
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            features: fabric
+            variant: fabric
+            suffix: ""
+          # Node B (fabric) — arm64 native (TPM/keyring backend needs a native
+          # libtss2; cross from amd64 has no target lib). Allowed to fail so it
+          # never blocks the amd64 release.
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            features: fabric
+            variant: fabric
+            suffix: ""
+            allow_fail: true
+          # Default status-page-only build (no substrate) — amd64.
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            features: ""
+            variant: status
+            suffix: "-status"
+    continue-on-error: ${{ matrix.allow_fail || false }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute platform tag
+        id: tag
+        shell: bash
+        run: |
+          ARCH="${{ matrix.platform }}"; ARCH="${ARCH##*/}"
+          echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+
+      - name: Build + push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          build-args: |
+            FEATURES=${{ matrix.features }}
+          # Per-arch, per-variant tag. A `manifest` job (below) stitches the
+          # fabric arches into the canonical multi-arch tags.
+          tags: |
+            ${{ env.IMAGE }}:${{ github.ref_name }}${{ matrix.suffix }}-${{ steps.tag.outputs.arch }}
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ steps.tag.outputs.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ steps.tag.outputs.arch }}
+
+  # ── Multi-arch manifest for the fabric (Node B) image ───────────────────────
+  manifest:
+    name: Multi-arch manifest (fabric)
+    needs: [image]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create + push manifest list
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          # amd64 always built; arm64 is allow-fail — include it only if present.
+          SRCS="${IMAGE}:${TAG}-amd64"
+          if docker manifest inspect "${IMAGE}:${TAG}-arm64" >/dev/null 2>&1; then
+            SRCS="$SRCS ${IMAGE}:${TAG}-arm64"
+          fi
+          for t in "${IMAGE}:${TAG}" "${IMAGE}:latest"; do
+            docker buildx imagetools create -t "$t" $SRCS
+          done
+          # Status-only image (amd64) gets its own tags.
+          docker buildx imagetools create \
+            -t "${IMAGE}:${TAG}-status" -t "${IMAGE}:status" \
+            "${IMAGE}:${TAG}-status-amd64"
+
+  # ── Stripped binaries → GitHub Release ──────────────────────────────────────
+  binaries:
+    name: Binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow_fail || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # aarch64 builds natively (TPM backend has no cross target lib).
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            allow_fail: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install build deps (substrate fabric feature)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+        with:
+          key: release-${{ matrix.target }}-${{ github.ref_name }}
+      - name: Build (fabric, release)
+        run: cargo build --release --locked --features fabric --target ${{ matrix.target }}
+      - name: Stage + strip
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/ciris-status
+          strip "$BIN" || true
+          mkdir -p stage && cp "$BIN" stage/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-status-${{ matrix.target }}
+          path: stage/
+          if-no-files-found: error
+
+  create-release:
+    name: Create Release
+    needs: [binaries]
+    # Run as long as the build stage finished (not cancelled) — the allow-fail
+    # aarch64 lane must not skip the release; it ships whatever built.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Package + checksum
+        run: |
+          mkdir -p release
+          for dir in artifacts/ciris-status-*; do
+            [ -d "$dir" ] || continue
+            target=$(basename "$dir" | sed 's/ciris-status-//')
+            tar -czvf "release/ciris-status-${{ github.ref_name }}-${target}.tar.gz" -C "$dir" .
+          done
+          cd release && sha256sum *.tar.gz > SHA256SUMS || true
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Sign artifacts (Sigstore keyless)
+        run: |
+          cd release
+          for f in *.tar.gz SHA256SUMS; do
+            [ -f "$f" ] || continue
+            cosign sign-blob --yes --output-signature "$f.sig" --output-certificate "$f.pem" "$f"
+          done
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          body: |
+            ## ciris-status ${{ github.ref_name }}
+
+            **Container images (GHCR):**
+            - `ghcr.io/${{ github.repository }}:${{ github.ref_name }}` — Node B (fabric; serves real mesh data)
+            - `ghcr.io/${{ github.repository }}:${{ github.ref_name }}-status` — status-page-only (default build)
+
+            Deploy with `docker-compose.fabric.yml`; see `DEPLOY.md` for the cutover runbook.
+          files: |
+            release/*.tar.gz
+            release/*.tar.gz.sig
+            release/*.tar.gz.pem
+            release/SHA256SUMS
+            release/SHA256SUMS.sig
+            release/SHA256SUMS.pem
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}

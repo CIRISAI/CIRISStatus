@@ -391,9 +391,8 @@ mod fabric {
         };
         tracing::info!(dsn = %redact(&cfg.dsn), "fabric: Node B flows online");
 
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(
-            state.cfg.poll_seconds,
-        ));
+        let mut tick =
+            tokio::time::interval(std::time::Duration::from_secs(state.cfg.poll_seconds));
         // Both flows go through the SQLite backend handle: it implements
         // ReadEngine (Flow A) AND FederationDirectory (Flow B); `Engine` itself
         // implements neither directly.
@@ -463,7 +462,11 @@ mod fabric {
                 });
             }
             // Non-keyed cross-region infra folded as evidence (not its own subject).
-            for (name, d) in agg.llm_providers.iter().chain(agg.internal_providers.iter()) {
+            for (name, d) in agg
+                .llm_providers
+                .iter()
+                .chain(agg.internal_providers.iter())
+            {
                 evidence.push(EvidenceRef {
                     ref_id: format!("provider:{name}"),
                     status: d.status.clone(),
@@ -493,7 +496,9 @@ mod fabric {
                     content_hash = %hash,
                     "flow B: emitted signed health:liveness"
                 ),
-                Err(e) => tracing::warn!(error = %e, service = %service_key_id, "flow B emit failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, service = %service_key_id, "flow B emit failed")
+                }
             }
         }
     }
