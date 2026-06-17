@@ -19,7 +19,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  IMAGE: ghcr.io/${{ github.repository }}
+  # GHCR/Docker require a lowercase repository name; `github.repository` is
+  # mixed-case (CIRISAI/CIRISStatus) → "invalid reference format". Hardcode the
+  # lowercase canonical (the repo name is stable).
+  IMAGE: ghcr.io/cirisai/cirisstatus
 
 permissions:
   contents: write
@@ -200,8 +203,8 @@ jobs:
             ## ciris-status ${{ github.ref_name }}
 
             **Container images (GHCR):**
-            - `ghcr.io/${{ github.repository }}:${{ github.ref_name }}` — Node B (fabric; serves real mesh data)
-            - `ghcr.io/${{ github.repository }}:${{ github.ref_name }}-status` — status-page-only (default build)
+            - `ghcr.io/cirisai/cirisstatus:${{ github.ref_name }}` — Node B (fabric; serves real mesh data)
+            - `ghcr.io/cirisai/cirisstatus:${{ github.ref_name }}-status` — status-page-only (default build)
 
             Deploy with `docker-compose.fabric.yml`; see `DEPLOY.md` for the cutover runbook.
           files: |
