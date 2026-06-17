@@ -127,8 +127,25 @@ ciris-status renders **no UI**; ciris.ai (or Portal) renders over these.
 
 Topology: both are `ciris-canonical` fabric nodes; Node B reads the mesh Node A
 (and others) populate and probes Node A's `/health` like any target. nginx
-routes `ciris.ai/...` public surface → Node B; the keyed lens read/DSAR surface
-→ Node A.
+routes `ciris.ai/...` public surface → Node B; the keyed lens reads → Node A.
+
+### 5.1 GDPR erasure routing — two entry points (AND), one mechanism
+
+Right-to-be-forgotten reaches the §19.7 hard-delete by **both** paths (not
+either/or). The fabric *performs* erasure but exposes no public hook for it:
+
+1. **DSAR endpoint on the monitor node (Node B).** The public, key-scoped,
+   hybrid-signed `dsar/delete` request (CIRISLens `accord_api.py` shape — *only
+   content signed by the requesting key is deleted*) is surfaced **here**, on the
+   public window, and drives Node A's erasure. It is **not** a fabric public hook.
+2. **In-app, CEG-native** (the fabric app, CIRISServer#15/#9 `auth::erasure`).
+   The data subject (or their agent delegate) emits a signed `withdraws`/
+   revocation against their own content; the substrate honours it via the same
+   §19.7 descent (`Engine::evict_actor`).
+
+Both collapse to one substrate mechanism (revocation → hard delete → below the
+recoverability floor), proven by the noise-floor demonstration (CIRISServer#14,
+`tests/noise_floor.rs`).
 
 ## 6. Ship sequence + gates (honest about blockers)
 
