@@ -31,7 +31,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tokio-stream = { version = "0.1", features = ["sync"] }
 # rustls (not openssl) so the binary is self-contained and cross-builds cleanly.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# Pinned to 0.31 to match ciris-persist v8.4.0 (both declare `links = "sqlite3"`,
+# Pinned to 0.31 to match ciris-persist v8.6.0 (both declare `links = "sqlite3"`,
 # so cargo requires a single libsqlite3-sys across the graph under `fabric`).
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -45,15 +45,15 @@ anyhow = "1"
 
 # ── Fabric substrate (only under the `fabric` feature) ───────────────────────
 # Pinned byte-for-byte to CIRISServer's Cargo.toml floor:
-#   persist v8.4.0 / edge v4.3.0 / verify-family v5.10.0 (CEG 1.0-RC12).
+#   persist v8.6.0 / edge v4.3.0 / verify-family v5.11.0 (CEG 1.0-RC12).
 # These give us the signed `scores` emit + read primitives:
 #   - Engine::with_signer / sign_hybrid           (hybrid Ed25519 + ML-DSA-65)
 #   - verify::canonicalize_envelope_for_signing   (JCS RFC 8785, CEG §0.9)
 #   - FederationDirectory::put_attestation         (Flow B emit)
 #   - ReadEngine::list_attestations(dimension_prefixes, valid_at, scope) (Flow A)
-ciris-persist     = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v8.4.0", features = ["sqlite"], optional = true }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.10.0", optional = true }
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.10.0", version = "5", features = ["software", "pqc-ml-dsa"], optional = true }
+ciris-persist     = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v8.6.0", features = ["sqlite"], optional = true }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.11.0", optional = true }
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.11.0", version = "5", features = ["software", "pqc-ml-dsa"], optional = true }
 hex               = { version = "0.4", optional = true }
 base64            = { version = "0.22", optional = true }
 sha2              = { version = "0.10", optional = true }
