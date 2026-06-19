@@ -39,12 +39,18 @@ RUN cargo build --release --locked \
 
 # ── runtime stage (slim) ─────────────────────────────────────────────────────
 FROM debian:bookworm-slim
-# Runtime libs: ca-certificates for outbound TLS probes; curl for HEALTHCHECK.
-# The binary statically links sqlite (`rusqlite/bundled`) and the keyring/TPM
-# backend — `ldd` shows NO libtss2/libsqlite3 dynamic dependency — so the runtime
-# stage stays minimal.
+# Runtime libs:
+#   - ca-certificates: outbound TLS probes; curl: HEALTHCHECK.
+#   - libtss2-esys + tctildr: ciris-keyring's TPM backend (tss-esapi) links
+#     `libtss2-esys.so.0` DYNAMICALLY — it is NOT static (the old comment claiming
+#     so was wrong; the slim image crash-looped on `libtss2-esys.so.0: cannot open
+#     shared object file`, CIRISServer#28). The lib must be present even with no TPM
+#     (the dynamic link resolves at load; the backend then degrades to the software
+#     keystore). sqlite IS static (`rusqlite/bundled`), so no libsqlite3 needed.
+#   (Structural alternative — build this image FROM a published ciris-server base so
+#    the substrate runtime libs inherit cleanly — is tracked as CIRISServer#28.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl \
+        ca-certificates curl libtss2-esys-3.0.2-0 libtss2-tctildr0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /ciris-status /usr/local/bin/ciris-status
