@@ -1,15 +1,20 @@
-# Deploying ciris-status — Node B (the public scoring-feed monitor node)
+# Deploying ciris-status — a ciris-server node + the StatusAdapter
 
 This is the operator runbook for standing up **Node B** of
-`FSD/MONITORING_NODE_DESIGN.md`: ciris-status built `--features fabric`, the
-lens-python scoring-feed replacement. It reads `capacity:*` signed `scores` from
-ciris-server's corpus (Flow A) and emits signed `health:liveness` (Flow B), and
-serves the public website surface ciris.ai consumes.
+`FSD/MONITORING_NODE_DESIGN.md`. ciris-status is now **a `ciris-server` fabric
+node + a `StatusAdapter`** (not a parallel federation impl): the whole node —
+identity, the OWN local corpus, `consent:replication` peering, A↔B replication,
+the read API — is `ciris-server`'s `serve_with_adapter`; the status page is the
+adapter. Node B owns its **OWN local corpus**: Flow A reads `capacity:*` signed
+`scores` from **B's own corpus** and Flow B emits signed `health:liveness` into
+it. Node A's `capacity:*` lands in B's corpus by **consented anti-entropy
+replication** that `ciris-server` performs — Node B **never reads Node A's
+database directly**.
 
-> **Cold-prod-miles warning.** The `fabric` build serves real mesh data but has
-> not yet run in production. Stand it up **alongside** the lens (read-only,
-> non-authoritative) and verify the surface before cutting public traffic. The
-> cutover ordering below is designed so every step is independently reversible.
+> **Cold-prod-miles warning.** This serves real mesh data but has not yet run in
+> production. Stand it up **alongside** the lens (read-only, non-authoritative)
+> and verify the surface before cutting public traffic. The cutover ordering
+> below is designed so every step is independently reversible.
 
 ---
 
@@ -17,47 +22,56 @@ serves the public website surface ciris.ai consumes.
 
 | Artifact | What |
 |---|---|
-| `ghcr.io/cirisai/cirisstatus:<vTAG>` | **Node B** image — `--features fabric`. Serves real data. |
-| `ghcr.io/cirisai/cirisstatus:<vTAG>-status` | status-page-only image (default build; prober + cache). |
-| `ghcr.io/cirisai/cirisstatus:latest` / `:status` | rolling tags for the two above. |
-| `docker-compose.fabric.yml` | Node B compose: image + corpus wiring + node identity + listen addr. |
-| GitHub Release `ciris-status-<vTAG>-<target>.tar.gz` | stripped fabric binary (x86_64 + aarch64), Sigstore-signed. |
+| `ghcr.io/cirisai/cirisstatus:<vTAG>` | the node image (always a node — the `ciris-server` node + StatusAdapter). |
+| `ghcr.io/cirisai/cirisstatus:latest` | rolling tag for the above. |
+| GitHub Release `ciris-status-<vTAG>-<target>.tar.gz` | stripped binary (x86_64 + aarch64), Sigstore-signed. |
 
 Built by `.github/workflows/release.yml` on a `v*` tag. The image is the blessed
 release; the ansible role pulls it and templates `.env` from the reference below.
+
+> The optional `fabric` feature is **gone** — there is one build now, and it is
+> always a node. There is no "prober-only" image any more.
 
 ---
 
 ## 2. Environment reference
 
-Copy `.env.example` → `.env`. The non-fabric probe/uptime vars are documented in
-`README.md`. The **fabric (Node B)** vars — ALL required or the flows stay
-disabled (binary degrades to the plain prober; roster stays empty):
+Copy `.env.example` → `.env`. Env splits in two: the **node** vars (read by
+`ciris_server::ServerConfig`) and the **StatusAdapter** vars (probe/uptime/CORS,
+documented in `README.md`).
+
+### Node vars (`ciris-server`'s — identity, corpus, listen, peering)
 
 | Var | Example | Meaning |
 |---|---|---|
-| `STATUS_LISTEN_ADDR` | `0.0.0.0:8200` | bind address (host maps `127.0.0.1:8200`) |
-| `STATUS_DB_PATH` | `/data/status.db` | Node B's own uptime SQLite (NOT the corpus) |
-| `STATUS_CORPUS_DSN` | `sqlite:///corpus/corpus.db` | the **shared ciris-server corpus** (Flow A reads, Flow B writes) |
-| `STATUS_NODE_KEY_ID` | `ciris-status-monitor` | Node B's Ed25519 identity key_id |
-| `STATUS_NODE_KEY_PATH` | `/secrets/ed25519.seed` | 32-byte raw Ed25519 seed, `chmod 600` |
-| `STATUS_NODE_PQC_KEY_ID` | `ciris-status-monitor-pqc` | Node B's ML-DSA-65 key_id (hybrid signing) |
-| `STATUS_NODE_PQC_KEY_PATH` | `/secrets/mldsa65.seed` | 32-byte raw ML-DSA-65 seed, `chmod 600` |
-| `STATUS_SERVICE_KEYS` | `us=k_service_us,eu=k_service_eu` | region-key → the keyed CIRIS service node key_id Flow B attests `health:liveness` about (providers/regions fold in as `evidence_refs`, never as separate subjects) |
+| `CIRIS_HOME` | `/data/ciris` | base for the data + identity dirs (corpus DB at `<data>/ciris_engine.db`, node seed at `<identity>/ed25519.seed`) |
+| `CIRIS_SERVER_DATA_DIR` / `CIRIS_SERVER_IDENTITY_DIR` | — | override the data / identity dirs individually |
+| `CIRIS_SERVER_LISTEN_ADDR` | `0.0.0.0:4242` | the Reticulum node port; the **read API + the status routers** bind `port + 1` (`:4243`) |
+| `CIRIS_SERVER_KEY_ID` | `ciris-server` | the node's federation `key_id` — the `health:liveness` attester. `serve_with_adapter` self-registers it at boot, so Flow B rows admit with no extra step. |
+| `CIRIS_SERVER_TRANSPORT_NODE` / `CIRIS_SERVER_STORE_AND_FORWARD` | `on` | NAT-traversal infra (relay + mail-for-asleep-edges); default on for a public node |
 
-**Node identity.** Node B is a distinct fabric node (`device_class: service`),
-NOT the lens identity (that is Node A — ciris-server). Generate fresh seeds:
+The node mints its own Ed25519 + ML-DSA-65 identity on first boot under the
+identity dir — there are **no `STATUS_NODE_*` seed vars to manage** any more.
 
-```sh
-mkdir -p secrets && chmod 700 secrets
-head -c 32 /dev/urandom > secrets/ed25519.seed   && chmod 600 secrets/ed25519.seed
-head -c 32 /dev/urandom > secrets/mldsa65.seed    && chmod 600 secrets/mldsa65.seed
-```
+### `consent:replication` peer (Node A / the lens node) — enables A→B replication
 
-Node B's public key must be **registered in the federation directory** (the
-founder-quorum admission door, same as any node) so its `health:liveness` rows
-admit. Node B reads `capacity:*` / `system:*` with NO special role
-(`CallerScope::Unauthenticated` → the §8.1.13.3 broad public tiers).
+`ciris-server` owns peering. Set these to register Node A's key, emit the directed
+`consent:replication:v1` grant, and run A↔B anti-entropy replication so A's
+`capacity:*` flows INTO B's own corpus. Unset ⇒ B runs solo (self-registers +
+emits its own `health:liveness`, no replication; roster stays empty until rows
+are replicated/seeded).
+
+| Var | Example | Meaning |
+|---|---|---|
+| `CIRIS_PEER_B_KEY_ID` | `ciris-server-steward` | the peer's federation key_id (replication wiring + consent subject) |
+| `CIRIS_PEER_B_KEY_RECORD` | `{"record":{…}}` | the peer's exported **self-signed** `SignedKeyRecord` (persist v9.0.2 serde_json, single line). The v8.8.0+ gate verifies the peer's proof-of-possession — neither side can fabricate the other's row from raw pubkeys. |
+
+> Note the env name is `ciris-server`'s `CIRIS_PEER_B_*` (its "peer B" slot is the
+> directed-consent peer). The full peering/transport env reference is
+> `ciris-server`'s `src/config.rs`.
+
+This node logs its OWN `SignedKeyRecord` (JSON) at boot — hand that to the peer as
+its corresponding peer-config artifact; the contract is symmetric.
 
 ---
 
@@ -68,23 +82,29 @@ cutover covers ONLY the public scoring/status surface (Phase 2 of the design §6
 
 1. **Deploy Node B (off public traffic).**
    ```sh
-   docker compose -f docker-compose.fabric.yml up -d
-   curl -fsS http://127.0.0.1:8200/health
+   docker compose up -d
+   curl -fsS http://127.0.0.1:4243/health
    ```
-   Confirm logs show `fabric: Node B flows online` (not the "built but not
-   configured" line — that means an env var is missing).
+   Confirm the logs show `ciris-status starting as a ciris-server node +
+   StatusAdapter`, `StatusAdapter lifecycle running`, and the node's
+   self-registration line.
 
-2. **Wire it to ciris-server's corpus.** Point `STATUS_CORPUS_DSN` at the shared
-   corpus (bind-mount Node A's corpus dir, or a networked/replicated corpus if
-   Node A is on another host). Verify Flow A serves **real** rows:
+2. **Enable A↔B consented replication.** The corpus is **B's OWN local corpus**
+   (the node's `ciris_engine.db` under the data dir, never Node A's DB file). To
+   pull A's `capacity:*` INTO it, set the `CIRIS_PEER_B_*` vars (§2): `ciris-server`
+   registers the peer's key, emits the directed `consent:replication:v1` grant,
+   and runs A↔B replication. Hand the peer the `SignedKeyRecord` this node logs at
+   boot so it registers + replicates symmetrically. The roster is **empty until
+   replication delivers** — that is correct, not an error. Verify Flow A serves
+   **real** rows once replication has run:
    ```sh
-   curl -fsS http://127.0.0.1:8200/api/v1/scoring | jq '.agents[0]'
+   curl -fsS http://127.0.0.1:4243/api/v1/scoring | jq '.agents[0]'
    # expect {key_id, capacity_composite, factors?, valid_until} — the lens shape.
    ```
-   If `agents` is empty: the corpus has no opted-in `capacity:*` rows yet, or the
-   DSN is wrong, or Node B's key isn't admitted. (Empty is well-formed, not an
-   error — the default cache is also empty.)
-   Verify Flow B emits: look for `flow B: emitted signed health:liveness` in the
+   If `agents` is empty: replication hasn't delivered opted-in `capacity:*` rows
+   yet, the peer env is unset/wrong, or this node's key isn't admitted at the peer.
+   (Empty is well-formed, not an error.)
+   Verify Flow B emits: look for `Flow B: emitted signed health:liveness:v1` in the
    logs after one poll cadence.
 
 3. **Cut the `ciris.ai/ciris-scoring/` public page lens → status.** Repoint the
@@ -98,7 +118,7 @@ cutover covers ONLY the public scoring/status surface (Phase 2 of the design §6
    Phase 3 substrate bump lands (design §6).
 
 To roll Node B back at any point: repoint the public route to the lens feed and
-`docker compose -f docker-compose.fabric.yml down`. Node B is the public
+`docker compose down`. Node B is the public
 *window*, never load-bearing — the federation runs without it.
 
 ---
@@ -107,14 +127,14 @@ To roll Node B back at any point: repoint the public route to the lens feed and
 
 Node B needs **its own hostname** (it is a distinct node from Node A; do not
 share the lens host). Suggested: `status.ciris.ai` (or reuse the lens public
-route family). Node B listens on `127.0.0.1:8200`; the reverse proxy terminates
+route family). Node B listens on `127.0.0.1:4243`; the reverse proxy terminates
 TLS and forwards.
 
 **Caddy** (TLS + SSE/WS pass-through):
 
 ```caddyfile
 status.ciris.ai {
-    reverse_proxy 127.0.0.1:8200 {
+    reverse_proxy 127.0.0.1:4243 {
         # SSE (/api/v1/*/live) + WS (/api/v1/status/ws) need streaming, no buffer.
         flush_interval -1
     }
@@ -124,11 +144,11 @@ status.ciris.ai {
 **nginx** (preserving the existing lens `/lens/api/` route shape, README §Deploy):
 
 ```nginx
-location /lens/api/  { proxy_pass http://127.0.0.1:8200/; }     # strips /lens/api
-location /lens/health { proxy_pass http://127.0.0.1:8200/health; }
+location /lens/api/  { proxy_pass http://127.0.0.1:4243/; }     # strips /lens/api
+location /lens/health { proxy_pass http://127.0.0.1:4243/health; }
 # SSE/WS:
 location /api/v1/ {
-    proxy_pass http://127.0.0.1:8200;
+    proxy_pass http://127.0.0.1:4243;
     proxy_http_version 1.1;
     proxy_set_header Connection "";          # SSE
     proxy_set_header Upgrade $http_upgrade;  # WS (/status/ws)

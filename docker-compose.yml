@@ -1,0 +1,64 @@
+# ciris-status — a ciris-server fabric node + a StatusAdapter
+# (FSD/MONITORING_NODE_DESIGN.md §5).
+#
+# Flow A reads `capacity:*` signed `scores` from THIS node's OWN corpus and
+# projects the public roster; Flow B probes off-fabric infra and emits signed
+# `health:liveness` into that same corpus. Serves the website surface
+# (`/api/v1/scoring`, SSE/WS, status, history) ciris.ai consumes.
+#
+# Usage:
+#   1. copy .env.example → .env and fill the node + adapter vars (see DEPLOY.md)
+#   2. docker compose up -d
+#
+# Topology: this node owns its OWN corpus (the node's ciris_engine.db under the
+# data dir, NOT a shared DB with the peer). The peer's `capacity:*` data arrives
+# by ANTI-ENTROPY REPLICATION over the federation transport, authorized by a
+# DIRECTED consent grant + mutual key registration that ciris-server performs —
+# NOT by mounting the peer's database. Set the CIRIS_PEER_B_* vars to enable the
+# peer leg; without them the node runs solo (self-attests, no replication).
+
+services:
+  ciris-status:
+    image: ghcr.io/cirisai/cirisstatus:${CIRIS_STATUS_TAG:-latest}
+    # To build locally instead of pulling the blessed image: `docker compose build`.
+    # NOTE: the build context must include ../CIRISServer (the path dep) until the
+    # ciris-server git pin lands — build from a parent dir that contains both repos.
+    build:
+      context: .
+    container_name: ciris-status
+    restart: unless-stopped
+    # Bind to the host loopback; nginx/Caddy terminates TLS and proxies in.
+    ports:
+      # Read API + status routers (the public surface): listen port + 1.
+      - "127.0.0.1:4243:4243"
+      # The Reticulum node port (federation transport / NAT-traversal).
+      - "${CIRIS_NODE_PORT:-4242}:4242"
+    env_file:
+      - .env
+    environment:
+      # The node + identity + corpus live under CIRIS_HOME on the volume; the node
+      # binds 0.0.0.0:4242 inside the container (read API + status routers :4243).
+      CIRIS_HOME: /data/ciris
+      CIRIS_SERVER_LISTEN_ADDR: 0.0.0.0:4242
+      STATUS_DB_PATH: /data/status.db
+      # ── consent:replication peer (Node A) — OPTIONAL; enables replication ─────
+      # v8.8.0 §5.6.8.15: the peer's OWN self-signed SignedKeyRecord (serde_json),
+      # not raw pubkeys — the admission gate verifies its proof-of-possession.
+      CIRIS_PEER_B_KEY_ID: ${CIRIS_PEER_B_KEY_ID:-}
+      CIRIS_PEER_B_KEY_RECORD: ${CIRIS_PEER_B_KEY_RECORD:-}
+    volumes:
+      # Node data dir (corpus DB + minted identity) AND the uptime-history DB.
+      - status-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4243/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  status-data:

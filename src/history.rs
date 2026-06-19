@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -43,7 +42,8 @@ fn record(conn: &Connection, ts: &str, service: &str, provider: &str, region: &s
 
 /// One poll cycle: probe everything we track and append rows. Region "global"
 /// for cross-region providers (LLMs, local deps), the region key otherwise.
-async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
+/// Driven by the StatusAdapter's `run_lifecycle` interval loop.
+pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut rows: Vec<(String, String, String, Probe)> = Vec::new();
 
@@ -145,15 +145,6 @@ fn leak(s: String) -> &'static str {
         "degraded" => "degraded",
         "outage" => "outage",
         _ => "operational",
-    }
-}
-
-/// The background poller loop.
-pub async fn run_poller(cfg: Arc<Config>, client: reqwest::Client, db: Db) {
-    let mut tick = tokio::time::interval(Duration::from_secs(cfg.poll_seconds));
-    loop {
-        tick.tick().await;
-        poll_once(&cfg, &client, &db).await;
     }
 }
 

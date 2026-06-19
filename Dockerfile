@@ -1,72 +1,61 @@
-# ciris-status — the ciris.ai public health/status surface + (with the `fabric`
-# feature) Node B of FSD/MONITORING_NODE_DESIGN.md.
+# ciris-status — a ciris-server fabric node + a StatusAdapter
+# (FSD/MONITORING_NODE_DESIGN.md). There is ONE build now: ciris-status is always
+# a node (the optional `fabric` feature is gone). It links the persist/verify
+# substrate via ciris-server: Flow A reads `capacity:*` from this node's own
+# corpus, Flow B emits signed `health:liveness`.
 #
-# Two build modes via the FEATURES build-arg:
-#   * default ("")          — the cost-safe outbound prober + SQLite uptime +
-#                             website sockets. Self-contained (rustls, no
-#                             openssl); roster served from cache (empty).
-#   * "fabric"              — the real fabric node: links the persist/verify
-#                             substrate (Flow A reads `capacity:*`, Flow B emits
-#                             signed `health:liveness`). Needs the substrate build
-#                             deps (libtss2-dev for the TPM/keyring backend,
-#                             libsqlite3-dev), matching CIRISServer's release CI.
-#
-# Build the fabric image (Node B):
-#   docker build --build-arg FEATURES=fabric -t ciris-status:fabric .
-# Build the default status-page image:
+# Build:
 #   docker build -t ciris-status:latest .
 #
-# Listens on :8200 (drop-in for the CIRISLens API container).
+# The node binds the Reticulum port (default :4242); the read API + the status
+# routers bind port + 1 (default :4243) — point the status reverse-proxy there.
 
-# The fabric feature pulls the substrate graph (ciris-persist/verify) whose
-# transitive deps require a recent stable rustc (redb 4.1 → 1.89, time → 1.88).
-# Bumped from 1.86 so `--features fabric` compiles in-container.
+# The substrate graph (ciris-persist/verify/edge) requires a recent stable rustc
+# (redb 4.1 → 1.89, time → 1.88).
 ARG RUST_VERSION=1.90
 
 # ── build stage ──────────────────────────────────────────────────────────────
 FROM rust:${RUST_VERSION}-slim AS build
-ARG FEATURES=""
 WORKDIR /app
 
-# Substrate build deps. libtss2-dev + libsqlite3-dev are required by the
-# `fabric` feature (ciris-keyring's TPM backend links tss2; ciris-persist links
-# sqlite3). Harmless for the default build. pkg-config + a C toolchain back the
-# `-sys` crates; git fetches the substrate git deps under `fabric`.
+# Substrate build deps. libtss2-dev (ciris-keyring's TPM backend links tss2) +
+# libsqlite3-dev (ciris-persist links sqlite3); pkg-config + a C toolchain back
+# the `-sys` crates; git fetches the substrate git deps.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libtss2-dev libsqlite3-dev pkg-config build-essential git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Cache deps: copy the manifests + lockfile first.
+# NOTE: ciris-status depends on ../CIRISServer as a path dep, so the build context
+# must include both repos (build from a parent dir, or swap to the git pin once
+# the adapter-seam ciris-server is tagged). The COPY below assumes ciris-status is
+# the context root with CIRISServer available as a sibling path dep.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 # `--locked` so the image build uses the committed Cargo.lock (reproducible).
-RUN if [ -n "$FEATURES" ]; then \
-        cargo build --release --locked --features "$FEATURES"; \
-    else \
-        cargo build --release --locked; \
-    fi \
+RUN cargo build --release --locked \
     && strip target/release/ciris-status \
     && cp target/release/ciris-status /ciris-status
 
 # ── runtime stage (slim) ─────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 # Runtime libs: ca-certificates for outbound TLS probes; curl for HEALTHCHECK.
-# NOTE: the binary statically links sqlite (`rusqlite/bundled`) and, in the
-# fabric build, the keyring/TPM backend — `ldd` shows NO libtss2/libsqlite3
-# dynamic dependency — so the runtime stage stays minimal for BOTH build modes
-# (verified: `ldd target/release/ciris-status` → only libc/libm/libgcc).
+# The binary statically links sqlite (`rusqlite/bundled`) and the keyring/TPM
+# backend — `ldd` shows NO libtss2/libsqlite3 dynamic dependency — so the runtime
+# stage stays minimal.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /ciris-status /usr/local/bin/ciris-status
 
-# History DB (and, for the fabric node, the corpus mount) live on volumes.
-ENV STATUS_LISTEN_ADDR=0.0.0.0:8200 \
+# The node data dir (corpus DB + minted identity) and the uptime-history DB live
+# on volumes.
+ENV CIRIS_HOME=/data/ciris \
     STATUS_DB_PATH=/data/status.db
 VOLUME ["/data"]
-EXPOSE 8200
+# 4242 = Reticulum node port; 4243 = read API + status routers.
+EXPOSE 4242 4243
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -fsS http://localhost:8200/health || exit 1
+    CMD curl -fsS http://localhost:4243/health || exit 1
 ENTRYPOINT ["/usr/local/bin/ciris-status"]

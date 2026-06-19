@@ -1,7 +1,11 @@
-//! Environment configuration — mirrors the env vars CIRISLens's status API read,
-//! so this is a drop-in replacement behind the same nginx route. Every probe
-//! target is optional: an unset `*_URL` simply skips that probe (the component is
-//! omitted), exactly as the Python service behaved.
+//! StatusAdapter environment configuration — the probe targets, poll cadence,
+//! and CORS origins for the status page. Every probe target is optional: an unset
+//! `*_URL` simply skips that probe (the component is omitted), exactly as the
+//! Python service behaved.
+//!
+//! The node's identity, DSN, and listen address are NOT here — they belong to
+//! `ciris_server::ServerConfig` (the `CIRIS_SERVER_*` / `CIRIS_PEER_B_*` env the
+//! fabric node reads). This config holds ONLY the adapter's concerns.
 
 use std::env;
 
@@ -39,7 +43,8 @@ pub struct ExternalProvider {
 
 #[derive(Clone)]
 pub struct Config {
-    pub listen_addr: String,
+    /// SQLite path for the uptime-history table the poller writes (the status
+    /// page's own append-only history store; distinct from the node corpus).
     pub db_path: String,
     pub poll_seconds: u64,
     pub version: &'static str,
@@ -111,7 +116,6 @@ impl Config {
         }
 
         Config {
-            listen_addr: env::var("STATUS_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8200".into()),
             db_path: env::var("STATUS_DB_PATH").unwrap_or_else(|_| "status.db".into()),
             poll_seconds: opt("STATUS_POLL_SECONDS")
                 .and_then(|v| v.parse().ok())

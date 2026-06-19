@@ -1,8 +1,8 @@
 [package]
 name = "ciris-status"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "The ciris.ai public health/status surface — the small standalone service that outlives CIRISLens. Serves /health, /v1/status, /api/v1/status, /api/v1/status/history by live outbound probes + a SQLite uptime history. No Grafana/Timescale/OAuth."
+description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
 publish = false
 
@@ -10,33 +10,42 @@ publish = false
 name = "ciris-status"
 path = "src/main.rs"
 
-[features]
-# Default build: the cost-safe outbound prober + SQLite uptime + the public
-# website sockets (roster/health/SSE served from the local cache). No fabric
-# substrate linked — stays self-contained and fast to build, and every existing
-# endpoint keeps working unchanged.
-default = []
-
-# `fabric` turns ciris-status into a real fabric node (Node B in the design):
-#   * Flow B — sign + EMIT probe results as CEG `health:liveness` `scores`
-#     attestations into the federation directory (persist + verify hybrid sign).
-#   * Flow A — READ `capacity:*` / `system:*` signed `scores` from the corpus and
-#     project the consent-gated public roster.
-#   * Self-registration of Node B's own witness key + (config-gated) peer key A
-#     + a directed `consent:replication:v1` grant, and bidirectional A<->B
-#     anti-entropy replication of `Attestation`-kind envelopes via ciris-edge's
-#     `ReplicationRuntime` over the lightweight HTTP transport.
-# Pulled in only under this feature so the default status-page build is unaffected.
-fabric = ["dep:ciris-persist", "dep:ciris-verify-core", "dep:ciris-keyring", "dep:ciris-edge", "dep:hex", "dep:base64", "dep:sha2"]
-
 [dependencies]
+# ── The fabric node ──────────────────────────────────────────────────────────
+# ciris-status IS a ciris-server node now (no optional `fabric` feature): the
+# whole node — engine + edge + consent:replication + read API + NodeCode +
+# ownership + safety + NAT-traversal — is ciris-server's `serve_with_adapter`,
+# and the status page is a `StatusAdapter: ciris_server::Adapter` folded onto the
+# SAME shared core. Default features (NOT python, NOT pkcs11).
+# Pinned to the ciris-server tag carrying the adapter seam (v0.4.10).
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.4.10" }
+
+# ciris-persist (sqlite) at the SAME pin ciris-server uses (v9.0.2) so the
+# lockfile resolves a SINGLE ciris-persist (ciris-server's path dep pins v9.0.2
+# too). The adapter touches persist types directly: `Engine::sqlite_backend()`
+# (the SqliteBackend handle that impls both ReadEngine + FederationDirectory),
+# `CallerScope::Unauthenticated` (the Flow-A public read scope), and the
+# federation `Attestation` row emit_liveness assembles.
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v9.0.2", features = ["sqlite"] }
+
+# Impl `ciris_server::Adapter` (async fn in trait). async-trait 0.1 + axum 0.8
+# match ciris-server.
+async-trait = "0.1"
+
+# emit_liveness signs + assembles the federation `Attestation` row: base64 for
+# the signature wire form, sha2 for the original_content_hash anchor, hex for the
+# digest encoding. All already in the lock as substrate-transitive deps.
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 # rustls (not openssl) so the binary is self-contained and cross-builds cleanly.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# Pinned to 0.31 to match ciris-persist v8.6.0 (both declare `links = "sqlite3"`,
-# so cargo requires a single libsqlite3-sys across the graph under `fabric`).
+# Pinned to 0.31 to match ciris-persist v9.0.2 (both declare `links = "sqlite3"`,
+# so cargo requires a single libsqlite3-sys across the graph).
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -46,32 +55,6 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-
-# ── Fabric substrate (only under the `fabric` feature) ───────────────────────
-# Pinned byte-for-byte to CIRISServer's Cargo.toml floor:
-#   persist v8.6.0 / edge v4.3.0 / verify-family v5.11.0 (CEG 1.0-RC12).
-# These give us the signed `scores` emit + read primitives:
-#   - Engine::with_signer / sign_hybrid           (hybrid Ed25519 + ML-DSA-65)
-#   - verify::canonicalize_envelope_for_signing   (JCS RFC 8785, CEG §0.9)
-#   - FederationDirectory::put_attestation         (Flow B emit)
-#   - ReadEngine::list_attestations(dimension_prefixes, valid_at, scope) (Flow A)
-ciris-persist     = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v8.8.0", features = ["sqlite"], optional = true }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.11.0", optional = true }
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.11.0", version = "5", features = ["software", "pqc-ml-dsa"], optional = true }
-# ciris-edge — the federation REPLICATION spine (Round 2). Pinned byte-for-byte
-# to CIRISServer/Cargo.lock (edge v4.5.0, rev 86eb59c) so Node A and Node B share
-# one edge ABI; this edge pins persist v8.6.0 (== our pin above) so the graph
-# carries a SINGLE ciris-persist. `transport-http` is chosen over
-# `transport-reticulum`: Node B is an out-of-group external MONITOR — a lighter
-# transport (no Reticulum/Leviculum stack, no RNS identity, no announce loop) is
-# the right least-privilege footprint, and the consent-attestation wire contract
-# is transport-agnostic so HTTP interops with A's Reticulum plane through any
-# bridge. `ReplicationRuntime` (the API used) is compiled unconditionally — the
-# feature only selects which `Transport` impl links.
-ciris-edge        = { git = "https://github.com/CIRISAI/CIRISEdge", tag = "v4.5.1", features = ["transport-http"], optional = true }
-hex               = { version = "0.4", optional = true }
-base64            = { version = "0.22", optional = true }
-sha2              = { version = "0.10", optional = true }
 
 [profile.release]
 strip = "symbols"

@@ -1,28 +1,21 @@
 //! Flow A — read & aggregate signed `scores` → the public roster surface.
 //!
 //! Per `FSD/MONITORING_NODE_DESIGN.md` §2 (Flow A) / §3: read `capacity:*`
-//! (per opted-in agent) and `system:*` (node self-reports) from the federation
-//! directory, **gate by consent / access tier** (public-tier reader: surface
-//! only the `public_sample` / consent projection), and project to the website
-//! roster `{key_id, capacity:composite, factors?, valid_until}`.
+//! (per opted-in agent) from this node's OWN corpus (the rows A's
+//! `consent:replication` peering replicated in, plus anything authored locally),
+//! **gate by consent / access tier** (public-tier reader: surface only the
+//! `public_sample` / consent projection), and project to the website roster
+//! `{key_id, capacity:composite, factors?, valid_until}`.
 //!
-//! The public endpoints serve from an in-memory [`RosterCache`] so the
-//! request path never blocks on the corpus; a background refresher (under the
-//! `fabric` feature) repopulates it from the substrate read. Without `fabric`
-//! the cache is simply empty (the roster endpoint returns an empty, well-formed
-//! `public_sample` projection) — the default build keeps compiling and serving.
-//!
-//! The capacity-projection constants/helpers are consumed under `--features
-//! fabric`; in the default build they are tested but otherwise unused.
-#![cfg_attr(not(feature = "fabric"), allow(dead_code))]
+//! The public endpoints serve from an in-memory [`RosterCache`] so the request
+//! path never blocks on the corpus; the StatusAdapter's `run_lifecycle` loop
+//! repopulates it from `engine.sqlite_backend()` (the `ReadEngine` handle) at the
+//! poll cadence.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use crate::model::Roster;
-#[cfg(feature = "fabric")]
-use crate::model::RosterEntry;
-#[cfg(feature = "fabric")]
-use std::collections::BTreeMap;
+use crate::model::{Roster, RosterEntry};
 
 /// Process-wide roster snapshot, swapped atomically by the refresher.
 #[derive(Clone)]
@@ -72,8 +65,7 @@ pub const SYSTEM_PREFIX: &str = "system:";
 /// segment — so the rows actually written to the corpus are
 /// `capacity:composite:v1`, `capacity:core_identity:v1`, … The roster
 /// projection must compare against the *unversioned* leaf, so we canonicalize
-/// by dropping that trailing segment. (Mirrors persist's own
-/// `contains_version_segment` shape: the version is the last `:`-segment.)
+/// by dropping that trailing segment.
 pub fn strip_version(dimension: &str) -> &str {
     match dimension.rsplit_once(':') {
         Some((head, tail))
@@ -102,10 +94,8 @@ pub fn factor_key(dimension: &str) -> Option<&str> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Flow A read — REAL signed-`scores` read via the persist substrate.
-// Compiled only under `--features fabric`.
+// Flow A read — REAL signed-`scores` read via this node's own corpus.
 // ─────────────────────────────────────────────────────────────────────────────
-#[cfg(feature = "fabric")]
 pub mod read {
     use super::*;
     use anyhow::Result;
@@ -115,8 +105,9 @@ pub mod read {
     use ciris_persist::federation::types::Attestation;
     use ciris_persist::scope::CallerScope;
 
-    /// Read all currently-valid `capacity:*` `scores` rows, gated to the
-    /// public/opted-in projection, and fold them into the roster.
+    /// Read all currently-valid `capacity:*` `scores` rows from this node's own
+    /// corpus, gated to the public/opted-in projection, and fold them into the
+    /// roster.
     ///
     /// `reader` is the persist backend handle (`SqliteBackend`), which impls
     /// [`ReadEngine`] — `Engine` itself does not, so callers pass
@@ -260,35 +251,29 @@ mod tests {
 // ─────────────────────────────────────────────────────────────────────────────
 // Flow A — REAL signed-`scores` read proof (the load-bearing test).
 //
-// Seeds a ciris-server SQLite corpus with `capacity:*:v1` `scores` rows for a
-// couple of opted-in agents (using the persist v8.4.0 federation-directory API —
-// `put_public_key` to register the keys, `put_attestation` to write the rows,
-// mirroring CIRISServer's `tests/replication.rs` seed pattern), then asserts
-// `read::build_roster(reader, CallerScope::Unauthenticated)` returns the expected
-// roster. This proves Flow A serves REAL substrate data — not the empty default
-// cache — and that the public/opted-in projection (`cohort_scope: federation`,
-// the §8.1.13.3 broad tier the Unauthenticated reader admits) is what surfaces.
-//
-// Versioned dimensions (`capacity:composite:v1`) are used because persist's
-// `DimensionAdmissionPolicy { require_version_segment: true }` admits ONLY
-// versioned `scores` dims — i.e. these are the rows that actually land in a real
-// corpus, so the projection's version-stripping is exercised end-to-end.
+// Seeds an in-memory persist corpus with `capacity:*:v1` `scores` rows for a
+// couple of opted-in agents (REAL hybrid-signed by a separate detector engine,
+// the way A's replicated `capacity:*` lands when the inbound replication bridge
+// calls `put_attestation`), then asserts `read::build_roster(reader,
+// CallerScope::Unauthenticated)` returns the expected roster from the node's OWN
+// corpus. Proves Flow A serves REAL substrate data, not the empty default cache.
 // ─────────────────────────────────────────────────────────────────────────────
-#[cfg(all(test, feature = "fabric"))]
+#[cfg(test)]
 mod flow_a_real_data {
     use super::read::build_roster;
 
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use chrono::Utc;
     use ciris_persist::federation::types::{
         algorithm, attestation_tier, cohort_scope, identity_type, Attestation, KeyRecord,
         SignedAttestation, SignedKeyRecord,
     };
-    use ciris_persist::federation::FederationDirectory;
+    use ciris_persist::federation::{Error as FederationError, FederationDirectory};
     use ciris_persist::prelude::{Engine, LocalSigner, LocalSignerConfig};
     use ciris_persist::scope::CallerScope;
+    use ciris_persist::verify::canonical::ceg_produce_canonicalize;
+    use sha2::{Digest, Sha256};
 
-    /// Minimal temp-dir for 32-byte raw seed files (avoids a `tempfile` dep).
-    /// Cleaned up on drop.
     pub(super) mod tempdir {
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -318,20 +303,16 @@ mod flow_a_real_data {
         }
     }
 
-    /// Stand up an in-memory fabric node keyed by its own node identity. The
-    /// Ed25519 seed is written to a temp file and loaded via the same
-    /// `LocalSigner::from_config` path production uses (no PQC needed for the
-    /// Flow A READ path — `put_attestation` takes the deferred-scrub federation
-    /// row we hand-build, exactly as `ceg::emit` assembles it).
     async fn node() -> (std::sync::Arc<Engine>, tempdir::SeedDir) {
         let seeds = tempdir::SeedDir::new();
         let ed = seeds.write_seed("node.ed25519", [0x5A; 32]);
+        let pqc = seeds.write_seed("node.mldsa65", [0x6B; 32]);
         let signer = std::sync::Arc::new(
             LocalSigner::from_config(&LocalSignerConfig {
                 key_id: "ciris-status-detector".to_string(),
                 key_path: ed,
-                pqc_key_id: None,
-                pqc_key_path: None,
+                pqc_key_id: Some("ciris-status-detector-pqc".to_string()),
+                pqc_key_path: Some(pqc),
             })
             .expect("LocalSigner::from_config"),
         );
@@ -343,8 +324,60 @@ mod flow_a_real_data {
         (engine, seeds)
     }
 
-    /// Register a key in `federation_keys` so `put_attestation`'s FK + identity
-    /// lookup resolves it (mirrors `replication.rs::cross_register`).
+    async fn detector(seeds: &tempdir::SeedDir, key_id: &str) -> std::sync::Arc<Engine> {
+        let ed = seeds.write_seed(&format!("{key_id}.ed25519"), [0xD7; 32]);
+        let pqc = seeds.write_seed(&format!("{key_id}.mldsa65"), [0xDC; 32]);
+        let signer = std::sync::Arc::new(
+            LocalSigner::from_config(&LocalSignerConfig {
+                key_id: key_id.to_string(),
+                key_path: ed,
+                pqc_key_id: Some(format!("{key_id}-pqc")),
+                pqc_key_path: Some(pqc),
+            })
+            .expect("detector LocalSigner::from_config with PQC"),
+        );
+        std::sync::Arc::new(
+            Engine::with_signer(signer, "sqlite::memory:")
+                .await
+                .expect("detector Engine::with_signer"),
+        )
+    }
+
+    async fn register_attester(node: &Engine, attester: &Engine, key_id: &str, id_type: &str) {
+        let envelope = serde_json::json!({ "key_id": key_id });
+        let canonical = ceg_produce_canonicalize(&envelope).unwrap();
+        let och = hex::encode(Sha256::digest(&canonical));
+        let sig = attester.sign_hybrid(&canonical).await.unwrap();
+        let now = Utc::now();
+        let rec = KeyRecord {
+            key_id: key_id.to_string(),
+            pubkey_ed25519_base64: B64.encode(&sig.classical.public_key),
+            pubkey_ml_dsa_65_base64: Some(B64.encode(&sig.pqc.public_key)),
+            algorithm: algorithm::HYBRID.into(),
+            identity_type: id_type.to_string(),
+            identity_ref: key_id.to_string(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: B64.encode(&sig.classical.signature),
+            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+            scrub_key_id: key_id.to_string(),
+            scrub_timestamp: now,
+            pqc_completed_at: Some(now),
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        match node
+            .register_federation_key(SignedKeyRecord { record: rec })
+            .await
+        {
+            Ok(()) | Err(FederationError::Conflict(_)) => {}
+            Err(e) => panic!("register attester {key_id}: {e}"),
+        }
+    }
+
     async fn register_key<B: FederationDirectory>(dir: &B, key_id: &str, id_type: &str) {
         let now = Utc::now();
         let rec = KeyRecord {
@@ -372,43 +405,44 @@ mod flow_a_real_data {
             .expect("register key");
     }
 
-    /// Write one `capacity:<leaf>:v1` `scores` row ABOUT `subject` BY `detector`,
-    /// at the public broad tier (`cohort_scope: federation`, visible to the
-    /// Unauthenticated reader). Federation-tier so the read-gate admits it.
     async fn seed_capacity<B: FederationDirectory>(
         dir: &B,
-        detector: &str,
+        attester: &Engine,
+        attester_key_id: &str,
         subject: &str,
         leaf: &str,
         score: f64,
         valid_until: chrono::DateTime<Utc>,
     ) {
         let dim = format!("capacity:{leaf}:v1");
-        let now = Utc::now();
         let envelope = serde_json::json!({
             "dimension": dim,
             "score": score,
             "valid_until": valid_until.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             "witness_relation": "external",
         });
+        let canonical = ceg_produce_canonicalize(&envelope).unwrap();
+        let och = hex::encode(Sha256::digest(&canonical));
+        let sig = attester.sign_hybrid(&canonical).await.unwrap();
+        let now = Utc::now();
         let att = Attestation {
             attestation_id: format!(
                 "{subject}-{leaf}-{}",
                 now.timestamp_nanos_opt().unwrap_or(0)
             ),
-            attesting_key_id: detector.to_string(),
+            attesting_key_id: attester_key_id.to_string(),
             attested_key_id: subject.to_string(),
             attestation_type: super::super::ceg::ATTESTATION_TYPE_SCORES.to_owned(),
             weight: Some(0.95),
             asserted_at: now,
             expires_at: Some(valid_until),
             attestation_envelope: envelope,
-            original_content_hash: "00".repeat(32),
-            scrub_signature_classical: "AAAA".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: detector.to_string(),
+            original_content_hash: och,
+            scrub_signature_classical: B64.encode(&sig.classical.signature),
+            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+            scrub_key_id: attester_key_id.to_string(),
             scrub_timestamp: now,
-            pqc_completed_at: None,
+            pqc_completed_at: Some(now),
             persist_row_hash: String::new(),
             subject_key_ids: vec![subject.to_string()],
             withdraws_admission_rule: None,
@@ -423,22 +457,19 @@ mod flow_a_real_data {
 
     #[tokio::test]
     async fn build_roster_serves_real_capacity_scores() {
-        let (engine, _seeds) = node().await;
+        let (engine, seeds) = node().await;
         let dir = engine.sqlite_backend().expect("sqlite backend");
 
-        // The about-attester (a `lenscore_detector` in prod; an `agent`-typed
-        // key here — `capacity:` is NOT a reserved prefix, so any registered
-        // key may emit it. §7.5 anti-self-emit is a subject≠attester rule,
-        // satisfied because we attest ABOUT other keys).
-        register_key(dir.as_ref(), "lenscore-detector", identity_type::AGENT).await;
+        let det = detector(&seeds, "lenscore-detector").await;
+        register_attester(&engine, &det, "lenscore-detector", identity_type::AGENT).await;
         register_key(dir.as_ref(), "agent-alpha", identity_type::AGENT).await;
         register_key(dir.as_ref(), "agent-bravo", identity_type::AGENT).await;
 
         let valid_until = Utc::now() + chrono::Duration::hours(24);
 
-        // Agent alpha: composite + two factors.
         seed_capacity(
             dir.as_ref(),
+            &det,
             "lenscore-detector",
             "agent-alpha",
             "composite",
@@ -448,6 +479,7 @@ mod flow_a_real_data {
         .await;
         seed_capacity(
             dir.as_ref(),
+            &det,
             "lenscore-detector",
             "agent-alpha",
             "core_identity",
@@ -457,6 +489,7 @@ mod flow_a_real_data {
         .await;
         seed_capacity(
             dir.as_ref(),
+            &det,
             "lenscore-detector",
             "agent-alpha",
             "integrity",
@@ -464,9 +497,9 @@ mod flow_a_real_data {
             valid_until,
         )
         .await;
-        // Agent bravo: composite only.
         seed_capacity(
             dir.as_ref(),
+            &det,
             "lenscore-detector",
             "agent-bravo",
             "composite",
@@ -475,7 +508,6 @@ mod flow_a_real_data {
         )
         .await;
 
-        // ── Flow A read at the PUBLIC scope (the opted-in projection). ──
         let roster = build_roster(dir.as_ref(), CallerScope::Unauthenticated)
             .await
             .expect("build_roster must succeed");
@@ -483,20 +515,15 @@ mod flow_a_real_data {
         assert_eq!(roster.projection, "public_sample");
         assert_eq!(roster.agents.len(), 2, "two opted-in agents expected");
 
-        // Agents are BTreeMap-ordered by attested_key_id.
         let alpha = roster
             .agents
             .iter()
             .find(|a| a.key_id == "agent-alpha")
             .expect("alpha present");
-        assert_eq!(
-            alpha.capacity_composite,
-            Some(0.87),
-            "composite projected from capacity:composite:v1"
-        );
+        assert_eq!(alpha.capacity_composite, Some(0.87));
         assert_eq!(alpha.factors.get("core_identity"), Some(&0.9));
         assert_eq!(alpha.factors.get("integrity"), Some(&0.8));
-        assert!(alpha.valid_until.is_some(), "freshness bound surfaced");
+        assert!(alpha.valid_until.is_some());
 
         let bravo = roster
             .agents
@@ -504,32 +531,28 @@ mod flow_a_real_data {
             .find(|a| a.key_id == "agent-bravo")
             .expect("bravo present");
         assert_eq!(bravo.capacity_composite, Some(0.42));
-        assert!(bravo.factors.is_empty(), "bravo has no factors");
+        assert!(bravo.factors.is_empty());
 
-        // ── Field-compatibility with the lens scoring feed: serialize the
-        // roster as `/api/v1/scoring` would and assert the lens shape
-        // {key_id, capacity_composite, valid_until}. ──
+        // Lens scoring-feed field compatibility.
         let json = serde_json::to_value(&roster).expect("serialize roster");
         let first = &json["agents"][0];
-        assert!(first.get("key_id").is_some(), "key_id field present");
-        assert!(
-            first.get("capacity_composite").is_some(),
-            "capacity_composite present"
-        );
-        assert!(first.get("valid_until").is_some(), "valid_until present");
+        assert!(first.get("key_id").is_some());
+        assert!(first.get("capacity_composite").is_some());
+        assert!(first.get("valid_until").is_some());
     }
 
     #[tokio::test]
     async fn expired_capacity_rows_are_dropped_by_freshness() {
-        let (engine, _seeds) = node().await;
+        let (engine, seeds) = node().await;
         let dir = engine.sqlite_backend().expect("sqlite backend");
-        register_key(dir.as_ref(), "lenscore-detector", identity_type::AGENT).await;
+        let det = detector(&seeds, "lenscore-detector").await;
+        register_attester(&engine, &det, "lenscore-detector", identity_type::AGENT).await;
         register_key(dir.as_ref(), "agent-stale", identity_type::AGENT).await;
 
-        // valid_until in the PAST → the filter's `valid_at: now` drops it.
         let past = Utc::now() - chrono::Duration::hours(1);
         seed_capacity(
             dir.as_ref(),
+            &det,
             "lenscore-detector",
             "agent-stale",
             "composite",

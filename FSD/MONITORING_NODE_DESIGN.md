@@ -7,6 +7,21 @@
 > public mesh-monitoring agent**: it reads the mesh's signed `scores`, aggregates
 > them into the live surface ciris.ai displays, and attests CIRIS service health
 > back into the fabric as signed CEG.
+>
+> **Realized architecture (as built):** ciris-status IS the `ciris-server` crate
+> (the whole fabric node) **+ a `StatusAdapter`**, mirroring CIRISAgent's adapter
+> model — the literal expression of `monitoring agent = fabric node + monitoring
+> cards`. `ciris_server::serve_with_adapter` is the node (one shared persist
+> `Engine`, the edge, `consent:replication` peering + A↔B replication, the read
+> API, NodeCode, ownership, the safety foundation, NAT-traversal). The
+> `StatusAdapter` (`src/adapter.rs`, `impl ciris_server::Adapter`) is the
+> "monitoring cards": its `routers()` contribute the status HTTP surface (merged
+> onto the node's read-API listener) and its `run_lifecycle()` runs the two flows
+> below. There is **no duplicate federation code** and **no optional `fabric`
+> feature** — ciris-status is always a node. The flows talk to the node's corpus
+> through `AdapterContext::engine` (Flow A reads via `engine.sqlite_backend()`,
+> Flow B signs + emits via `Engine::sign_hybrid` + `FederationDirectory::put_attestation`);
+> the node self-registers its own signing key at boot, so Flow B rows admit.
 
 ## 0. Why this shape
 
@@ -39,8 +54,11 @@ health `scores`**.
 
 ### Flow A — read & aggregate → the website sockets
 1. **Read** `scores` rows on `capacity:*` (per opted-in agent) and `system:*`
-   (per node self-report) from the shared corpus / federation directory — the
-   same reads any fabric node can do, signature-verified.
+   (per node self-report) from **Node B's OWN local corpus / federation
+   directory** — the same reads any fabric node can do, signature-verified. Node
+   A's `capacity:*` lands in B's corpus by consented A↔B anti-entropy replication
+   (a directed `consent:replication:v1` grant + mutual key registration); Node B
+   never reads Node A's database directly.
 2. **Gate by consent / access tier.** ciris-status is a **public-tier reader**:
    it may surface only what the subject opted in to (the `public_sample` /
    consent projection — see §4). The lens-python "key_id + CIRIS score of each
