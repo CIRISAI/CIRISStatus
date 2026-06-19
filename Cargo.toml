@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -17,16 +17,16 @@ path = "src/main.rs"
 # ownership + safety + NAT-traversal — is ciris-server's `serve_with_adapter`,
 # and the status page is a `StatusAdapter: ciris_server::Adapter` folded onto the
 # SAME shared core. Default features (NOT python, NOT pkcs11).
-# Pinned to the ciris-server tag carrying the adapter seam (v0.4.10).
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.4.10" }
+# Pinned to the ciris-server tag carrying the adapter seam + the v9.0.3/v5.0.1 floor.
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.4.11" }
 
-# ciris-persist (sqlite) at the SAME pin ciris-server uses (v9.0.2) so the
-# lockfile resolves a SINGLE ciris-persist (ciris-server's path dep pins v9.0.2
-# too). The adapter touches persist types directly: `Engine::sqlite_backend()`
+# ciris-persist (sqlite) at the SAME pin ciris-server uses (v9.0.3) so the
+# lockfile resolves a SINGLE ciris-persist (ciris-server pins v9.0.3 too).
+# The adapter touches persist types directly: `Engine::sqlite_backend()`
 # (the SqliteBackend handle that impls both ReadEngine + FederationDirectory),
 # `CallerScope::Unauthenticated` (the Flow-A public read scope), and the
 # federation `Attestation` row emit_liveness assembles.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v9.0.2", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v9.0.3", features = ["sqlite"] }
 
 # Impl `ciris_server::Adapter` (async fn in trait). async-trait 0.1 + axum 0.8
 # match ciris-server.
