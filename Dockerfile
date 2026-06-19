@@ -17,7 +17,12 @@
 ARG RUST_VERSION=1.90
 
 # ── build stage ──────────────────────────────────────────────────────────────
-FROM rust:${RUST_VERSION}-slim AS build
+# PIN the build base to bookworm (glibc 2.36) so it MATCHES the bookworm runtime
+# stage below. The bare `-slim` tag tracks the latest Debian (trixie, glibc 2.39),
+# which produced a binary needing GLIBC_2.39 that the bookworm runtime (2.36)
+# could not load — `cirisstatus:v0.3.2: GLIBC_2.39 not found` (CIRISServer#33).
+# Build glibc must be ≤ runtime glibc; pinning both to bookworm guarantees it.
+FROM rust:${RUST_VERSION}-slim-bookworm AS build
 WORKDIR /app
 
 # Substrate build deps. libtss2-dev (ciris-keyring's TPM backend links tss2) +

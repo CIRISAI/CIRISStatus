@@ -34,3 +34,29 @@ jobs:
         run: cargo build --release
       - name: test — Flow A real-data + Flow B sign proofs
         run: cargo test
+
+  # Run the binary INSIDE the actual runtime IMAGE — not just the build host.
+  # The build host has the newest glibc + every -dev lib, so a cargo build can be
+  # green while the published image crash-loops at exec on a missing runtime lib
+  # (libtss2-esys.so.0 → CIRISServer#28) or too-new glibc (GLIBC_2.39 →
+  # CIRISServer#33). This catches that whole class: build the image, then exec the
+  # binary in it with a fast-failing arg — if it reaches the argparser ("unknown
+  # serve arg"), it LOADED (glibc + every .so resolved). A dynamic-link/glibc
+  # failure prints "GLIBC_… not found" / "cannot open shared object file" instead,
+  # failing the grep.
+  image-runtime-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the runtime image
+        run: docker build -t ciris-status:smoke .
+      - name: Exec the binary in the image (proves it loads — glibc + .so)
+        run: |
+          set -o pipefail
+          out=$(docker run --rm ciris-status:smoke --bogus-flag 2>&1 || true)
+          echo "$out"
+          # Reaching the argparser ("unknown arg: --bogus-flag … usage: ciris-status")
+          # proves the binary LOADED — glibc + every .so resolved. A dynamic-link/glibc
+          # failure prints "GLIBC_… not found" / "cannot open shared object file" instead.
+          echo "$out" | grep -q "usage: ciris-status" \
+            || { echo "::error::image binary failed to exec (glibc/.so runtime gap) — never reached the argparser"; exit 1; }
