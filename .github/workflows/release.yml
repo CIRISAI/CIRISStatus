@@ -1,16 +1,14 @@
 name: Release
 
 # On a `v*` tag: build + publish the ciris-status container image to GHCR (the
-# "blessed release" the CIRISBridge ansible role stands Node B up from), plus a
-# stripped x86_64 + aarch64 binary attached to the GitHub Release.
+# "blessed release" the CIRISBridge ansible role stands the status node up from),
+# plus a stripped x86_64 + aarch64 binary attached to the GitHub Release.
 #
-# The image is built with `--features fabric` (Node B — the only build that
-# serves real mesh data). A second `:status` tag is the default-feature
-# status-page-only build for deployments that just want the prober.
-#
-# Mirrors CIRISServer's release patterns: native x86_64 + aarch64 runners (the
-# TPM/keyring backend can't cross-compile, so aarch64 builds NATIVELY on an ARM
-# runner), allow-fail on the hard lanes so they never block the release.
+# ciris-status is now ALWAYS a node: it = ciris-server (the whole fabric) + a
+# StatusAdapter. There is no `fabric` feature and no status-page-only variant —
+# one image, default features. (Mirrors CIRISServer's release patterns: native
+# x86_64 + aarch64 runners; the TPM/keyring backend can't cross-compile, so
+# aarch64 builds NATIVELY on an ARM runner and is allow-fail so it never blocks.)
 
 on:
   push:
@@ -32,33 +30,21 @@ permissions:
 jobs:
   # ── Container image → GHCR (the bridge's contract) ──────────────────────────
   image:
-    name: Image (${{ matrix.platform }}, ${{ matrix.variant }})
+    name: Image (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Node B (fabric) — the real monitoring node. amd64 native.
+          # The status node — amd64 native.
           - platform: linux/amd64
             runner: ubuntu-latest
-            features: fabric
-            variant: fabric
-            suffix: ""
-          # Node B (fabric) — arm64 native (TPM/keyring backend needs a native
+          # The status node — arm64 native (TPM/keyring backend needs a native
           # libtss2; cross from amd64 has no target lib). Allowed to fail so it
           # never blocks the amd64 release.
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
-            features: fabric
-            variant: fabric
-            suffix: ""
             allow_fail: true
-          # Default status-page-only build (no substrate) — amd64.
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            features: ""
-            variant: status
-            suffix: "-status"
     continue-on-error: ${{ matrix.allow_fail || false }}
     steps:
       - uses: actions/checkout@v4
@@ -86,18 +72,16 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           push: true
-          build-args: |
-            FEATURES=${{ matrix.features }}
-          # Per-arch, per-variant tag. A `manifest` job (below) stitches the
-          # fabric arches into the canonical multi-arch tags.
+          # Per-arch tag. The `manifest` job (below) stitches the arches into the
+          # canonical multi-arch tags.
           tags: |
-            ${{ env.IMAGE }}:${{ github.ref_name }}${{ matrix.suffix }}-${{ steps.tag.outputs.arch }}
-          cache-from: type=gha,scope=${{ matrix.variant }}-${{ steps.tag.outputs.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ steps.tag.outputs.arch }}
+            ${{ env.IMAGE }}:${{ github.ref_name }}-${{ steps.tag.outputs.arch }}
+          cache-from: type=gha,scope=node-${{ steps.tag.outputs.arch }}
+          cache-to: type=gha,mode=max,scope=node-${{ steps.tag.outputs.arch }}
 
-  # ── Multi-arch manifest for the fabric (Node B) image ───────────────────────
+  # ── Multi-arch manifest (the canonical status-node image) ───────────────────
   manifest:
-    name: Multi-arch manifest (fabric)
+    name: Multi-arch manifest
     needs: [image]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
@@ -121,10 +105,6 @@ jobs:
           for t in "${IMAGE}:${TAG}" "${IMAGE}:latest"; do
             docker buildx imagetools create -t "$t" $SRCS
           done
-          # Status-only image (amd64) gets its own tags.
-          docker buildx imagetools create \
-            -t "${IMAGE}:${TAG}-status" -t "${IMAGE}:status" \
-            "${IMAGE}:${TAG}-status-amd64"
 
   # ── Stripped binaries → GitHub Release ──────────────────────────────────────
   binaries:
@@ -146,14 +126,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install build deps (substrate fabric feature)
+      - name: Install build deps (substrate)
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
         with:
           key: release-${{ matrix.target }}-${{ github.ref_name }}
-      - name: Build (fabric, release)
-        run: cargo build --release --locked --features fabric --target ${{ matrix.target }}
+      - name: Build (release)
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Stage + strip
         shell: bash
         run: |
@@ -202,11 +182,12 @@ jobs:
           body: |
             ## ciris-status ${{ github.ref_name }}
 
-            **Container images (GHCR):**
-            - `ghcr.io/cirisai/cirisstatus:${{ github.ref_name }}` — Node B (fabric; serves real mesh data)
-            - `ghcr.io/cirisai/cirisstatus:${{ github.ref_name }}-status` — status-page-only (default build)
+            ciris-status = ciris-server (the whole fabric node) + a StatusAdapter.
 
-            Deploy with `docker-compose.fabric.yml`; see `DEPLOY.md` for the cutover runbook.
+            **Container image (GHCR):**
+            - `ghcr.io/cirisai/cirisstatus:${{ github.ref_name }}` (and `:latest`) — the status node (multi-arch).
+
+            Deploy with `docker-compose.yml`; see `DEPLOY.md` for the cutover runbook.
           files: |
             release/*.tar.gz
             release/*.tar.gz.sig
