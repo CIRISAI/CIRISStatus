@@ -7,8 +7,10 @@
 # Build:
 #   docker build -t ciris-status:latest .
 #
-# The node binds the Reticulum port (default :4242); the read API + the status
-# routers bind port + 1 (default :4243) — point the status reverse-proxy there.
+# ZERO ENV (ciris-server 0.5): boot takes only `--home <path>` / `--key-id <name>`
+# on the CLI (passed by docker-compose `command:`). No env vars. The node binds
+# the Reticulum port (default :4242); the read API + the status routers bind
+# port + 1 (default :4243) — point the status reverse-proxy there.
 
 # The substrate graph (ciris-persist/verify/edge) requires a recent stable rustc
 # (redb 4.1 → 1.89, time → 1.88).
@@ -25,10 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libtss2-dev libsqlite3-dev pkg-config build-essential git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# NOTE: ciris-status depends on ../CIRISServer as a path dep, so the build context
-# must include both repos (build from a parent dir, or swap to the git pin once
-# the adapter-seam ciris-server is tagged). The COPY below assumes ciris-status is
-# the context root with CIRISServer available as a sibling path dep.
+# ciris-server is a git pin (tag v0.5.0) — fetched by cargo from the committed
+# Cargo.lock, so the build context is just this repo (no sibling path dep).
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
@@ -49,13 +49,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /ciris-status /usr/local/bin/ciris-status
 
-# The node data dir (corpus DB + minted identity) and the uptime-history DB live
-# on volumes.
-ENV CIRIS_HOME=/data/ciris \
-    STATUS_DB_PATH=/data/status.db
+# The node data dir (corpus DB + minted identity) and the uptime-history DB
+# (<data_dir>/status.db) live on a volume. The data root is set with `--home` at
+# boot (docker-compose passes `--home /data`); there are NO env vars.
 VOLUME ["/data"]
 # 4242 = Reticulum node port; 4243 = read API + status routers.
 EXPOSE 4242 4243
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -fsS http://localhost:4243/health || exit 1
+# Zero-env: pass `--home <path>` / `--key-id <name>` as CMD args (compose does).
+# Defaults if none given: --home /var/lib/ciris --key-id ciris-status.
 ENTRYPOINT ["/usr/local/bin/ciris-status"]

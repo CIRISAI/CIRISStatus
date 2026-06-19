@@ -6,51 +6,44 @@
 # `health:liveness` into that same corpus. Serves the website surface
 # (`/api/v1/scoring`, SSE/WS, status, history) ciris.ai consumes.
 #
-# Usage:
-#   1. copy .env.example → .env and fill the node + adapter vars (see DEPLOY.md)
-#   2. docker compose up -d
+# ZERO ENV (ciris-server 0.5 zero-env model). The container boots with only two
+# CLI inputs: `--home <data-root>` and `--key-id <federation-key-label>`. There
+# are NO environment variables. Everything else — the listen address, the probe
+# targets, the poll cadence, the CORS allow-list, and `consent:replication`
+# peering — is signed `config:*` / consent CEG, authored by the OWNER at runtime
+# via the desktop client (or `POST /v1/config` + `POST /v1/federation/peering`)
+# AFTER claiming ownership (NodeCode + the one-time claim PIN on fresh boot).
 #
 # Topology: this node owns its OWN corpus (the node's ciris_engine.db under the
 # data dir, NOT a shared DB with the peer). The peer's `capacity:*` data arrives
 # by ANTI-ENTROPY REPLICATION over the federation transport, authorized by a
-# DIRECTED consent grant + mutual key registration that ciris-server performs —
-# NOT by mounting the peer's database. Set the CIRIS_PEER_B_* vars to enable the
-# peer leg; without them the node runs solo (self-attests, no replication).
+# DIRECTED consent grant + mutual key registration — NEVER by mounting the peer's
+# database.
+#
+# Usage:
+#   1. docker compose up -d
+#   2. claim ownership + author config:* (see DEPLOY.md / .env.example)
 
 services:
   ciris-status:
     image: ghcr.io/cirisai/cirisstatus:${CIRIS_STATUS_TAG:-latest}
     # To build locally instead of pulling the blessed image: `docker compose build`.
-    # NOTE: the build context must include ../CIRISServer (the path dep) until the
-    # ciris-server git pin lands — build from a parent dir that contains both repos.
     build:
       context: .
     container_name: ciris-status
     restart: unless-stopped
-    # Bind to the host loopback; nginx/Caddy terminates TLS and proxies in.
+    # Zero-env boot: the ONLY inputs are --home (the data root = the mounted
+    # volume) and --key-id (this node's federation key label).
+    command: ["--home", "/data", "--key-id", "ciris-status"]
     ports:
       # Read API + status routers (the public surface): listen port + 1.
+      # Bind to host loopback; nginx/Caddy terminates TLS and proxies in.
       - "127.0.0.1:4243:4243"
       # The Reticulum node port (federation transport / NAT-traversal).
-      - "${CIRIS_NODE_PORT:-4242}:4242"
-    env_file:
-      - .env
-    environment:
-      # The node + identity + corpus live under CIRIS_HOME on the volume; the node
-      # binds 0.0.0.0:4242 inside the container (read API + status routers :4243).
-      CIRIS_HOME: /data/ciris
-      CIRIS_SERVER_LISTEN_ADDR: 0.0.0.0:4242
-      STATUS_DB_PATH: /data/status.db
-      # ── consent:replication peer (Node A) — OPTIONAL; enables replication ─────
-      # v8.8.0 §5.6.8.15: the peer's OWN self-signed SignedKeyRecord (serde_json),
-      # not raw pubkeys — the admission gate verifies its proof-of-possession.
-      # BOOTSTRAP_PEERS is how this node REACHES Node A on the Reticulum mesh —
-      # required for cross-host replication (the key alone is not a network path).
-      CIRIS_SERVER_BOOTSTRAP_PEERS: ${CIRIS_SERVER_BOOTSTRAP_PEERS:-}
-      CIRIS_PEER_B_KEY_ID: ${CIRIS_PEER_B_KEY_ID:-}
-      CIRIS_PEER_B_KEY_RECORD: ${CIRIS_PEER_B_KEY_RECORD:-}
+      - "4242:4242"
     volumes:
-      # Node data dir (corpus DB + minted identity) AND the uptime-history DB.
+      # Node data dir (corpus DB + minted identity) AND the uptime-history DB
+      # (derived as <data_dir>/status.db). One volume, this node's own corpus.
       - status-data:/data
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:4243/health"]

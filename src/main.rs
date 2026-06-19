@@ -11,9 +11,12 @@
 //! signed `health:liveness:v1` (Flow B) + rebuilds the public roster from this
 //! node's OWN corpus (Flow A) → updates the cache + uptime history + live push.
 //!
-//! Env split: the node reads `CIRIS_SERVER_*` / `CIRIS_PEER_B_*` (identity, DSN,
-//! listen, peering); the StatusAdapter reads only its probe targets, poll cadence,
-//! and CORS origins (see `src/config.rs`).
+//! **Zero env** (Server 0.5 zero-env model): boot takes only `--home <path>` and
+//! `--key-id <name>` on the CLI. The node's identity/listen/peering resolve from
+//! that home + the node's own `config:*` CEG; the StatusAdapter's own config
+//! (probe targets, poll cadence, CORS) is `config:*` CEG read via `graph_config`,
+//! and the uptime-history DB path is derived from the node `data_dir`. There are
+//! no `STATUS_*`/`CIRIS_*` env vars.
 
 mod adapter;
 mod aggregate;
@@ -24,6 +27,16 @@ mod model;
 mod probe;
 mod roster;
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// The data root default. Matches `ciris_server`'s `DEFAULT_CIRIS_HOME`
+/// (`/var/lib/ciris`); the docker-compose deploy passes `--home /data` to point
+/// at the mounted volume.
+const DEFAULT_HOME: &str = "/var/lib/ciris";
+/// The federation key label default for the status node.
+const DEFAULT_KEY_ID: &str = "ciris-status";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -33,11 +46,89 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // The fabric node config (CIRIS_SERVER_* / CIRIS_PEER_B_*).
-    let cfg = ciris_server::ServerConfig::from_env()?;
-    // The status page, as an adapter folded onto the node's shared core.
-    let adapter = std::sync::Arc::new(adapter::StatusAdapter::from_env()?);
+    let (home, key_id) = parse_args(std::env::args().skip(1))?;
 
-    tracing::info!("ciris-status starting as a ciris-server node + StatusAdapter");
+    // Zero-env node config: derived entirely from `--home`/`--key-id` + config:*.
+    let cfg = ciris_server::ServerConfig::from_home(home, key_id)?;
+    // The status page, as an adapter folded onto the node's shared core. It
+    // resolves its own config:* at runtime from the AdapterContext; here it just
+    // primes the HTTP client + live channel (no env, no corpus read yet).
+    let adapter = Arc::new(adapter::StatusAdapter::new()?);
+
+    tracing::info!(
+        data_dir = %cfg.data_dir.display(),
+        "ciris-status starting as a ciris-server node + StatusAdapter (zero-env)"
+    );
     ciris_server::serve_with_adapter(cfg, adapter).await
+}
+
+/// Parse `--home <path>` / `--key-id <name>` (both optional; `--flag=value` also
+/// accepted). Unknown args are an error — fail loud, never silently ignore a
+/// misspelled flag on the boot path. Mirrors ciris-server's `parse_serve_flags`.
+fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, String)> {
+    let mut home: Option<String> = None;
+    let mut key_id: Option<String> = None;
+
+    let mut it = args;
+    while let Some(arg) = it.next() {
+        let (name, eq_value) = match arg.split_once('=') {
+            Some((n, v)) => (n.to_string(), Some(v.to_string())),
+            None => (arg.clone(), None),
+        };
+        let mut take = |arg_name: &str| -> anyhow::Result<String> {
+            match eq_value.clone() {
+                Some(v) => Ok(v),
+                None => it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("{arg_name} needs a value")),
+            }
+        };
+        match name.as_str() {
+            "--home" => home = Some(take("--home")?),
+            "--key-id" => key_id = Some(take("--key-id")?),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unknown arg: {other} (usage: ciris-status [--home <path>] [--key-id <name>])"
+                ))
+            }
+        }
+    }
+
+    Ok((
+        PathBuf::from(home.unwrap_or_else(|| DEFAULT_HOME.to_string())),
+        key_id.unwrap_or_else(|| DEFAULT_KEY_ID.to_string()),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> anyhow::Result<(PathBuf, String)> {
+        parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn defaults_when_no_flags() {
+        let (home, key_id) = parse(&[]).unwrap();
+        assert_eq!(home, PathBuf::from(DEFAULT_HOME));
+        assert_eq!(key_id, DEFAULT_KEY_ID);
+    }
+
+    #[test]
+    fn space_and_eq_forms_parse() {
+        let (home, key_id) = parse(&["--home", "/data", "--key-id", "ciris-status"]).unwrap();
+        assert_eq!(home, PathBuf::from("/data"));
+        assert_eq!(key_id, "ciris-status");
+
+        let (home, key_id) = parse(&["--home=/data", "--key-id=node-b"]).unwrap();
+        assert_eq!(home, PathBuf::from("/data"));
+        assert_eq!(key_id, "node-b");
+    }
+
+    #[test]
+    fn unknown_flag_is_an_error() {
+        assert!(parse(&["--nope"]).is_err());
+        assert!(parse(&["--home"]).is_err()); // missing value
+    }
 }

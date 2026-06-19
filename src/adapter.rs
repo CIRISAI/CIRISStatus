@@ -18,13 +18,18 @@
 //!     tokio interval; exits cleanly when `shutdown` flips true.
 //!   * [`StatusAdapter::start`] / [`StatusAdapter::stop`] log + prime the roster.
 //!
-//! The federation identity, DSN, listen address, and `consent:replication`
-//! peering are all `ciris_server::ServerConfig`'s job (the `CIRIS_SERVER_*` /
-//! `CIRIS_PEER_B_*` env). This adapter's own env is just probe targets, cadence,
-//! and CORS — see [`StatusAdapter::from_env`].
+//! **Zero env** (Server 0.5 zero-env model): the federation identity, listen
+//! address, data dir, and `consent:replication` peering are all
+//! `ciris_server::ServerConfig`'s job (resolved from `--home`/`--key-id` + the
+//! node's `config:*`). This adapter's OWN config — probe targets, poll cadence,
+//! CORS — is `config:*` CEG read at runtime via `graph_config` (see
+//! [`crate::config::Config::resolve`]); the uptime-history DB path is DERIVED
+//! from `ctx.cfg.data_dir` (`<data_dir>/status.db`). [`StatusAdapter::new`]
+//! takes no env and reads no corpus — it just primes the HTTP client + live
+//! channel; everything else resolves from the [`AdapterContext`] at runtime.
 
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -51,17 +56,29 @@ use crate::roster::RosterCache;
 use crate::{aggregate, history};
 
 /// The status page's shared state — what the old `main.rs` `AppState` held,
-/// minus the node concerns (engine/identity/DSN). The engine is reached through
-/// the [`AdapterContext`] the lifecycle/router builders receive.
+/// minus the node concerns (engine/identity/data dir). The engine is reached
+/// through the [`AdapterContext`] the lifecycle/router builders receive.
+///
+/// `cfg` lives behind an `RwLock` so the lifecycle loop can refresh it from
+/// `config:*` each poll cycle (owner-authored config changes are picked up live,
+/// no restart). `db` is opened lazily in [`Adapter::start`] once the node
+/// `data_dir` is known (the path is `<data_dir>/status.db`).
 #[derive(Clone)]
 struct AppState {
-    cfg: Arc<Config>,
+    cfg: Arc<RwLock<Config>>,
     client: reqwest::Client,
-    db: history::Db,
+    db: Arc<RwLock<Option<history::Db>>>,
     /// Flow A public roster snapshot (served by `/api/v1/scoring`).
     roster: RosterCache,
     /// Live-push fan-out for roster + health deltas (the "extra website sockets").
     live_tx: broadcast::Sender<LiveDelta>,
+}
+
+impl AppState {
+    /// A snapshot clone of the current resolved config.
+    fn cfg(&self) -> Config {
+        self.cfg.read().expect("cfg lock").clone()
+    }
 }
 
 fn now_z() -> String {
@@ -71,19 +88,19 @@ fn now_z() -> String {
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
 async fn root(State(st): State<AppState>) -> impl IntoResponse {
-    Json(json!({ "service": "ciris-status", "version": st.cfg.version }))
+    Json(json!({ "service": "ciris-status", "version": st.cfg().version }))
 }
 
 async fn health(State(st): State<AppState>) -> impl IntoResponse {
-    Json(json!({ "status": "healthy", "timestamp": now_z(), "version": st.cfg.version }))
+    Json(json!({ "status": "healthy", "timestamp": now_z(), "version": st.cfg().version }))
 }
 
 async fn v1_status(State(st): State<AppState>) -> impl IntoResponse {
-    Json(aggregate::service_status(&st.cfg, &st.client).await)
+    Json(aggregate::service_status(&st.cfg(), &st.client).await)
 }
 
 async fn api_status(State(st): State<AppState>) -> impl IntoResponse {
-    Json(aggregate::aggregated_status(&st.cfg, &st.client).await)
+    Json(aggregate::aggregated_status(&st.cfg(), &st.client).await)
 }
 
 #[derive(Deserialize)]
@@ -107,7 +124,20 @@ async fn history(State(st): State<AppState>, Query(q): Query<HistoryParams>) -> 
             return bad("Invalid region. Must be one of: us, eu, global");
         }
     }
-    match history::query_history(&st.db, days, region.as_deref()) {
+    let db = match st.db.read().expect("db lock").clone() {
+        Some(db) => db,
+        None => {
+            // The history store opens in `start()` once data_dir is known; until
+            // then serve an empty history rather than 500.
+            return Json(HistoryResponse {
+                days,
+                region,
+                history: Vec::new(),
+            })
+            .into_response();
+        }
+    };
+    match history::query_history(&db, days, region.as_deref()) {
         Ok(hist) => Json(HistoryResponse {
             days,
             region,
@@ -203,30 +233,38 @@ pub struct StatusAdapter {
 }
 
 impl StatusAdapter {
-    /// Build the adapter from the environment: the probe targets, poll cadence,
-    /// CORS origins, uptime-history DB path, the HTTP client, and the live-push
-    /// channel. The node identity/DSN/listen come from `ServerConfig`, not here.
-    pub fn from_env() -> anyhow::Result<Self> {
-        let cfg = Arc::new(Config::from_env());
-        let db = history::init(&cfg.db_path)?;
+    /// Build the adapter with NO env and NO corpus read: just the HTTP client and
+    /// the live-push channel, plus a baked-default config (no probes, baked CORS,
+    /// 60s cadence). The probe targets, poll cadence, and CORS resolve from
+    /// `config:*` at runtime from the [`AdapterContext`]; the uptime-history DB
+    /// path is derived from `ctx.cfg.data_dir` and the store opens in
+    /// [`Adapter::start`]. The node identity/listen/peering come from
+    /// `ServerConfig`, not here.
+    pub fn new() -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent(concat!("ciris-status/", env!("CARGO_PKG_VERSION")))
             .build()?;
 
-        tracing::info!(
-            db = %cfg.db_path,
-            poll_s = cfg.poll_seconds,
-            regions = cfg
-                .regions
-                .iter()
-                .filter(|r| r.billing_url.is_some() || r.proxy_url.is_some())
-                .count(),
-            external = cfg.external.len(),
-            "StatusAdapter configured"
-        );
+        let (live_tx, _live_rx) = broadcast::channel::<LiveDelta>(64);
+        let state = AppState {
+            // db_path is filled in at `start()` from data_dir; defaults until then.
+            cfg: Arc::new(RwLock::new(Config::defaults(String::new()))),
+            client,
+            db: Arc::new(RwLock::new(None)),
+            roster: RosterCache::default(),
+            live_tx,
+        };
+        Ok(StatusAdapter { state })
+    }
 
-        // Loudly flag any provider set to send its live key — that path can be
-        // BILLABLE (Brave has no free tier/health endpoint as of 2026).
+    /// Re-resolve the adapter `config:*` from this node's OWN corpus and swap it
+    /// in. Called at `start()` and each poll cycle so an owner-authored config
+    /// change is picked up live. `db_path` (derived from `data_dir`) is preserved
+    /// across the swap. Loudly flags any provider opted into BILLABLE keyed probing.
+    async fn refresh_config(&self, ctx: &AdapterContext) {
+        let db_path = self.state.cfg().db_path;
+        let cfg = Config::resolve(&ctx.engine, &ctx.key_id, db_path).await;
+
         for ext in cfg.external.iter().filter(|e| e.authenticated) {
             tracing::warn!(
                 provider = ext.key,
@@ -235,15 +273,7 @@ impl StatusAdapter {
             );
         }
 
-        let (live_tx, _live_rx) = broadcast::channel::<LiveDelta>(64);
-        let state = AppState {
-            cfg,
-            client,
-            db,
-            roster: RosterCache::default(),
-            live_tx,
-        };
-        Ok(StatusAdapter { state })
+        *self.state.cfg.write().expect("cfg lock") = cfg;
     }
 
     /// Rebuild the Flow-A roster from THIS node's OWN corpus and publish it to the
@@ -274,11 +304,11 @@ impl StatusAdapter {
     /// Flow B: probe the configured external services, fold the result into a
     /// `health:liveness:v1` envelope ABOUT this node, and sign + emit it into the
     /// node's own corpus. (Per-keyed-service attestation can layer on later via
-    /// `STATUS_SERVICE_KEYS`; the node always self-attests its own liveness here,
-    /// and that key is already registered by `serve_with_adapter`.)
+    /// a `config:*` service-key map; the node always self-attests its own liveness
+    /// here, and that key is already registered by `serve_with_adapter`.)
     async fn emit_liveness(&self, ctx: &AdapterContext, agg: &crate::model::AggregatedStatus) {
         let now = chrono::Utc::now();
-        let valid_until = now + chrono::Duration::seconds(self.state.cfg.poll_seconds as i64);
+        let valid_until = now + chrono::Duration::seconds(self.state.cfg().poll_seconds as i64);
 
         // Fold every probed region/provider as evidence behind the node's own
         // liveness score (non-keyed infra is evidence, not a subject — §1/§2.2).
@@ -344,7 +374,24 @@ impl Adapter for StatusAdapter {
         }
     }
 
-    fn routers(&self, _ctx: &AdapterContext) -> Vec<axum::Router> {
+    fn routers(&self, ctx: &AdapterContext) -> Vec<axum::Router> {
+        // Derive the uptime-history DB path from the node data dir (convention,
+        // not env, not config) and record it in the shared config so `start()`
+        // can open the store and the lifecycle can preserve it across refreshes.
+        let db_path = crate::config::db_path_for(&ctx.cfg.data_dir);
+        // Resolve CORS (and the rest) from config:* once, synchronously, for the
+        // router's CORS layer. `routers` runs on a runtime worker thread inside
+        // `serve_with_adapter`, so block on the async resolve via block_in_place.
+        let cfg = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(Config::resolve(
+                &ctx.engine,
+                &ctx.key_id,
+                db_path,
+            ))
+        });
+        let cors_layer = cors(&cfg);
+        *self.state.cfg.write().expect("cfg lock") = cfg;
+
         let router = Router::new()
             .route("/", get(root))
             .route("/health", get(health))
@@ -357,13 +404,28 @@ impl Adapter for StatusAdapter {
             .route("/api/v1/scoring/live", get(live_sse))
             .route("/api/v1/status/live", get(live_sse))
             .route("/api/v1/status/ws", get(live_ws))
-            .layer(cors(&self.state.cfg))
+            .layer(cors_layer)
             .with_state(self.state.clone());
         vec![router]
     }
 
     async fn start(&self, ctx: &AdapterContext) -> anyhow::Result<()> {
-        tracing::info!("StatusAdapter starting — initial roster build from own corpus");
+        // Derive + open the uptime-history store from the node data dir.
+        let db_path = crate::config::db_path_for(&ctx.cfg.data_dir);
+        match history::init(&db_path) {
+            Ok(db) => *self.state.db.write().expect("db lock") = Some(db),
+            Err(e) => {
+                tracing::error!(error = %e, db = %db_path, "uptime-history store open failed")
+            }
+        }
+        // Record the derived path + resolve the initial adapter config:* set.
+        self.state.cfg.write().expect("cfg lock").db_path = db_path.clone();
+        self.refresh_config(ctx).await;
+        tracing::info!(
+            db = %db_path,
+            poll_s = self.state.cfg().poll_seconds,
+            "StatusAdapter starting — initial config:* resolved, roster build from own corpus"
+        );
         self.refresh_roster(ctx).await;
         Ok(())
     }
@@ -376,19 +438,35 @@ impl Adapter for StatusAdapter {
         // The uptime-history poller and the live/Flow-A/Flow-B refresh are folded
         // into one interval loop here so they share the node's runtime + shutdown.
         let mut tick =
-            tokio::time::interval(Duration::from_secs(self.state.cfg.poll_seconds.max(1)));
+            tokio::time::interval(Duration::from_secs(self.state.cfg().poll_seconds.max(1)));
+        let mut last_poll = self.state.cfg().poll_seconds;
         tracing::info!(
-            poll_s = self.state.cfg.poll_seconds,
+            poll_s = last_poll,
             "StatusAdapter lifecycle running (probe → emit_liveness → roster refresh → history)"
         );
         loop {
             tokio::select! {
                 _ = tick.tick() => {
+                    // ── Re-resolve config:* so an owner-authored change is live. ──
+                    self.refresh_config(ctx).await;
+                    let cfg = self.state.cfg();
+                    // If the cadence changed, rebuild the interval timer.
+                    if cfg.poll_seconds != last_poll {
+                        last_poll = cfg.poll_seconds;
+                        tick = tokio::time::interval(Duration::from_secs(cfg.poll_seconds.max(1)));
+                        tracing::info!(poll_s = last_poll, "StatusAdapter poll cadence retuned from config:*");
+                    }
+
                     // ── Probe everything once; record the uptime-history rows. ──
-                    history::poll_once(&self.state.cfg, &self.state.client, &self.state.db).await;
+                    // Clone the handle out and drop the guard before awaiting (the
+                    // guard is !Send and would poison the future otherwise).
+                    let db = self.state.db.read().expect("db lock").clone();
+                    if let Some(db) = db {
+                        history::poll_once(&cfg, &self.state.client, &db).await;
+                    }
 
                     // ── Flow B: probe-derived signed health:liveness emit. ──
-                    let agg = aggregate::aggregated_status(&self.state.cfg, &self.state.client).await;
+                    let agg = aggregate::aggregated_status(&cfg, &self.state.client).await;
                     self.emit_liveness(ctx, &agg).await;
 
                     // ── Flow A: rebuild the public roster from the OWN corpus. ──

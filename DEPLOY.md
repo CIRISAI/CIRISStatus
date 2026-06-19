@@ -27,74 +27,87 @@ database directly**.
 | GitHub Release `ciris-status-<vTAG>-<target>.tar.gz` | stripped binary (x86_64 + aarch64), Sigstore-signed. |
 
 Built by `.github/workflows/release.yml` on a `v*` tag. The image is the blessed
-release; the ansible role pulls it and templates `.env` from the reference below.
+release; the ansible role pulls it and runs it with the two CLI flags below.
 
 > The optional `fabric` feature is **gone** — there is one build now, and it is
 > always a node. There is no "prober-only" image any more.
 
 ---
 
-## 2. Environment reference
+## 2. Configuration — ZERO ENV (ciris-server 0.5 zero-env model)
 
-Copy `.env.example` → `.env`. Env splits in two: the **node** vars (read by
-`ciris_server::ServerConfig`) and the **StatusAdapter** vars (probe/uptime/CORS,
-documented in `README.md`).
+ciris-status takes **no environment variables**. It boots from two CLI flags and
+resolves everything else from **signed CEG objects in its own corpus**, authored
+by the OWNER at runtime. `.env.example` documents this (there is nothing to put
+in a `.env`).
 
-### Node vars (`ciris-server`'s — identity, corpus, listen, peering)
+### Boot inputs (CLI flags — the ONLY two)
 
-| Var | Example | Meaning |
+| Flag | Default | Meaning |
 |---|---|---|
-| `CIRIS_HOME` | `/data/ciris` | base for the data + identity dirs (corpus DB at `<data>/ciris_engine.db`, node seed at `<identity>/ed25519.seed`) |
-| `CIRIS_SERVER_DATA_DIR` / `CIRIS_SERVER_IDENTITY_DIR` | — | override the data / identity dirs individually |
-| `CIRIS_SERVER_LISTEN_ADDR` | `0.0.0.0:4242` | the Reticulum node port; the **read API + the status routers** bind `port + 1` (`:4243`) |
-| `CIRIS_SERVER_KEY_ID` | `ciris-server` | the node's federation `key_id` — the `health:liveness` attester. `serve_with_adapter` self-registers it at boot, so Flow B rows admit with no extra step. |
-| `CIRIS_SERVER_TRANSPORT_NODE` / `CIRIS_SERVER_STORE_AND_FORWARD` | `on` | NAT-traversal infra (relay + mail-for-asleep-edges); default on for a public node |
-| `CIRIS_SERVER_BOOTSTRAP_PEERS` | `lens.ciris.ai:4242` | comma-separated `host:port` Reticulum peers to join the mesh. **Required for cross-host replication** — set it to the lens node (Node A) so this node can actually *reach* the peer whose key you configure below. Without a mesh path, the `CIRIS_PEER_B_*` key is registered but no `capacity:*` ever arrives. |
+| `--home <path>` | `/var/lib/ciris` | the data root. `data_dir = <home>/data`; the corpus is `<data_dir>/ciris_engine.db`, the minted Ed25519 + ML-DSA-65 identity lives under `<home>`, and the uptime-history DB is **derived** as `<data_dir>/status.db`. The docker-compose deploy passes `--home /data` (the mounted volume). |
+| `--key-id <name>` | `ciris-status` | this node's federation `key_id` — the `health:liveness` attester. `serve_with_adapter` self-registers it at boot, so Flow B rows admit with no extra step. |
 
-The node mints its own Ed25519 + ML-DSA-65 identity on first boot under the
-identity dir — there are **no `STATUS_NODE_*` seed vars to manage** any more.
+```sh
+ciris-status --home /data --key-id ciris-status   # docker-compose passes this as command:
+```
 
-> **The corpus is its OWN** — `<CIRIS_HOME>/data/ciris_engine.db`. There is **no
-> `CIRIS_DB_URL`/DSN env**; never share `CIRIS_HOME`/`CIRIS_SERVER_DATA_DIR` with
-> the lens node or bind-mount the lens node's `data/`. Node A's `capacity:*`
-> arrives **only** by the consent:replication leg below — the old "point Node B at
-> Node A's DSN" model is gone.
+The listen address, transport/NAT-traversal toggles, replication cadence, and
+mode are themselves the **node's** `config:*` CEG (resolved at boot, hot-applied)
+— see `ciris-server`'s `src/config.rs`. There is no `CIRIS_*` env any more.
 
-### `consent:replication` peering — CONSENT-DRIVEN (v0.4.12+), not env
+> **The corpus is its OWN** — `<home>/data/ciris_engine.db`. Never share `--home`
+> with the lens node or bind-mount the lens node's `data/`. Node A's `capacity:*`
+> arrives **only** by the consent:replication leg below.
 
-Replication is driven by the **fabric**, not config: the corpus's
-`consent:replication` objects ARE the desired peer set, and `ciris-server`'s
-reconcile loop converges the live runtime to them. **The normal path is the
-owner**, from the desktop client (or `POST /v1/federation/peering`): claim
-ownership of this node, then author a `consent:replication` grant naming Node A.
-The grant lands in the corpus → the reconciler picks it up → A's `capacity:*`
-flows INTO B's own corpus. No env, no restart-to-add (see the interim note).
+### Adapter config:* (probe targets, poll cadence, CORS) — owner-authored
 
-`CIRIS_PEER_B_*` is now an **optional boot bootstrap** only — it just *writes that
-same consent object* at boot so an unattended deploy can pre-seed the peer. Unset
-⇒ B runs solo (self-registers + emits its own `health:liveness`; roster stays
-empty until an owner authors the consent grant).
+The StatusAdapter's own config is `config:*` CEG under the `status.` namespace,
+read live each poll cycle via `graph_config` (an owner change is picked up with
+**no restart**). Author it via the desktop client or `POST /v1/config` after
+claiming ownership. Keys (full table in `src/config.rs` / `README.md`):
 
-| Var | Example | Meaning |
+| key | type | default |
 |---|---|---|
-| `CIRIS_PEER_B_KEY_ID` | `ciris-server` | (optional bootstrap) the peer's federation key_id — written into a consent object at boot |
-| `CIRIS_PEER_B_KEY_RECORD` | `{"record":{…}}` | (optional bootstrap) the peer's exported **self-signed** `SignedKeyRecord` (persist v9.0.3 serde_json, single line). The v8.8.0+ gate verifies proof-of-possession — neither side can fabricate the other's row. |
-| `CIRIS_SERVER_BOOTSTRAP_PEERS` | `lens.ciris.ai:4242` | (node var, above) the Reticulum mesh path to Node A — **still required** for replication to reach it, whether peering came from the owner or the bootstrap env. |
-| `CIRIS_SERVER_REPLICATION_RECONCILE_SECS` | `30` | reconcile cadence (also fires immediately on a peering write). |
+| `status.poll_secs` | i64 | `60` |
+| `status.cors_origins` | list | baked `ciris.ai` set |
+| `status.ghcr_url` | str | `https://ghcr.io/v2/` |
+| `status.grafana_url` / `status.database_url` | str | — (skipped) |
+| `status.region.<us\|eu>.{name,billing_url,proxy_url,infra_url}` | str | baked label / skipped |
+| `status.external.<exa\|brave\|serper\|tavily>.{url,api_key,auth}` | str/bool | skipped / keyless |
 
-> **Interim (edge v5.0.1 — CIRISEdge#173):** a consent authored at runtime registers
-> the peer for **inbound** immediately, but B begins **active pull** of A's
-> `capacity:*` only after the **next restart** (boot re-derives the Initiator set
-> from the corpus). So with the owner-GUI flow today: claim → author consent →
-> restart B once → replication is live. The bootstrap-env path avoids the restart
-> (the consent exists at boot). The restart requirement drops when CIRISEdge#173 ships.
+A region or external provider is probed **only** when its `*_url` is set. On a
+fresh node (no `config:*` yet) the adapter runs with defaults: **no probes**, the
+baked CORS allow-list, 60s cadence — correct, not an error.
 
-> Note the env name is `ciris-server`'s `CIRIS_PEER_B_*` (its "peer B" slot is the
-> directed-consent peer). The full peering/transport env reference is
-> `ciris-server`'s `src/config.rs`.
+```sh
+curl -X POST https://status.ciris.ai/v1/config \
+  -d '{"key":"status.region.us.billing_url","value":"https://billing.us.example/"}'
+curl -X POST https://status.ciris.ai/v1/config \
+  -d '{"key":"status.poll_secs","value":60}'
+```
 
-This node logs its OWN `SignedKeyRecord` (JSON) at boot — hand that to the peer as
-its corresponding peer-config artifact; the contract is symmetric.
+### `consent:replication` peering — CONSENT-DRIVEN, runtime, no env
+
+Replication is driven by the **fabric**: the corpus's `consent:replication`
+objects ARE the desired peer set, and `ciris-server`'s reconcile loop converges
+the live runtime to them — fully no-restart on edge v5.1.0 (CIRISEdge#173
+resolved). Claim ownership of this node, then author a `consent:replication`
+grant naming Node A (desktop client or `POST /v1/federation/peering`). The grant
+lands in the corpus → the reconciler picks it up → A's `capacity:*` flows INTO
+B's own corpus, live. Unset ⇒ B runs solo (self-registers + emits its own
+`health:liveness`; roster stays empty until a grant is authored).
+
+```sh
+curl -X POST https://status.ciris.ai/v1/federation/peering \
+  -d '{"peer_key_id":"ciris-server-steward","peer_key_record":{...}}'
+```
+
+The peer admission gate verifies proof-of-possession — neither side can fabricate
+the other's `SignedKeyRecord` (both nodes are on persist v9.0.3). This node logs
+its OWN `SignedKeyRecord` (JSON) at boot — hand that to the peer as its
+corresponding peer-config artifact; the contract is symmetric. The reachability
+mesh path to Node A (the Reticulum bootstrap peer) is itself node `config:*`.
 
 ---
 
@@ -109,23 +122,24 @@ cutover covers ONLY the public scoring/status surface (Phase 2 of the design §6
    curl -fsS http://127.0.0.1:4243/health
    ```
    Confirm the logs show `ciris-status starting as a ciris-server node +
-   StatusAdapter`, `StatusAdapter lifecycle running`, and the node's
+   StatusAdapter (zero-env)`, `StatusAdapter lifecycle running`, and the node's
    self-registration line.
 
 2. **Enable A↔B consented replication.** The corpus is **B's OWN local corpus**
    (the node's `ciris_engine.db` under the data dir, never Node A's DB file). To
-   pull A's `capacity:*` INTO it, set the `CIRIS_PEER_B_*` vars (§2): `ciris-server`
-   registers the peer's key, emits the directed `consent:replication:v1` grant,
-   and runs A↔B replication. Hand the peer the `SignedKeyRecord` this node logs at
-   boot so it registers + replicates symmetrically. The roster is **empty until
-   replication delivers** — that is correct, not an error. Verify Flow A serves
-   **real** rows once replication has run:
+   pull A's `capacity:*` INTO it, claim ownership and author a `consent:replication`
+   grant naming Node A (§2): `ciris-server` registers the peer's key, emits the
+   directed `consent:replication:v1` grant, and runs A↔B replication — live, no
+   restart. Hand the peer the `SignedKeyRecord` this node logs at boot so it
+   registers + replicates symmetrically. The roster is **empty until replication
+   delivers** — that is correct, not an error. Verify Flow A serves **real** rows
+   once replication has run:
    ```sh
    curl -fsS http://127.0.0.1:4243/api/v1/scoring | jq '.agents[0]'
    # expect {key_id, capacity_composite, factors?, valid_until} — the lens shape.
    ```
    If `agents` is empty: replication hasn't delivered opted-in `capacity:*` rows
-   yet, the peer env is unset/wrong, or this node's key isn't admitted at the peer.
+   yet, no consent grant is authored, or this node's key isn't admitted at the peer.
    (Empty is well-formed, not an error.)
    Verify Flow B emits: look for `Flow B: emitted signed health:liveness:v1` in the
    logs after one poll cadence.
@@ -180,8 +194,9 @@ location /api/v1/ {
 }
 ```
 
-CORS for the public origins (`ciris.ai`, `www.ciris.ai`, `agents.ciris.ai`) is
-already allow-listed in the binary (`src/config.rs`).
+CORS defaults to the public origins (`ciris.ai`, `www.ciris.ai`,
+`agents.ciris.ai`) baked into the binary (`src/config.rs`); override the
+allow-list at runtime with the `status.cors_origins` `config:*` key (§2).
 
 **DNS:** point `status.ciris.ai` A/AAAA at the Node B host. If Node B runs on the
 same host as the lens, a path route on the existing host works too — but a
@@ -193,6 +208,9 @@ route change.
 ## 5. Cost safety (unchanged)
 
 Flow B reuses the same cost-safe aggregated probe — it never authed-probes paid
-providers in the loop, and the 60s uptime poller never probes external providers
-at all (their health comes from the proxy's `/v1/status`). See `README.md`
-"Monitoring billable providers". Leave `BRAVE_HEALTH_AUTH` unset.
+providers in the loop, and the uptime poller never probes external providers at
+all (their health comes from the proxy's `/v1/status`). External providers probe
+**keyless by default**; keyed (possibly BILLABLE) probing is opt-in per provider
+via the `status.external.<p>.auth = true` config key. See `README.md` "Monitoring
+billable providers". Leave `status.external.brave.auth` unset (Brave bills health
+checks).

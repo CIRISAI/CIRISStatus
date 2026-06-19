@@ -17,9 +17,11 @@ The status surface itself is still pure outbound HTTP probes + a SQLite uptime
 history written by the adapter's poll loop. No Grafana, no TimescaleDB, no OAuth,
 no ingest pipeline — those retire with Lens.
 
-> **Release note:** `ciris-status` currently depends on `ciris-server` as a path
-> dep (`../CIRISServer`). The release pin (`{ git = "…/CIRISServer", tag }`) lands
-> once the adapter-seam `ciris-server` is tagged.
+> **Zero env (ciris-server 0.5):** ciris-status takes **no environment
+> variables**. It boots from two CLI flags — `--home <path>` and `--key-id <name>`
+> — and resolves everything else from signed `config:*` / consent CEG objects in
+> its own corpus, authored by the owner at runtime. Pinned to `ciris-server`
+> `v0.5.0`.
 
 ## Endpoints
 
@@ -69,39 +71,49 @@ Response shapes match the Lens API field-for-field (status strings
 `operational\|degraded\|outage`; aggregate overall
 `operational\|degraded\|partial_outage\|major_outage`).
 
-## Configuration (env)
+## Configuration — ZERO ENV
 
-Env splits in two: the **node** env (read by `ciris_server::ServerConfig`) and the
-**StatusAdapter** env (probe targets, cadence, CORS — read by `src/config.rs`).
+ciris-status takes **no environment variables**. Boot takes two CLI flags; all
+other config is signed CEG, owner-authored at runtime.
 
-### Node env (`ciris-server`'s — identity, listen, peering)
+### Boot (CLI flags — the only inputs)
 
-| Var | Default | Meaning |
+| Flag | Default | Meaning |
 |---|---|---|
-| `CIRIS_HOME` / `CIRIS_SERVER_DATA_DIR` / `CIRIS_SERVER_IDENTITY_DIR` | `~/ciris/…` | data + identity dirs. The corpus is **always** SQLite at `<data>/ciris_engine.db` — there is **no `CIRIS_DB_URL`/DSN env**, and this node's corpus is its **OWN** (never share dirs with / mount the lens node's DB). |
-| `CIRIS_SERVER_LISTEN_ADDR` | `0.0.0.0:4242` | the Reticulum node port; the read API (and the status routers) bind `port + 1` (`:4243`) |
-| `CIRIS_SERVER_KEY_ID` | `ciris-server` | the node's federation `key_id` (the `health:liveness` attester) |
-| `CIRIS_SERVER_BOOTSTRAP_PEERS` | — | comma-sep `host:port` Reticulum peers to join the mesh — **set to Node A for cross-host replication** (how this node reaches the `CIRIS_PEER_B_*` peer) |
-| `CIRIS_PEER_B_KEY_ID` / `CIRIS_PEER_B_KEY_RECORD` | — | the `consent:replication` peer (Node A / the lens node) — its `key_id` + exported self-signed `SignedKeyRecord` JSON. A's `capacity:*` arrives **only** via this leg, into this node's own corpus. |
-| `CIRIS_SERVER_TRANSPORT_NODE` / `CIRIS_SERVER_STORE_AND_FORWARD` | `on` | NAT-traversal infra (relay + mail-for-asleep-edges) |
+| `--home <path>` | `/var/lib/ciris` | the data root. `data_dir = <home>/data`; corpus `<data_dir>/ciris_engine.db`; minted Ed25519 + ML-DSA-65 identity under `<home>`; the uptime-history DB is **derived** as `<data_dir>/status.db`. The corpus is this node's **OWN** — never share `--home` with / mount the lens node's DB. |
+| `--key-id <name>` | `ciris-status` | the node's federation `key_id` (the `health:liveness` attester; self-registered at boot by `serve_with_adapter`). |
 
-The full node env reference is `ciris-server`'s `src/config.rs`.
+The node's listen address, transport/NAT-traversal, replication cadence, and mode
+are the **node's** `config:*` CEG (resolved at boot) — see `ciris-server`'s
+`src/config.rs`. The read API + status routers bind the Reticulum port + 1
+(default `:4243`).
 
-### StatusAdapter env (probe targets, cadence, CORS)
+### Adapter config:* (probe targets, cadence, CORS) — `config:*` CEG
 
-Every probe target is optional — an unset `*_URL` simply omits that component.
+The StatusAdapter resolves its own config from signed `config:*` objects in this
+node's corpus (read live each poll cycle via `graph_config` — owner changes apply
+with **no restart**), all under the `status.` namespace. Author via the desktop
+client or `POST /v1/config` after claiming ownership. A region/external provider
+is probed **only** when its `*_url` is set; a fresh node runs with no probes, the
+baked CORS allow-list, and 60s cadence.
 
-| Var | Default | Meaning |
-|---|---|---|
-| `STATUS_DB_PATH` | `status.db` | SQLite **uptime-history** file (the status page's own store; distinct from the node corpus) |
-| `STATUS_POLL_SECONDS` | `60` | probe + roster-refresh + history poll cadence |
-| `DATABASE_URL` | — | local `postgresql` provider (TCP liveness probe) |
-| `GRAFANA_URL` | — | local `grafana` provider (`/api/health`) |
-| `US_BILLING_URL` / `US_PROXY_URL` / `VULTR_HEALTH_URL` | — | US region |
-| `EU_BILLING_URL` / `EU_PROXY_URL` / `HETZNER_HEALTH_URL` | — | EU region |
-| `GHCR_HEALTH_URL` | `https://ghcr.io/v2/` | container registry (401 = up, 3s threshold) |
-| `{EXA,BRAVE,SERPER,TAVILY}_HEALTH_URL` / `_API_KEY` | — | external search providers (see cost note) |
-| `{EXA,BRAVE,SERPER,TAVILY}_HEALTH_AUTH` | `false` | send the live key when probing — **billable for some providers** |
+| key | type | default | meaning |
+|---|---|---|---|
+| `status.poll_secs` | i64 | `60` | probe + roster-refresh + history poll cadence |
+| `status.cors_origins` | list | baked `ciris.ai` set | CORS allow-list |
+| `status.ghcr_url` | str | `https://ghcr.io/v2/` | container registry (401 = up) |
+| `status.database_url` | str | — | local `postgresql` provider (TCP liveness) |
+| `status.grafana_url` | str | — | local `grafana` provider (`/api/health`) |
+| `status.region.<us\|eu>.name` | str | baked label | region display name |
+| `status.region.<us\|eu>.billing_url` | str | — | regional billing `/v1/status` |
+| `status.region.<us\|eu>.proxy_url` | str | — | regional LLM-proxy `/v1/status` |
+| `status.region.<us\|eu>.infra_url` | str | — | infra host health (Vultr/Hetzner) |
+| `status.external.<exa\|brave\|serper\|tavily>.url` | str | — | external search provider health URL |
+| `status.external.<…>.api_key` | str | — | key sent only when `.auth = true` |
+| `status.external.<…>.auth` | bool | `false` | send the live key when probing — **billable for some providers** |
+
+The uptime-history DB path is **not** config — it is derived by convention from
+the node data dir (`<data_dir>/status.db`).
 
 ### Monitoring billable providers — the right way
 
@@ -114,36 +126,41 @@ for**: the LLM proxy reports each provider's health in its own `/v1/status`
 `internal_providers`. Zero extra cost, and a *truer* signal (it reflects whether
 your key + quota actually work, which a synthetic probe can't tell you).
 
-So for Brave: **leave `BRAVE_HEALTH_URL` unset** — its status comes from the proxy.
+So for Brave: **leave `status.external.brave.url` unset** — its status comes from
+the proxy.
 
 Three tiers, safest first:
-1. **Passive (recommended for paid APIs):** unset `*_HEALTH_URL`; health comes
-   from the proxy's `/v1/status`. No probe, no charge.
-2. **Direct keyless probe (default if `*_HEALTH_URL` set):** reachability only, no
-   key sent → no billable call (paid APIs reject the unauthenticated request
-   before billing). An independent liveness signal.
-3. **Direct authenticated probe (`*_HEALTH_AUTH=true`):** sends the live key —
-   **billable for metered providers.** Opt-in per provider, and only for one with
-   a genuinely free health endpoint. Logged with a warning at startup.
+1. **Passive (recommended for paid APIs):** unset `status.external.<p>.url`;
+   health comes from the proxy's `/v1/status`. No probe, no charge.
+2. **Direct keyless probe (default once `status.external.<p>.url` is set):**
+   reachability only, no key sent → no billable call (paid APIs reject the
+   unauthenticated request before billing). An independent liveness signal.
+3. **Direct authenticated probe (`status.external.<p>.auth = true`):** sends the
+   live key — **billable for metered providers.** Opt-in per provider, and only
+   for one with a genuinely free health endpoint. Logged with a warning at runtime.
 
-The 60s history poller never probes external providers at all (its provider rows
-come from the proxy reports), so the recurring loop can't incur charges.
+The uptime-history poller never probes external providers at all (its provider
+rows come from the proxy reports), so the recurring loop can't incur charges.
 
 ## Run
 
 ```sh
-cargo run --release
-# or the built binary (node listens 0.0.0.0:4242, read API + status routers :4243):
-CIRIS_SERVER_LISTEN_ADDR=0.0.0.0:4242 STATUS_DB_PATH=/var/lib/ciris-status/status.db ./ciris-status
+# zero-env: the only inputs are --home and --key-id (both optional, defaults shown).
+cargo run --release -- --home /var/lib/ciris --key-id ciris-status
+# or the built binary (read API + status routers on the RET port + 1, default :4243):
+./ciris-status --home /data --key-id ciris-status
 ```
 
-There is one binary now — it is always a node. Point the status reverse-proxy at
-the read-API listener (`CIRIS_SERVER_LISTEN_ADDR` port + 1, default `:4243`).
+There is one binary now — it is always a node, and it takes no env. Point the
+status reverse-proxy at the read-API listener (the RET port + 1, default `:4243`).
+After it is up, claim ownership and author the adapter `config:*` (above) + a
+`consent:replication` grant — see [`DEPLOY.md`](DEPLOY.md).
 
 ## Deploy (replacing the Lens API container)
 
-**See [`DEPLOY.md`](DEPLOY.md)** for the full runbook: the GHCR image, the env
-reference, the lens→status cutover ordering, and the DNS/Caddy/nginx routing.
+**See [`DEPLOY.md`](DEPLOY.md)** for the full runbook: the GHCR image, the
+zero-env CLI boot, the owner-authored `config:*` / peering, the lens→status
+cutover ordering, and the DNS/Caddy/nginx routing.
 
 Build:
 
