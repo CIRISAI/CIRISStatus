@@ -50,7 +50,7 @@ of `FSD/MONITORING_NODE_DESIGN.md`:
   on dimension `health:liveness:v1` (`witness_relation: external`,
   operational/degraded/outage → `+1/0/-1`). Non-keyed infra (LLM/search
   providers, regions) folds in as `evidence_refs`, not as separate subjects.
-  Hybrid-signed (Ed25519 + ML-DSA-65) via persist v9.0.2 / verify v6.2.0 over
+  Hybrid-signed (Ed25519 + ML-DSA-65) via persist v9.0.3 / verify v6.2.0 over
   `ceg_produce_canonicalize` and written with
   `FederationDirectory::put_attestation` into **this node's own corpus**
   (federation-tier rows are PQC-mandatory at the v9.0.0 ingest gate,
@@ -74,14 +74,15 @@ Response shapes match the Lens API field-for-field (status strings
 Env splits in two: the **node** env (read by `ciris_server::ServerConfig`) and the
 **StatusAdapter** env (probe targets, cadence, CORS — read by `src/config.rs`).
 
-### Node env (`ciris-server`'s — identity, listen, DSN, peering)
+### Node env (`ciris-server`'s — identity, listen, peering)
 
 | Var | Default | Meaning |
 |---|---|---|
-| `CIRIS_HOME` / `CIRIS_SERVER_DATA_DIR` / `CIRIS_SERVER_IDENTITY_DIR` | `~/ciris/…` | data + identity dirs (the corpus DB + the node seed) |
+| `CIRIS_HOME` / `CIRIS_SERVER_DATA_DIR` / `CIRIS_SERVER_IDENTITY_DIR` | `~/ciris/…` | data + identity dirs. The corpus is **always** SQLite at `<data>/ciris_engine.db` — there is **no `CIRIS_DB_URL`/DSN env**, and this node's corpus is its **OWN** (never share dirs with / mount the lens node's DB). |
 | `CIRIS_SERVER_LISTEN_ADDR` | `0.0.0.0:4242` | the Reticulum node port; the read API (and the status routers) bind `port + 1` (`:4243`) |
 | `CIRIS_SERVER_KEY_ID` | `ciris-server` | the node's federation `key_id` (the `health:liveness` attester) |
-| `CIRIS_PEER_B_KEY_ID` / `CIRIS_PEER_B_KEY_RECORD` | — | the `consent:replication` peer (Node A / the lens node) — its `key_id` + exported self-signed `SignedKeyRecord` JSON |
+| `CIRIS_SERVER_BOOTSTRAP_PEERS` | — | comma-sep `host:port` Reticulum peers to join the mesh — **set to Node A for cross-host replication** (how this node reaches the `CIRIS_PEER_B_*` peer) |
+| `CIRIS_PEER_B_KEY_ID` / `CIRIS_PEER_B_KEY_RECORD` | — | the `consent:replication` peer (Node A / the lens node) — its `key_id` + exported self-signed `SignedKeyRecord` JSON. A's `capacity:*` arrives **only** via this leg, into this node's own corpus. |
 | `CIRIS_SERVER_TRANSPORT_NODE` / `CIRIS_SERVER_STORE_AND_FORWARD` | `on` | NAT-traversal infra (relay + mail-for-asleep-edges) |
 
 The full node env reference is `ciris-server`'s `src/config.rs`.

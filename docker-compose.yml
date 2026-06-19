@@ -44,6 +44,9 @@ services:
       # ── consent:replication peer (Node A) — OPTIONAL; enables replication ─────
       # v8.8.0 §5.6.8.15: the peer's OWN self-signed SignedKeyRecord (serde_json),
       # not raw pubkeys — the admission gate verifies its proof-of-possession.
+      # BOOTSTRAP_PEERS is how this node REACHES Node A on the Reticulum mesh —
+      # required for cross-host replication (the key alone is not a network path).
+      CIRIS_SERVER_BOOTSTRAP_PEERS: ${CIRIS_SERVER_BOOTSTRAP_PEERS:-}
       CIRIS_PEER_B_KEY_ID: ${CIRIS_PEER_B_KEY_ID:-}
       CIRIS_PEER_B_KEY_RECORD: ${CIRIS_PEER_B_KEY_RECORD:-}
     volumes:

@@ -49,9 +49,16 @@ documented in `README.md`).
 | `CIRIS_SERVER_LISTEN_ADDR` | `0.0.0.0:4242` | the Reticulum node port; the **read API + the status routers** bind `port + 1` (`:4243`) |
 | `CIRIS_SERVER_KEY_ID` | `ciris-server` | the node's federation `key_id` — the `health:liveness` attester. `serve_with_adapter` self-registers it at boot, so Flow B rows admit with no extra step. |
 | `CIRIS_SERVER_TRANSPORT_NODE` / `CIRIS_SERVER_STORE_AND_FORWARD` | `on` | NAT-traversal infra (relay + mail-for-asleep-edges); default on for a public node |
+| `CIRIS_SERVER_BOOTSTRAP_PEERS` | `lens.ciris.ai:4242` | comma-separated `host:port` Reticulum peers to join the mesh. **Required for cross-host replication** — set it to the lens node (Node A) so this node can actually *reach* the peer whose key you configure below. Without a mesh path, the `CIRIS_PEER_B_*` key is registered but no `capacity:*` ever arrives. |
 
 The node mints its own Ed25519 + ML-DSA-65 identity on first boot under the
 identity dir — there are **no `STATUS_NODE_*` seed vars to manage** any more.
+
+> **The corpus is its OWN** — `<CIRIS_HOME>/data/ciris_engine.db`. There is **no
+> `CIRIS_DB_URL`/DSN env**; never share `CIRIS_HOME`/`CIRIS_SERVER_DATA_DIR` with
+> the lens node or bind-mount the lens node's `data/`. Node A's `capacity:*`
+> arrives **only** by the consent:replication leg below — the old "point Node B at
+> Node A's DSN" model is gone.
 
 ### `consent:replication` peer (Node A / the lens node) — enables A→B replication
 
@@ -64,7 +71,8 @@ are replicated/seeded).
 | Var | Example | Meaning |
 |---|---|---|
 | `CIRIS_PEER_B_KEY_ID` | `ciris-server-steward` | the peer's federation key_id (replication wiring + consent subject) |
-| `CIRIS_PEER_B_KEY_RECORD` | `{"record":{…}}` | the peer's exported **self-signed** `SignedKeyRecord` (persist v9.0.2 serde_json, single line). The v8.8.0+ gate verifies the peer's proof-of-possession — neither side can fabricate the other's row from raw pubkeys. |
+| `CIRIS_PEER_B_KEY_RECORD` | `{"record":{…}}` | the peer's exported **self-signed** `SignedKeyRecord` (persist v9.0.3 serde_json, single line). The v8.8.0+ gate verifies the peer's proof-of-possession — neither side can fabricate the other's row from raw pubkeys. |
+| `CIRIS_SERVER_BOOTSTRAP_PEERS` | `lens.ciris.ai:4242` | (node var, above) must point at Node A so the consent grant + replication actually have a mesh path to it. |
 
 > Note the env name is `ciris-server`'s `CIRIS_PEER_B_*` (its "peer B" slot is the
 > directed-consent peer). The full peering/transport env reference is
