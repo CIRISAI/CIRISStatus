@@ -60,19 +60,34 @@ identity dir — there are **no `STATUS_NODE_*` seed vars to manage** any more.
 > arrives **only** by the consent:replication leg below — the old "point Node B at
 > Node A's DSN" model is gone.
 
-### `consent:replication` peer (Node A / the lens node) — enables A→B replication
+### `consent:replication` peering — CONSENT-DRIVEN (v0.4.12+), not env
 
-`ciris-server` owns peering. Set these to register Node A's key, emit the directed
-`consent:replication:v1` grant, and run A↔B anti-entropy replication so A's
-`capacity:*` flows INTO B's own corpus. Unset ⇒ B runs solo (self-registers +
-emits its own `health:liveness`, no replication; roster stays empty until rows
-are replicated/seeded).
+Replication is driven by the **fabric**, not config: the corpus's
+`consent:replication` objects ARE the desired peer set, and `ciris-server`'s
+reconcile loop converges the live runtime to them. **The normal path is the
+owner**, from the desktop client (or `POST /v1/federation/peering`): claim
+ownership of this node, then author a `consent:replication` grant naming Node A.
+The grant lands in the corpus → the reconciler picks it up → A's `capacity:*`
+flows INTO B's own corpus. No env, no restart-to-add (see the interim note).
+
+`CIRIS_PEER_B_*` is now an **optional boot bootstrap** only — it just *writes that
+same consent object* at boot so an unattended deploy can pre-seed the peer. Unset
+⇒ B runs solo (self-registers + emits its own `health:liveness`; roster stays
+empty until an owner authors the consent grant).
 
 | Var | Example | Meaning |
 |---|---|---|
-| `CIRIS_PEER_B_KEY_ID` | `ciris-server-steward` | the peer's federation key_id (replication wiring + consent subject) |
-| `CIRIS_PEER_B_KEY_RECORD` | `{"record":{…}}` | the peer's exported **self-signed** `SignedKeyRecord` (persist v9.0.3 serde_json, single line). The v8.8.0+ gate verifies the peer's proof-of-possession — neither side can fabricate the other's row from raw pubkeys. |
-| `CIRIS_SERVER_BOOTSTRAP_PEERS` | `lens.ciris.ai:4242` | (node var, above) must point at Node A so the consent grant + replication actually have a mesh path to it. |
+| `CIRIS_PEER_B_KEY_ID` | `ciris-server` | (optional bootstrap) the peer's federation key_id — written into a consent object at boot |
+| `CIRIS_PEER_B_KEY_RECORD` | `{"record":{…}}` | (optional bootstrap) the peer's exported **self-signed** `SignedKeyRecord` (persist v9.0.3 serde_json, single line). The v8.8.0+ gate verifies proof-of-possession — neither side can fabricate the other's row. |
+| `CIRIS_SERVER_BOOTSTRAP_PEERS` | `lens.ciris.ai:4242` | (node var, above) the Reticulum mesh path to Node A — **still required** for replication to reach it, whether peering came from the owner or the bootstrap env. |
+| `CIRIS_SERVER_REPLICATION_RECONCILE_SECS` | `30` | reconcile cadence (also fires immediately on a peering write). |
+
+> **Interim (edge v5.0.1 — CIRISEdge#173):** a consent authored at runtime registers
+> the peer for **inbound** immediately, but B begins **active pull** of A's
+> `capacity:*` only after the **next restart** (boot re-derives the Initiator set
+> from the corpus). So with the owner-GUI flow today: claim → author consent →
+> restart B once → replication is live. The bootstrap-env path avoids the restart
+> (the consent exists at boot). The restart requirement drops when CIRISEdge#173 ships.
 
 > Note the env name is `ciris-server`'s `CIRIS_PEER_B_*` (its "peer B" slot is the
 > directed-consent peer). The full peering/transport env reference is
