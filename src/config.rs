@@ -387,65 +387,73 @@ mod config_ceg {
 
     #[tokio::test]
     async fn resolve_reads_seeded_config_objects() {
-        const NODE: &str = "ciris-status";
-        let (engine, _seeds) = node(NODE).await;
-        register_self_key(&engine, NODE).await;
+        const ALIAS: &str = "ciris-status";
+        let (engine, _seeds) = node(ALIAS).await;
+        // #247: set_config attests (via emit_attestation_self) under the node's
+        // DERIVED key_id AND scopes the config object by it — register, author, and
+        // resolve all key off that derived id (== prod cfg.key_id), not the bare alias.
+        let node_kid = engine
+            .local_derived_key_id()
+            .await
+            .expect("derive node key_id");
+        let node = node_kid.as_str();
+        register_self_key(&engine, node).await;
 
         // Seed an owner-authored config:* set.
         set_config(
             &engine,
-            NODE,
+            node,
             "status.poll_secs",
             ConfigValue::I64(15),
-            NODE,
+            node,
             ConfigScope::Local,
         )
         .await
         .expect("set poll_secs");
         set_config(
             &engine,
-            NODE,
+            node,
             "status.cors_origins",
             ConfigValue::List(vec![serde_json::Value::String(
                 "https://example.test".into(),
             )]),
-            NODE,
+            node,
             ConfigScope::Local,
         )
         .await
         .expect("set cors_origins");
         set_config(
             &engine,
-            NODE,
+            node,
             "status.region.us.billing_url",
             ConfigValue::Str("https://billing.us.test/".into()),
-            NODE,
+            node,
             ConfigScope::Local,
         )
         .await
         .expect("set us billing_url");
         set_config(
             &engine,
-            NODE,
+            node,
             "status.external.exa.url",
             ConfigValue::Str("https://exa.test/health".into()),
-            NODE,
+            node,
             ConfigScope::Local,
         )
         .await
         .expect("set exa url");
         set_config(
             &engine,
-            NODE,
+            node,
             "status.external.exa.auth",
             ConfigValue::Bool(true),
-            NODE,
+            node,
             ConfigScope::Local,
         )
         .await
         .expect("set exa auth");
 
-        let cfg = Config::resolve(&engine, NODE, "/data/status.db".into()).await;
+        let cfg = Config::resolve(&engine, node, "/data/status.db".into()).await;
 
         assert_eq!(cfg.poll_seconds, 15, "poll cadence from config:*");
         assert_eq!(cfg.cors_origins, vec!["https://example.test".to_string()]);
