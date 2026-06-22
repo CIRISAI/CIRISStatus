@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -17,19 +17,20 @@ path = "src/main.rs"
 # ownership + safety + NAT-traversal — is ciris-server's `serve_with_adapter`,
 # and the status page is a `StatusAdapter: ciris_server::Adapter` folded onto the
 # SAME shared core. Default features (NOT python, NOT pkcs11).
-# Pinned to ciris-server v0.5.0 — config-as-CEG, ZERO env vars: the node boots
+# Pinned to ciris-server v0.5.30 — the v6.3.0 substrate floor + the complete
+# HUMANITY_ACCORD safe-mesh surface. config-as-CEG, ZERO env vars: the node boots
 # from `--home`/`--key-id` and resolves ALL config from signed `config:*` CEG
 # objects at runtime (graph_config). ciris-status mirrors this: zero-env boot,
 # adapter config:* via `ciris_server::graph_config`.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.3" }
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.30" }
 
-# ciris-persist (sqlite) at the SAME pin ciris-server uses (v9.0.3) so the
-# lockfile resolves a SINGLE ciris-persist (ciris-server pins v9.0.3 too).
+# ciris-persist (sqlite) at the SAME pin ciris-server uses (v9.10.0) so the
+# lockfile resolves a SINGLE ciris-persist (ciris-server v0.5.30 pins v9.10.0 too).
 # The adapter touches persist types directly: `Engine::sqlite_backend()`
 # (the SqliteBackend handle that impls both ReadEngine + FederationDirectory),
 # `CallerScope::Unauthenticated` (the Flow-A public read scope), and the
 # federation `Attestation` row emit_liveness assembles.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v9.0.3", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v9.10.0", features = ["sqlite"] }
 
 # Impl `ciris_server::Adapter` (async fn in trait). async-trait 0.1 + axum 0.8
 # match ciris-server.
@@ -47,7 +48,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tokio-stream = { version = "0.1", features = ["sync"] }
 # rustls (not openssl) so the binary is self-contained and cross-builds cleanly.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# Pinned to 0.31 to match ciris-persist v9.0.2 (both declare `links = "sqlite3"`,
+# Pinned to 0.31 (libsqlite3-sys 0.28) to match ciris-persist v9.10.0 (both declare `links = "sqlite3"`,
 # so cargo requires a single libsqlite3-sys across the graph).
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
