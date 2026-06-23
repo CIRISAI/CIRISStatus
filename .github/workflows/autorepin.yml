@@ -1,0 +1,75 @@
+name: auto-repin ciris-server
+
+# Keeps this status node in automatic lockstep with new ciris-server releases
+# (the follow-up asked in CIRISStatus#7). On a schedule + on demand: if CIRISServer
+# has a newer release tag than we pin, open a repin PR that bumps ciris-server, the
+# MATCHING ciris-persist pin (read from the new server's own Cargo.toml so the
+# lockfile resolves a single persist), and our patch version. The repin is NOT
+# blindly merged — CI's `build` + the new `boot-smoke` gate validate it first
+# (that gate is exactly what would have caught the v0.3.7 /health crash-loop), so a
+# bad substrate bump lands as a RED PR, never a crash-looping image.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *" # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  repin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute repin (only if a newer ciris-server release exists)
+        id: calc
+        run: |
+          set -euo pipefail
+          # Newest CIRISServer release tag by SEMVER (not creation order).
+          latest=$(git ls-remote --tags --refs --sort=-v:refname \
+            https://github.com/CIRISAI/CIRISServer 'v*' | head -1 | sed 's#.*/##')
+          cur=$(grep -oP 'CIRISServer", tag = "\K[^"]+' Cargo.toml | head -1)
+          echo "latest=$latest  current=$cur"
+          if [ -z "$latest" ] || [ "$latest" = "$cur" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Match the persist pin the NEW server uses (single-version resolve).
+          persist=$(gh api "repos/CIRISAI/CIRISServer/contents/Cargo.toml?ref=$latest" \
+            -q .content | base64 -d | grep -oP 'CIRISPersist", tag = "\K[^"]+' | head -1 || true)
+          ver=$(grep -oP '^version = "\K[^"]+' Cargo.toml | head -1)
+          newver=$(echo "$ver" | awk -F. '{printf "%d.%d.%d", $1,$2,$3+1}')
+          sed -i -E "s|(CIRISServer\", tag = \")[^\"]+|\1$latest|" Cargo.toml
+          if [ -n "$persist" ]; then
+            sed -i -E "s|(CIRISPersist\", tag = \")[^\"]+|\1$persist|" Cargo.toml
+          fi
+          sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"$newver\"/" Cargo.toml
+          {
+            echo "changed=true"; echo "latest=$latest"; echo "persist=$persist"; echo "newver=$newver"
+          } >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Open repin PR
+        if: steps.calc.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          branch="autorepin/ciris-server-${{ steps.calc.outputs.latest }}"
+          git config user.name "ciris-bot"
+          git config user.email "bot@ciris.ai"
+          git checkout -b "$branch"
+          git add Cargo.toml
+          git commit -m "chore: auto-repin ciris-server → ${{ steps.calc.outputs.latest }} (v${{ steps.calc.outputs.newver }})"
+          git push -u origin "$branch" --force
+          gh pr create \
+            --title "chore: auto-repin ciris-server → ${{ steps.calc.outputs.latest }} (v${{ steps.calc.outputs.newver }})" \
+            --body "Automated lockstep repin (auto-repin.yml).
+
+          - \`ciris-server\` → **${{ steps.calc.outputs.latest }}**
+          - \`ciris-persist\` → **${{ steps.calc.outputs.persist }}** (matched from the server's own Cargo.toml)
+          - \`version\` → **${{ steps.calc.outputs.newver }}**
+
+          CI \`build\` + \`boot-smoke\` gate this PR — a bad substrate bump lands RED, never a crash-looping image. Merge on green, then tag \`v${{ steps.calc.outputs.newver }}\` for the ghcr image." \
+            || echo "a PR for $branch may already exist"
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -60,3 +60,25 @@ jobs:
           # failure prints "GLIBC_… not found" / "cannot open shared object file" instead.
           echo "$out" | grep -q "usage: ciris-status" \
             || { echo "::error::image binary failed to exec (glibc/.so runtime gap) — never reached the argparser"; exit 1; }
+      - name: Boot smoke — the node must actually SERVE /health (catches router/boot panics)
+        run: |
+          # The check that would have caught CIRISStatus#7 (the v0.3.7 /health
+          # route-collision crash-loop): a panic at serve_with_adapter router
+          # construction. The arg-exec step above never boots the node, so it
+          # sailed straight through. This one boots it and proves it serves.
+          docker run -d --name statusboot -p 4243:4243 ciris-status:smoke \
+            --home /tmp/ciris --key-id ci-smoke
+          ok=0
+          for i in $(seq 1 40); do
+            # Bail FAST if the container died — a boot panic / crash-loop.
+            if [ "$(docker inspect -f '{{.State.Running}}' statusboot 2>/dev/null)" != "true" ]; then
+              echo "::error::container exited during boot (router/boot panic or crash-loop)"
+              docker logs statusboot 2>&1 | tail -40; exit 1
+            fi
+            if curl -sf -m3 http://127.0.0.1:4243/health 2>/dev/null | grep -q '"status":"ok"'; then ok=1; break; fi
+            sleep 2
+          done
+          docker logs statusboot 2>&1 | tail -20
+          docker rm -f statusboot >/dev/null 2>&1 || true
+          [ "$ok" = 1 ] || { echo "::error::node never served GET /health within ~80s (boot failure)"; exit 1; }
+          echo "✅ boot smoke OK — node booted clean and served GET /health"
