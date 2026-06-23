@@ -776,8 +776,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-crypto"
-version = "6.11.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v6.11.0#064d776b2cc20fe65565ffce8111ff60c912e372"
+version = "7.2.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v7.2.0#fac7d6b4ad290a7dc225bd8dbf11d1598b980e69"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -805,8 +805,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "6.3.0"
-source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v6.3.0#0ebb488e3707fda8555ab8f3af9b1961d86a900c"
+version = "6.4.0"
+source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v6.4.0#f8572d00bb8ea631c132eefd1d941176641f52c5"
 dependencies = [
  "async-trait",
  "axum",
@@ -856,8 +856,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-keyring"
-version = "6.11.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v6.11.0#064d776b2cc20fe65565ffce8111ff60c912e372"
+version = "7.2.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v7.2.0#fac7d6b4ad290a7dc225bd8dbf11d1598b980e69"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -865,6 +865,7 @@ dependencies = [
  "ciris-crypto",
  "core-foundation 0.9.4",
  "core-foundation-sys",
+ "cryptoki",
  "dirs",
  "ed25519-dalek",
  "hex",
@@ -892,7 +893,7 @@ dependencies = [
 [[package]]
 name = "ciris-lens-core"
 version = "1.4.2"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.31#fc9dc28291af1c2d0e06bcd70b8e1618bce783f3"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.35#cfdac2ad4cc2524d576212e97accb35add598548"
 dependencies = [
  "async-trait",
  "axum",
@@ -918,8 +919,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "9.10.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v9.10.0#08226ce2abc75d6ee0d3d1e429d0a4dcf747884b"
+version = "9.11.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v9.11.0#50ea12f7a37b86ccba25e6dc6bb92f51f7d40a1d"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -957,8 +958,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-server"
-version = "0.5.31"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.31#fc9dc28291af1c2d0e06bcd70b8e1618bce783f3"
+version = "0.5.35"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.35#cfdac2ad4cc2524d576212e97accb35add598548"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -992,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-status"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1017,8 +1018,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-verify-core"
-version = "6.11.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v6.11.0#064d776b2cc20fe65565ffce8111ff60c912e372"
+version = "7.2.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v7.2.0#fac7d6b4ad290a7dc225bd8dbf11d1598b980e69"
 dependencies = [
  "android_system_properties",
  "anyhow",
@@ -1291,6 +1292,28 @@ dependencies = [
  "getrandom 0.4.2",
  "hybrid-array",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "cryptoki"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff765b99fc49f3116c9a908484486a2b92fd73c48da45c3a69716471c6cc56c6"
+dependencies = [
+ "bitflags 2.13.0",
+ "cryptoki-sys",
+ "libloading",
+ "log",
+ "secrecy",
+]
+
+[[package]]
+name = "cryptoki-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1fd850498411e4057f1cba79e6e2bc7cbe960544c1046ab46d4685c403a1121"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]
@@ -3212,6 +3235,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5063,6 +5096,15 @@ dependencies = [
  "generic-array",
  "pkcs8 0.10.2",
  "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
  "zeroize",
 ]
 
