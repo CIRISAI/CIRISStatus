@@ -91,6 +91,9 @@ async fn root(State(st): State<AppState>) -> impl IntoResponse {
     Json(json!({ "service": "ciris-status", "version": st.cfg().version }))
 }
 
+// No longer routed (the embedded ciris-server owns `/health` since v0.5.32 —
+// CIRISStatus#7). Kept for reference / a future relocated status-health surface.
+#[allow(dead_code)]
 async fn health(State(st): State<AppState>) -> impl IntoResponse {
     Json(json!({ "status": "healthy", "timestamp": now_z(), "version": st.cfg().version }))
 }
@@ -394,7 +397,12 @@ impl Adapter for StatusAdapter {
 
         let router = Router::new()
             .route("/", get(root))
-            .route("/health", get(health))
+            // NB: NO `/health` here. Since ciris-server v0.5.32 the embedded node
+            // owns base liveness at `/health` (+ `/v1/health`, `/v1/system/health`),
+            // and the adapter seam merges our routes ON TOP — axum panics on the
+            // duplicate `GET /health` (CIRISStatus#7, the v0.3.7 crash-loop). Base
+            // liveness is the server's; our rich status lives at `/v1/status` +
+            // `/api/v1/status`. (`health` handler kept below for reference/reuse.)
             .route("/v1/status", get(v1_status))
             .route("/api/status", get(api_status))
             .route("/api/v1/status", get(api_status))
