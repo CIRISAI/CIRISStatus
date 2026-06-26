@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.10"
+version = "0.3.11"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -22,7 +22,7 @@ path = "src/main.rs"
 # from `--home`/`--key-id` and resolves ALL config from signed `config:*` CEG
 # objects at runtime (graph_config). ciris-status mirrors this: zero-env boot,
 # adapter config:* via `ciris_server::graph_config`.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.37" }
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.54" }
 
 # ciris-persist (sqlite) at the SAME pin ciris-server uses (v9.10.0) so the
 # lockfile resolves a SINGLE ciris-persist (ciris-server v0.5.30 pins v9.10.0 too).
@@ -30,7 +30,7 @@ ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.37"
 # (the SqliteBackend handle that impls both ReadEngine + FederationDirectory),
 # `CallerScope::Unauthenticated` (the Flow-A public read scope), and the
 # federation `Attestation` row emit_liveness assembles.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v10.0.0", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v10.6.0", features = ["sqlite"] }
 
 # Impl `ciris_server::Adapter` (async fn in trait). async-trait 0.1 + axum 0.8
 # match ciris-server.
