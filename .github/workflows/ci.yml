@@ -24,7 +24,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Install substrate build deps
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev libudev-dev
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
         run: cargo fmt --check

@@ -26,10 +26,12 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS build
 WORKDIR /app
 
 # Substrate build deps. libtss2-dev (ciris-keyring's TPM backend links tss2) +
-# libsqlite3-dev (ciris-persist links sqlite3); pkg-config + a C toolchain back
-# the `-sys` crates; git fetches the substrate git deps.
+# libsqlite3-dev (ciris-persist links sqlite3) + libudev-dev (ciris-server's
+# serialport / serial-LoRa transport pulls libudev-sys, whose build script needs
+# the libudev pkg-config); pkg-config + a C toolchain back the `-sys` crates;
+# git fetches the substrate git deps.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libtss2-dev libsqlite3-dev pkg-config build-essential git ca-certificates \
+        libtss2-dev libsqlite3-dev libudev-dev pkg-config build-essential git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # ciris-server is a git pin (tag v0.5.0) — fetched by cargo from the committed
@@ -52,10 +54,13 @@ FROM debian:bookworm-slim
 #     shared object file`, CIRISServer#28). The lib must be present even with no TPM
 #     (the dynamic link resolves at load; the backend then degrades to the software
 #     keystore). sqlite IS static (`rusqlite/bundled`), so no libsqlite3 needed.
+#   - libudev1: ciris-server's serialport / serial-LoRa transport links
+#     `libudev.so.1` DYNAMICALLY (via libudev-sys); the runtime lib must be present
+#     for the binary to load even with no serial hardware.
 #   (Structural alternative — build this image FROM a published ciris-server base so
 #    the substrate runtime libs inherit cleanly — is tracked as CIRISServer#28.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl libtss2-esys-3.0.2-0 libtss2-tctildr0 \
+        ca-certificates curl libtss2-esys-3.0.2-0 libtss2-tctildr0 libudev1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /ciris-status /usr/local/bin/ciris-status
