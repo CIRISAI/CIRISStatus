@@ -22,7 +22,7 @@ path = "src/main.rs"
 # from `--home`/`--key-id` and resolves ALL config from signed `config:*` CEG
 # objects at runtime (graph_config). ciris-status mirrors this: zero-env boot,
 # adapter config:* via `ciris_server::graph_config`.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.68" }
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.70" }
 
 # ciris-persist (sqlite) at the SAME pin ciris-server uses (v9.10.0) so the
 # lockfile resolves a SINGLE ciris-persist (ciris-server v0.5.30 pins v9.10.0 too).
