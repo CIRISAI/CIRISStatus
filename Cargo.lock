@@ -785,8 +785,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "7.4.4"
-source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v7.4.4#aebb9e1e099ef6b7a32c12ae876526c94c218b27"
+version = "8.3.0"
+source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v8.3.0#6673692c7b73c351c76580bc767148c440dc8897"
 dependencies = [
  "async-trait",
  "axum",
@@ -875,7 +875,7 @@ dependencies = [
 [[package]]
 name = "ciris-lens-core"
 version = "1.4.3"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.70#8f92a1fa7a2b9ae5df4d860a66d9804083ae775b"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.72#4afcfaf5873fbe84059a422c94452840f232a373"
 dependencies = [
  "async-trait",
  "axum",
@@ -902,8 +902,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "11.5.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v11.5.0#a249650f9d254f75265e6871b6443a78965f6ef5"
+version = "11.9.1"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v11.9.1#e6748c4407e9c105e832ca3395571d59cb7c75b3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -941,8 +941,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-server"
-version = "0.5.70"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.70#8f92a1fa7a2b9ae5df4d860a66d9804083ae775b"
+version = "0.5.72"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.72#4afcfaf5873fbe84059a422c94452840f232a373"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -970,6 +970,7 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "tokio",
+ "tower",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -979,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-status"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1439,7 +1440,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
- "serde_core",
 ]
 
 [[package]]
@@ -4580,13 +4580,11 @@ dependencies = [
  "log",
  "regex",
  "rusqlite",
- "serde",
  "siphasher",
  "thiserror 2.0.18",
  "time",
  "tokio",
  "tokio-postgres",
- "toml 1.1.2+spec-1.1.0",
  "url",
  "walkdir",
 ]
@@ -5870,21 +5868,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "toml"
-version = "1.1.2+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
-dependencies = [
- "indexmap",
- "serde_core",
- "serde_spanned 1.1.1",
- "toml_datetime 1.1.1+spec-1.1.0",
- "toml_parser",
- "toml_writer",
- "winnow 1.0.3",
-]
-
-[[package]]
 name = "toml_datetime"
 version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5898,15 +5881,6 @@ name = "toml_datetime"
 version = "0.7.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
-dependencies = [
- "serde_core",
-]
-
-[[package]]
-name = "toml_datetime"
-version = "1.1.1+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
 dependencies = [
  "serde_core",
 ]

@@ -3,37 +3,134 @@ name: CI
 # fmt + clippy(-D warnings) + build + test. ciris-status is ALWAYS a node now
 # (ciris-server + StatusAdapter — the optional `fabric` feature is gone), so there
 # is ONE build, and it links the persist/verify substrate. That needs the substrate
-# build deps (libtss2-dev for the keyring TPM backend, libsqlite3-dev for persist).
-# Single Linux target — this is a server-side service (no wheel/binary matrix).
+# build deps (libtss2-dev for the keyring TPM backend, libsqlite3-dev for persist,
+# libudev-dev for the serial-LoRa transport that landed in ciris-server 0.5.68).
+# Single Linux target — this is a server-side service (no wheel/binary matrix); the
+# published artifact is the GHCR runtime image, exercised by image-runtime-smoke.
+#
+# CI structure mirrors CIRISServer's canonical ci.yml: concurrency-cancel, apt
+# hardening (drop the flaky Microsoft/azure apt repo), and the CIRISCache 4-layer
+# centipede (CIRISServer#99) that RESTORES the SAME shared substrate blobs
+# CIRISServer publishes for the same PLAT/rustc/versions (byte-identical cache-key
+# prefix). CI restores only — it never saves (a debug `target/` save is a net loss).
 
 on:
   push:
     branches: [main]
+    # Docs-only commits don't change the Rust build — skip the full compile.
+    paths-ignore:
+      - "**/*.md"
+      - "FSD/**"
+      - "docs/**"
   pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "FSD/**"
+      - "docs/**"
   workflow_dispatch:
+
+# Cancel a superseded run on the same ref (PR re-push / newer main commit). A tag
+# ref is distinct, so this never cancels a release pipeline.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
+  packages: write   # CIRISCache restore (GHCR) — CIRISServer#99
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - name: Install substrate build deps
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev libudev-dev
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  build:
+    name: clippy + build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install build deps (Linux)
+        # libtss2-dev: the Linux-only keyring/tpm backend (cfg(target_os=linux)).
+        # libsqlite3-dev: persist's sqlite. libudev-dev: the serialport/LoRa dep.
+        run: |
+          # Drop the preinstalled Microsoft/azure-cli apt repo: it intermittently
+          # 403s and tanks apt-get update (its packages are not needed here).
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list /etc/apt/sources.list.d/azure-cli.sources
+          sudo apt-get update
+          sudo apt-get install -y libtss2-dev libsqlite3-dev libudev-dev
       - uses: Swatinem/rust-cache@v2
-      - name: rustfmt
-        run: cargo fmt --check
+        continue-on-error: true
+        with:
+          cache-bin: false
+      # CIRISCache (CIRISServer#99) — 4-layer centipede over the Swatinem GHA L1.
+      # PLAT from the NATIVE target of the runner. ciris-status is a DIFFERENT
+      # downstream than ciris-server, but the shared edge/persist/verify layer blobs
+      # are byte-identical across repos for the same PLAT/rustc/versions, so the key
+      # PREFIX must match CIRISServer's exactly. persist (P) is pinned in Cargo.toml;
+      # edge (EDGE) + verify (V) are TRANSITIVE (via ciris-server) so they are read
+      # from Cargo.lock. Restore deepest-first, first-hit-wins; NO -s server blob
+      # (that is ciris-server's own crate graph, not ours).
+      - name: Compute CIRISCache keys (shared substrate layers, CIRISServer#99)
+        id: cachekey
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Linux)   PLAT=linux-x86_64 ;;
+            macOS)   PLAT=macos-aarch64 ;;
+            Windows) PLAT=windows-x64 ;;
+            *)       PLAT=unknown ;;
+          esac
+          RUSTC=$(rustc -V | awk '{print $2}')
+          # persist is pinned in Cargo.toml; edge + verify are transitive → Cargo.lock.
+          P=$(grep -m1 'CIRISPersist.*tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
+          EDGE=$(grep -A1 'name = "ciris-edge"'        Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([0-9.]+)".*/\1/')
+          V=$(grep -A1 'name = "ciris-verify-core"'    Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([0-9.]+)".*/\1/')
+          BASE="ciris-substrate-v1-${PLAT}-release-rustc${RUSTC}"
+          KEY_VERIFY="${BASE}-pnone-enone-v${V:-none}"
+          KEY_PERSIST="${BASE}-p${P:-none}-enone-v${V:-none}"
+          KEY_EDGE="${BASE}-p${P:-none}-e${EDGE:-none}-v${V:-none}"
+          {
+            echo "key-verify=${KEY_VERIFY}"
+            echo "key-persist=${KEY_PERSIST}"
+            echo "key-edge=${KEY_EDGE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::CIRISCache (${PLAT}): P=${P:-NONE} V=${V:-NONE} EDGE=${EDGE:-NONE} RUSTC=${RUSTC}"
+          echo "::notice::${KEY_VERIFY}"
+          echo "::notice::${KEY_PERSIST}"
+          echo "::notice::${KEY_EDGE}"
+      # Deepest-first, first-hit-wins (CIRISCache restore@v2): the layers are
+      # cumulative supersets, so one restore of the deepest available blob beats
+      # extracting verify→persist→edge in sequence.
+      - name: CIRISCache restore (edge→persist→verify shared layers, first hit)
+        uses: CIRISAI/CIRISCache/restore@v2
+        continue-on-error: true
+        with:
+          keys: |
+            ${{ steps.cachekey.outputs.key-edge }}
+            ${{ steps.cachekey.outputs.key-persist }}
+            ${{ steps.cachekey.outputs.key-verify }}
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: build (release)
         run: cargo build --release
       - name: test — Flow A real-data + Flow B sign proofs
         run: cargo test
+      # NB: CI does NOT save a cache blob. It builds DEBUG (clippy+test); saving a
+      # debug `target/` measured ~586s on main to spare only the cheap debug delta
+      # next run — a net loss. The shared release `-s`/edge/persist/verify blobs are
+      # populated by CIRISServer's conformance/build-wheels; CI here only RESTORES.
 
   # Run the binary INSIDE the actual runtime IMAGE — not just the build host.
   # The build host has the newest glibc + every -dev lib, so a cargo build can be
