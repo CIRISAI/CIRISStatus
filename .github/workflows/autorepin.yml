@@ -23,6 +23,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A fine-grained PAT (contents:write + pull-requests:write) lets this job
+          # OPEN the repin PR itself — the default GITHUB_TOKEN cannot create PRs
+          # when the org disables "Allow GitHub Actions to create and approve pull
+          # requests" (why prior repins landed as branches with no PR). Falls back to
+          # github.token if the secret is unset (branch is still pushed; open the PR
+          # by hand). Set the REPIN_PAT repo secret to make repins fully one-click.
+          token: ${{ secrets.REPIN_PAT || github.token }}
       - name: Compute repin (only if a newer ciris-server release exists)
         id: calc
         run: |
@@ -45,6 +53,13 @@ jobs:
             sed -i -E "s|(CIRISPersist\", tag = \")[^\"]+|\1$persist|" Cargo.toml
           fi
           sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"$newver\"/" Cargo.toml
+          # Sync Cargo.lock to the bumped git-tag pins. The Dockerfile builds with
+          # `cargo build --release --locked`, so a stale lock fails image-runtime-smoke
+          # (exactly what happened on the v0.5.75 repin). ubuntu-latest ships cargo;
+          # these are git-tag deps, so `update -p` re-resolves them to the new tags
+          # without disturbing unrelated crates.io deps.
+          cargo update -p ciris-server
+          if [ -n "$persist" ]; then cargo update -p ciris-persist; fi
           {
             echo "changed=true"; echo "latest=$latest"; echo "persist=$persist"; echo "newver=$newver"
           } >> "$GITHUB_OUTPUT"
@@ -58,7 +73,7 @@ jobs:
           git config user.name "ciris-bot"
           git config user.email "bot@ciris.ai"
           git checkout -b "$branch"
-          git add Cargo.toml
+          git add Cargo.toml Cargo.lock
           git commit -m "chore: auto-repin ciris-server → ${{ steps.calc.outputs.latest }} (v${{ steps.calc.outputs.newver }})"
           git push -u origin "$branch" --force
           gh pr create \
@@ -72,4 +87,4 @@ jobs:
           CI \`build\` + \`boot-smoke\` gate this PR — a bad substrate bump lands RED, never a crash-looping image. Merge on green, then tag \`v${{ steps.calc.outputs.newver }}\` for the ghcr image." \
             || echo "a PR for $branch may already exist"
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.REPIN_PAT || github.token }}
