@@ -36,8 +36,12 @@ jobs:
         run: |
           set -euo pipefail
           # Newest CIRISServer release tag by SEMVER (not creation order).
-          latest=$(git ls-remote --tags --refs --sort=-v:refname \
-            https://github.com/CIRISAI/CIRISServer 'v*' | head -1 | sed 's#.*/##')
+          # Capture ls-remote FIRST, then head/sed. Piping `git ls-remote` straight
+          # into `head` under `set -o pipefail` SIGPIPEs git (exit 141) once head
+          # closes the pipe early — the v0.5.76 repin died exactly this way.
+          all_tags=$(git ls-remote --tags --refs --sort=-v:refname \
+            https://github.com/CIRISAI/CIRISServer 'v*')
+          latest=$(printf '%s\n' "$all_tags" | head -1 | sed 's#.*/##')
           cur=$(grep -oP 'CIRISServer", tag = "\K[^"]+' Cargo.toml | head -1)
           echo "latest=$latest  current=$cur"
           if [ -z "$latest" ] || [ "$latest" = "$cur" ]; then
