@@ -375,6 +375,7 @@ mod config_ceg {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         match engine
             .register_federation_key(SignedKeyRecord { record: rec })
