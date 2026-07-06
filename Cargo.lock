@@ -757,8 +757,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "9.1.4"
-source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v9.1.4#7eb24431004e7a49aad950855fd5c4836c622918"
+version = "9.1.5"
+source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v9.1.5#fe2369e12be90037cf1f2d87dc5e3129c68e6009"
 dependencies = [
  "async-trait",
  "axum",
@@ -845,7 +845,7 @@ dependencies = [
 [[package]]
 name = "ciris-lens-core"
 version = "1.4.3"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.84#a5871d8488fb5e798b3cb612bbc018d16bf6035d"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.86#62b495ac3e7f7c6790289627e3e983d0f4fcce33"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -870,8 +870,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "13.3.1"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v13.3.1#abb45050b7fa64cfa05295224e69135780acb925"
+version = "13.4.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v13.4.0#7acaa94d73ff087abdc5753db8d44196389ecf10"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -907,8 +907,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-server"
-version = "0.5.84"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.84#a5871d8488fb5e798b3cb612bbc018d16bf6035d"
+version = "0.5.86"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.86#62b495ac3e7f7c6790289627e3e983d0f4fcce33"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -927,6 +927,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "jsonwebtoken",
+ "libsqlite3-sys",
  "pbkdf2",
  "reqwest",
  "serde",
@@ -945,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-status"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "anyhow",
  "async-trait",
