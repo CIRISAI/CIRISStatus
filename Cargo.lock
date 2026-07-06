@@ -730,8 +730,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-crypto"
-version = "8.7.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v8.7.0#c09ed2c5f42da354b153c40abaa57c2f49b1c79a"
+version = "8.9.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v8.9.0#31a3a6fd1dc50f77b39bd388fce004f9ec41bf7f"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -757,8 +757,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "9.1.0"
-source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v9.1.0#72aacf41b920d5c59b87b2cab5c6fbb7ef124857"
+version = "9.1.2"
+source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v9.1.2#f045e0ce73dda711dbbd65faf3e4f9dbb3283c3e"
 dependencies = [
  "async-trait",
  "axum",
@@ -808,8 +808,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-keyring"
-version = "8.7.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v8.7.0#c09ed2c5f42da354b153c40abaa57c2f49b1c79a"
+version = "8.9.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v8.9.0#31a3a6fd1dc50f77b39bd388fce004f9ec41bf7f"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -845,7 +845,7 @@ dependencies = [
 [[package]]
 name = "ciris-lens-core"
 version = "1.4.3"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.80#40e15d39b93e31cbf741b1538b9baf991796819f"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.82#a8987ae9ab95f3c773c339770b4af975a06a3a02"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -870,8 +870,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "13.0.1"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v13.0.1#6731a472f2ed11317675e13000ecafe6b1d229d9"
+version = "13.2.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v13.2.0#3f1506d42b67332a7fdcd3a6eca7d10dd25b9b83"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -907,8 +907,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-server"
-version = "0.5.80"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.80#40e15d39b93e31cbf741b1538b9baf991796819f"
+version = "0.5.82"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.82#a8987ae9ab95f3c773c339770b4af975a06a3a02"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-status"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -970,8 +970,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-verify-core"
-version = "8.7.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v8.7.0#c09ed2c5f42da354b153c40abaa57c2f49b1c79a"
+version = "8.9.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v8.9.0#31a3a6fd1dc50f77b39bd388fce004f9ec41bf7f"
 dependencies = [
  "android_system_properties",
  "async-trait",

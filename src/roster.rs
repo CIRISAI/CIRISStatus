@@ -369,6 +369,7 @@ mod flow_a_real_data {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         match node
             .register_federation_key(SignedKeyRecord { record: rec })
@@ -401,6 +402,7 @@ mod flow_a_real_data {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         dir.put_public_key(SignedKeyRecord { record: rec })
             .await
