@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.25"
+version = "0.3.27"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -17,12 +17,15 @@ path = "src/main.rs"
 # ownership + safety + NAT-traversal — is ciris-server's `serve_with_adapter`,
 # and the status page is a `StatusAdapter: ciris_server::Adapter` folded onto the
 # SAME shared core. Default features (NOT python, NOT pkcs11).
-# Pinned to ciris-server v0.5.30 — the v6.3.0 substrate floor + the complete
-# HUMANITY_ACCORD safe-mesh surface. config-as-CEG, ZERO env vars: the node boots
-# from `--home`/`--key-id` and resolves ALL config from signed `config:*` CEG
-# objects at runtime (graph_config). ciris-status mirrors this: zero-env boot,
-# adapter config:* via `ciris_server::graph_config`.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.98" }
+# Pinned to ciris-server v0.5.114 — THE MESH-WORKS CUT: coherent triple verify
+# v10.2.0 / persist v17.2.0 / edge v13.0.8, end-to-end PROVEN by CIRISServer's
+# harness/mesh-repro QA runner (#258 SUCCESS: both nodes root, anti-entropy
+# rounds complete all 3 kinds). Closes the responder seams (CIRISEdge#348) atop
+# the full 0.5.108-113 routing/identify/re-key saga — Node B moves with the
+# fleet (wire-coherent with Node A + agents on >=0.5.114). Also ships the full
+# edge event-bus logger, so Node B's logs now narrate announce/link/path
+# lifecycle. Zero-env boot unchanged (config-as-CEG via graph_config).
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.114" }
 
 # ciris-persist (sqlite) at the SAME pin ciris-server uses (v11.9.1) so the
 # lockfile resolves a SINGLE ciris-persist (ciris-server v0.5.72 pins v11.9.1 too).
@@ -30,7 +33,7 @@ ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.98"
 # (the SqliteBackend handle that impls both ReadEngine + FederationDirectory),
 # `CallerScope::Unauthenticated` (the Flow-A public read scope), and the
 # federation `Attestation` row emit_liveness assembles.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v13.9.1", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v17.2.0", features = ["sqlite"] }
 
 # Impl `ciris_server::Adapter` (async fn in trait). async-trait 0.1 + axum 0.8
 # match ciris-server.
