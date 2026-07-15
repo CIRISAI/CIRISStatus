@@ -121,16 +121,14 @@ pub mod read {
     {
         let engine = reader;
         let now = chrono::Utc::now();
-        let filter = AttestationFilter {
-            attesting_key_id: None,
-            attested_key_id: None,
-            attestation_type: Some(super::super::ceg::ATTESTATION_TYPE_SCORES.to_owned()),
-            pqc_completed: None,
-            dimension_prefixes: vec![CAPACITY_PREFIX.to_owned()],
-            valid_at: Some(now), // freshness: drop expired rows
-            confidence_floor: None,
-            subject_key_id: None,
-        };
+        // persist v17.5.0 made `AttestationFilter` `#[non_exhaustive]` (additive
+        // fields, #456) — a struct literal is forbidden across the crate boundary
+        // even with `..Default`, so default-then-set the fields we constrain; new
+        // fields keep their sane defaults without touching this call.
+        let mut filter = AttestationFilter::default();
+        filter.attestation_type = Some(super::super::ceg::ATTESTATION_TYPE_SCORES.to_owned());
+        filter.dimension_prefixes = vec![CAPACITY_PREFIX.to_owned()];
+        filter.valid_at = Some(now); // freshness: drop expired rows
 
         // Page through; the public roster is small (opted-in agents only).
         let mut cursor = None;
