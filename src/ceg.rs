@@ -211,7 +211,6 @@ pub async fn emit_liveness(
         .map_err(|e| anyhow::anyhow!("emit_attestation_self(health:liveness): {e}"))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,7 +267,7 @@ mod tests {
 #[cfg(test)]
 mod flow_b_emit {
     use super::*;
-    
+
     use ciris_persist::federation::Error as FederationError;
     use ciris_persist::prelude::{Engine, LocalSigner, LocalSignerConfig};
 
@@ -379,7 +378,10 @@ mod flow_b_emit {
         let hash = emit_liveness(&engine, NODE, &env)
             .await
             .expect("after self-registration, health:liveness must be admitted");
-        assert!(!hash.is_empty(), "emit_attestation_self returns the attestation_id");
+        assert!(
+            !hash.is_empty(),
+            "emit_attestation_self returns the attestation_id"
+        );
     }
 
     #[tokio::test]
