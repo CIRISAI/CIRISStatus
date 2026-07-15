@@ -352,7 +352,7 @@ impl StatusAdapter {
 
         match crate::ceg::emit_liveness(&ctx.engine, &ctx.key_id, &env).await {
             Ok(hash) => tracing::info!(
-                content_hash = %hash,
+                attestation_id = %hash,
                 overall = %agg.status,
                 "Flow B: emitted signed health:liveness:v1"
             ),

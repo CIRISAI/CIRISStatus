@@ -117,7 +117,10 @@ pub struct LivenessEnvelope {
     pub evidence: Vec<EvidenceRef>,
     /// `now + poll cadence` (freshness; becomes the row's `expires_at`).
     pub valid_until: chrono::DateTime<chrono::Utc>,
-    /// When the observation was made (becomes the row's `asserted_at`).
+    /// When the observation was made. (`emit_attestation_self` stamps the row's
+    /// `asserted_at` itself, CIRISStatus#31, so this is retained for the adapter's
+    /// own bookkeeping / future envelope enrichment.)
+    #[allow(dead_code)]
     pub asserted_at: chrono::DateTime<chrono::Utc>,
     pub epistemic_mode: EpistemicMode,
 }
@@ -152,21 +155,16 @@ fn rfc3339(t: chrono::DateTime<chrono::Utc>) -> String {
 // `serve_with_adapter`, so a row authored here passes the attesting-key gate.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use sha2::{Digest, Sha256};
-
-use ciris_persist::federation::types::{attestation_tier, Attestation, SignedAttestation};
-use ciris_persist::federation::FederationDirectory;
+use anyhow::Result;
 use ciris_persist::prelude::Engine;
 // v9.0.0 federation-tier ingest gate (CC 5.3.2.4.3.1) re-derives the signed
 // canonical bytes via `ceg_produce_canonicalize` (the PRODUCE-side JCS gate)
 // and cross-checks `SHA-256(canonical) == original_content_hash` before a
 // Strict hybrid-verify. Emit MUST sign over THESE bytes.
-use ciris_persist::verify::canonical::ceg_produce_canonicalize;
 
-/// Sign + emit one `health:liveness` `scores` attestation for a keyed service,
-/// returning the `original_content_hash` (hex) of the signed envelope.
+/// Sign + emit one `health:liveness` `scores` attestation for a keyed service
+/// via persist's `emit_attestation_self` (CIRISStatus#31), returning the row's
+/// `attestation_id`.
 ///
 /// `engine` is the node's shared persist `Engine` (from
 /// [`ciris_server::AdapterContext::engine`]); the federation directory the row is
@@ -187,81 +185,30 @@ pub async fn emit_liveness(
     key_id: &str,
     env: &LivenessEnvelope,
 ) -> Result<String> {
-    let _ = key_id; // attesting key is the engine's current signer alias.
-    let directory = engine
-        .sqlite_backend()
-        .context("emit_liveness needs the sqlite backend (FederationDirectory handle)")?;
+    let _ = key_id;
+    // CIRISStatus#31 — emit via persist's `Engine::emit_attestation_self`
+    // (CIRISPersist#248) rather than hand-rolling the row. The old path set
+    // `attesting_key_id`/`scrub_key_id = engine.signer().current_alias()` — the
+    // RAW keystore alias `ciris-status-1` — but `serve_with_adapter` enrolls this
+    // node into `federation_keys` under the DERIVED key_id `ciris-status-1-<fp>`
+    // (CIRISServer#27). So every liveness emit was refused with
+    // "ciris-status-1 does not exist in federation_keys". `emit_attestation_self`
+    // derives `attesting_key_id`/`scrub_key_id` internally from the engine's own
+    // composed signer (the #247 floor — never a caller alias), canonicalizes +
+    // hybrid-signs, and assembles the federation-tier row — so it CANNOT pick the
+    // raw form. `attested_key_id = None` defaults it to the same derived self key
+    // (this node attesting its own liveness); the envelope carries the subject.
+    use ciris_persist::federation::EmitAttestationInput;
 
-    let envelope = env.to_envelope();
+    let mut input = EmitAttestationInput::with_envelope(ATTESTATION_TYPE_SCORES, env.to_envelope())
+        .with_weight(Some(env.confidence));
+    input.expires_at = Some(env.valid_until);
+    input.subject_key_ids = vec![env.attested_key_id.clone()];
 
-    // 2. JCS canonical bytes via the PRODUCE-side gate — the EXACT basis the
-    //    v9.0.0 federation-tier ingest gate re-derives + verifies against.
-    let canonical = ceg_produce_canonicalize(&envelope)
-        .map_err(|e| anyhow::anyhow!("canonicalize health:liveness envelope: {e}"))?;
-
-    // 3. original_content_hash = hex(SHA-256(canonical)).
-    let original_content_hash = hex::encode(Sha256::digest(&canonical));
-
-    // 4. Hybrid sign (Ed25519 classical + ML-DSA-65 PQC) over the canonical
-    //    bytes — the same payload persist verifies against on admission/read.
-    let sig = engine
-        .sign_hybrid(&canonical)
+    engine
+        .emit_attestation_self(input)
         .await
-        .context("hybrid-sign health:liveness envelope")?;
-    let classical_b64 = B64.encode(&sig.classical.signature);
-    let pqc_b64 = B64.encode(&sig.pqc.signature);
-    let scrub_key_id = engine.signer().current_alias().to_owned();
-    let now = chrono::Utc::now();
-
-    // 5. Assemble the federation-tier row.
-    let attestation = Attestation {
-        attestation_id: uuid_v4(),
-        attesting_key_id: scrub_key_id.clone(),
-        attested_key_id: env.attested_key_id.clone(),
-        attestation_type: ATTESTATION_TYPE_SCORES.to_owned(),
-        weight: Some(env.confidence),
-        asserted_at: env.asserted_at,
-        expires_at: Some(env.valid_until),
-        attestation_envelope: envelope,
-        original_content_hash: original_content_hash.clone(),
-        scrub_signature_classical: classical_b64,
-        scrub_signature_pqc: Some(pqc_b64),
-        scrub_key_id,
-        scrub_timestamp: now,
-        pqc_completed_at: Some(now),
-        persist_row_hash: String::new(), // server-computed on insert
-        subject_key_ids: vec![env.attested_key_id.clone()],
-        withdraws_admission_rule: None,
-        cohort_scope: "federation".to_owned(),
-        tier: attestation_tier::FEDERATION.to_owned(),
-        promoted_at: None,
-    };
-
-    directory
-        .put_attestation(SignedAttestation { attestation })
-        .await
-        .map_err(|e| anyhow::anyhow!("put_attestation(health:liveness): {e}"))?;
-
-    Ok(original_content_hash)
-}
-
-fn uuid_v4() -> String {
-    // Minimal RFC-4122 v4 without pulling a uuid dep (the content hash is the
-    // integrity anchor, not this row id).
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static CTR: AtomicU64 = AtomicU64::new(0);
-    let n = CTR.fetch_add(1, Ordering::Relaxed);
-    let t = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64;
-    let a = t ^ (n.rotate_left(17));
-    let b = t.rotate_left(31) ^ n;
-    format!(
-        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        (a >> 32) as u32,
-        (a >> 16) as u16,
-        (a as u16) & 0x0fff,
-        ((b >> 48) as u16 & 0x3fff) | 0x8000,
-        b & 0xffff_ffff_ffff,
-    )
+        .map_err(|e| anyhow::anyhow!("emit_attestation_self(health:liveness): {e}"))
 }
 
 #[cfg(test)]
@@ -320,7 +267,7 @@ mod tests {
 #[cfg(test)]
 mod flow_b_emit {
     use super::*;
-    use ciris_persist::federation::types::{algorithm, KeyRecord, SignedKeyRecord};
+
     use ciris_persist::federation::Error as FederationError;
     use ciris_persist::prelude::{Engine, LocalSigner, LocalSignerConfig};
 
@@ -373,38 +320,23 @@ mod flow_b_emit {
     /// Self-register the node's witness key (what ciris-server does at boot) so
     /// `emit_liveness` rows pass the attesting-key gate.
     async fn register_self_key(engine: &Engine, key_id: &str) {
-        let envelope = serde_json::json!({ "key_id": key_id });
-        let canonical = ceg_produce_canonicalize(&envelope).unwrap();
-        let och = hex::encode(Sha256::digest(&canonical));
-        let sig = engine.sign_hybrid(&canonical).await.unwrap();
-        let now = chrono::Utc::now();
-        let rec = KeyRecord {
-            key_id: key_id.into(),
-            pubkey_ed25519_base64: B64.encode(&sig.classical.public_key),
-            pubkey_ml_dsa_65_base64: Some(B64.encode(&sig.pqc.public_key)),
-            algorithm: algorithm::HYBRID.into(),
-            identity_type: "witness".into(),
-            identity_ref: key_id.into(),
-            valid_from: now,
-            valid_until: None,
-            registration_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: B64.encode(&sig.classical.signature),
-            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
-            scrub_key_id: key_id.into(),
-            scrub_timestamp: now,
-            pqc_completed_at: Some(now),
-            persist_row_hash: String::new(),
-            roles: Vec::new(),
-            attestation_evidence: None,
-            consent_role: None,
-            additional_scrubs: Vec::new(),
-        };
+        // CIRISStatus#31 — register the engine's OWN DERIVED key_id (what
+        // `serve_with_adapter` does in production and what `emit_attestation_self`
+        // attests under), NOT the raw label. `register_self_federation_key`
+        // derives the key_id internally from the composed signer, so this test
+        // now mirrors the real enrollment the emit relies on.
+        let _ = key_id;
         match engine
-            .register_federation_key(SignedKeyRecord { record: rec })
+            .register_self_federation_key(
+                "witness",
+                key_id,
+                None,
+                serde_json::json!({}),
+                Vec::new(),
+            )
             .await
         {
-            Ok(()) | Err(FederationError::Conflict(_)) => {}
+            Ok(_) | Err(FederationError::Conflict(_)) => {}
             Err(e) => panic!("self-register witness key: {e}"),
         }
     }
@@ -446,7 +378,10 @@ mod flow_b_emit {
         let hash = emit_liveness(&engine, NODE, &env)
             .await
             .expect("after self-registration, health:liveness must be admitted");
-        assert_eq!(hash.len(), 64, "content hash is SHA-256 hex");
+        assert!(
+            !hash.is_empty(),
+            "emit_attestation_self returns the attestation_id"
+        );
     }
 
     #[tokio::test]
