@@ -348,6 +348,10 @@ mod flow_a_real_data {
         let sig = attester.sign_hybrid(&canonical).await.unwrap();
         let now = Utc::now();
         let rec = KeyRecord {
+            // renamed from `roles` — empty is correct for a test subject/attester
+            // key: capability_roles is the co-scrub plane's serve-node grant
+            // ([infra:serve, infra:attest, …]), which a scoring fixture does not hold.
+            capability_roles: Vec::new(),
             key_id: key_id.to_string(),
             pubkey_ed25519_base64: B64.encode(&sig.classical.public_key),
             pubkey_ml_dsa_65_base64: Some(B64.encode(&sig.pqc.public_key)),
@@ -364,7 +368,6 @@ mod flow_a_real_data {
             scrub_timestamp: now,
             pqc_completed_at: Some(now),
             persist_row_hash: String::new(),
-            roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -378,33 +381,75 @@ mod flow_a_real_data {
         }
     }
 
-    async fn register_key<B: FederationDirectory>(dir: &B, key_id: &str, id_type: &str) {
+    // `register_key` (raw KeyRecord, no signer) was removed here. Under
+    // CIRISConstitution#46 a scoring SUBJECT must be able to sign, because it
+    // has to author the `analyze` consent that admits any capacity:* claim
+    // about it. A subject that cannot consent cannot be scored, so a fixture
+    // that registers one is modelling a state production cannot reach.
+    // Every subject here is now a real signer via `detector` +
+    // `register_attester` + `seed_analyze_consent`.
+
+    /// **CIRISConstitution#46** — the subject's `analyze` consent.
+    ///
+    /// persist refuses a `capacity:*` claim about S unless a live
+    /// `consent:state:granted:v1` from S names the attester with scope
+    /// `analyze`. Without this the seed fails with *"resolved stance:
+    /// Unspecified"*, which is the gate working, not the fixture being wrong.
+    ///
+    /// The subject signs it, so the subject must be a real signer — these
+    /// fixtures used to raw-register their subjects, which cannot consent to
+    /// anything.
+    async fn seed_analyze_consent<B: FederationDirectory>(
+        dir: &B,
+        subject_engine: &Engine,
+        subject: &str,
+        attester_key_id: &str,
+    ) {
+        use ciris_persist::federation::admission::CAPACITY_CONSENT_SCOPE;
+        use ciris_persist::federation::consent::consent_dimension;
+        use ciris_persist::federation::envelope::paths;
+
+        // Single-source the KEYS and the dimension prefix from persist — a
+        // hand-mirrored literal compiles and skews the wire (CIRISServer#322).
+        let envelope = serde_json::json!({
+            (paths::DIMENSION): format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX),
+            "scope": CAPACITY_CONSENT_SCOPE,
+        });
+        let canonical = ceg_produce_canonicalize(&envelope).unwrap();
+        let och = hex::encode(Sha256::digest(&canonical));
+        let sig = subject_engine.sign_hybrid(&canonical).await.unwrap();
         let now = Utc::now();
-        let rec = KeyRecord {
-            key_id: key_id.to_string(),
-            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-            pubkey_ml_dsa_65_base64: None,
-            algorithm: algorithm::HYBRID.into(),
-            identity_type: id_type.to_string(),
-            identity_ref: key_id.to_string(),
-            valid_from: now,
-            valid_until: None,
-            registration_envelope: serde_json::json!({ "key_id": key_id }),
-            original_content_hash: "deadbeef".into(),
-            scrub_signature_classical: "AAAA".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: key_id.to_string(),
-            scrub_timestamp: now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            roles: Vec::new(),
-            attestation_evidence: None,
-            consent_role: None,
+        let att = Attestation {
+            attestation_id: format!(
+                "{subject}-analyze-{}",
+                now.timestamp_nanos_opt().unwrap_or(0)
+            ),
+            // The SUBJECT attests; the ATTESTER is what the consent is about.
+            attesting_key_id: subject.to_string(),
+            attested_key_id: attester_key_id.to_string(),
+            attestation_type: "consent".to_owned(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: B64.encode(&sig.classical.signature),
+            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+            scrub_key_id: subject.to_string(),
             additional_scrubs: Vec::new(),
+            scrub_timestamp: now,
+            pqc_completed_at: Some(now),
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![attester_key_id.to_string()],
+            withdraws_admission_rule: None,
+            // FEDERATION, not self: it is read on the SCORING node, not the subject's.
+            cohort_scope: cohort_scope::FEDERATION.to_owned(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
         };
-        dir.put_public_key(SignedKeyRecord { record: rec })
+        dir.put_attestation(SignedAttestation { attestation: att })
             .await
-            .expect("register key");
+            .expect("seed analyze consent");
     }
 
     async fn seed_capacity<B: FederationDirectory>(
@@ -443,6 +488,10 @@ mod flow_a_real_data {
             scrub_signature_classical: B64.encode(&sig.classical.signature),
             scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
             scrub_key_id: attester_key_id.to_string(),
+            // persist #556: a row carries its own co-scrub quorum. This
+            // fixture is a single-attester score, so the set is empty — the
+            // 2-of-3 case belongs to the genesis bundle gates, not here.
+            additional_scrubs: Vec::new(),
             scrub_timestamp: now,
             pqc_completed_at: Some(now),
             persist_row_hash: String::new(),
@@ -464,8 +513,24 @@ mod flow_a_real_data {
 
         let det = detector(&seeds, "lenscore-detector").await;
         register_attester(&engine, &det, "lenscore-detector", identity_type::AGENT).await;
-        register_key(dir.as_ref(), "agent-alpha", identity_type::AGENT).await;
-        register_key(dir.as_ref(), "agent-bravo", identity_type::AGENT).await;
+        let agent_alpha = detector(&seeds, "agent-alpha").await;
+        register_attester(&engine, &agent_alpha, "agent-alpha", identity_type::AGENT).await;
+        seed_analyze_consent(
+            dir.as_ref(),
+            &agent_alpha,
+            "agent-alpha",
+            "lenscore-detector",
+        )
+        .await;
+        let agent_bravo = detector(&seeds, "agent-bravo").await;
+        register_attester(&engine, &agent_bravo, "agent-bravo", identity_type::AGENT).await;
+        seed_analyze_consent(
+            dir.as_ref(),
+            &agent_bravo,
+            "agent-bravo",
+            "lenscore-detector",
+        )
+        .await;
 
         let valid_until = Utc::now() + chrono::Duration::hours(24);
 
@@ -549,7 +614,15 @@ mod flow_a_real_data {
         let dir = engine.sqlite_backend().expect("sqlite backend");
         let det = detector(&seeds, "lenscore-detector").await;
         register_attester(&engine, &det, "lenscore-detector", identity_type::AGENT).await;
-        register_key(dir.as_ref(), "agent-stale", identity_type::AGENT).await;
+        let agent_stale = detector(&seeds, "agent-stale").await;
+        register_attester(&engine, &agent_stale, "agent-stale", identity_type::AGENT).await;
+        seed_analyze_consent(
+            dir.as_ref(),
+            &agent_stale,
+            "agent-stale",
+            "lenscore-detector",
+        )
+        .await;
 
         let past = Utc::now() - chrono::Duration::hours(1);
         seed_capacity(

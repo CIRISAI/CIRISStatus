@@ -200,8 +200,18 @@ pub async fn emit_liveness(
     // (this node attesting its own liveness); the envelope carries the subject.
     use ciris_persist::federation::EmitAttestationInput;
 
-    let mut input = EmitAttestationInput::with_envelope(ATTESTATION_TYPE_SCORES, env.to_envelope())
-        .with_weight(Some(env.confidence));
+    // persist #519/#527 added an explicit write-side cohort_scope: write and read
+    // must not share one default. `federation` is correct here for the same reason
+    // the server's capacity scorer uses it — a liveness score is a REPUTATIONAL
+    // claim published so peers can read it. Defaulting this to `self` would leave
+    // every status score born (self, local) and unpromotable, which is precisely
+    // how the trace plane shipped zero rows for eight releases while staying green.
+    let mut input = EmitAttestationInput::with_envelope(
+        ATTESTATION_TYPE_SCORES,
+        ciris_persist::federation::envelope::EnvelopeCore::from_value(env.to_envelope())?,
+        ciris_persist::federation::types::cohort_scope::FEDERATION,
+    )
+    .with_weight(Some(env.confidence));
     input.expires_at = Some(env.valid_until);
     input.subject_key_ids = vec![env.attested_key_id.clone()];
 

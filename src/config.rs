@@ -6,7 +6,7 @@
 //! The node's identity, listen address, peering, and data dir are NOT here —
 //! they belong to `ciris_server::ServerConfig` (resolved from `--home`/`--key-id`
 //! plus the node's own `config:*`). This module resolves ONLY the adapter's concerns,
-//! and only from the corpus (`graph_config::get_*(&engine, &node_key_id, KEY)`),
+//! and only from the corpus (`graph_config::get_*(&engine, KEY)`),
 //! with baked defaults so a fresh, unconfigured node runs cleanly (no probes,
 //! empty roster until replication).
 //!
@@ -125,15 +125,15 @@ impl Config {
     ///
     /// Re-callable each poll cycle so an owner-authored config change is picked
     /// up live without a restart.
-    pub async fn resolve(engine: &Arc<Engine>, node_key_id: &str, db_path: String) -> Self {
-        let poll_seconds = graph_config::get_i64(engine, node_key_id, "status.poll_secs")
+    pub async fn resolve(engine: &Arc<Engine>, db_path: String) -> Self {
+        let poll_seconds = graph_config::get_i64(engine, "status.poll_secs")
             .await
             .ok()
             .flatten()
             .filter(|v| *v > 0)
             .unwrap_or(60) as u64;
 
-        let cors_origins = graph_config::get_str_list(engine, node_key_id, "status.cors_origins")
+        let cors_origins = graph_config::get_str_list(engine, "status.cors_origins")
             .await
             .ok()
             .flatten()
@@ -142,30 +142,15 @@ impl Config {
 
         let mut regions = Vec::new();
         for (key, label, provider) in REGION_SPECS {
-            let name = get_str(engine, node_key_id, &format!("status.region.{key}.name"))
+            let name = get_str(engine, &format!("status.region.{key}.name"))
                 .await
                 .unwrap_or_else(|| (*label).to_string());
             regions.push(Region {
                 key,
                 name,
-                billing_url: get_str(
-                    engine,
-                    node_key_id,
-                    &format!("status.region.{key}.billing_url"),
-                )
-                .await,
-                proxy_url: get_str(
-                    engine,
-                    node_key_id,
-                    &format!("status.region.{key}.proxy_url"),
-                )
-                .await,
-                infra_url: get_str(
-                    engine,
-                    node_key_id,
-                    &format!("status.region.{key}.infra_url"),
-                )
-                .await,
+                billing_url: get_str(engine, &format!("status.region.{key}.billing_url")).await,
+                proxy_url: get_str(engine, &format!("status.region.{key}.proxy_url")).await,
+                infra_url: get_str(engine, &format!("status.region.{key}.infra_url")).await,
                 infra_provider: provider,
             });
         }
@@ -173,28 +158,18 @@ impl Config {
         let mut external = Vec::new();
         for (key, display, header, expected) in EXTERNAL_SPECS {
             // A provider is probed only when its url is configured.
-            if let Some(url) =
-                get_str(engine, node_key_id, &format!("status.external.{key}.url")).await
-            {
-                let authenticated = graph_config::get_bool(
-                    engine,
-                    node_key_id,
-                    &format!("status.external.{key}.auth"),
-                )
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or(false);
+            if let Some(url) = get_str(engine, &format!("status.external.{key}.url")).await {
+                let authenticated =
+                    graph_config::get_bool(engine, &format!("status.external.{key}.auth"))
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or(false);
                 external.push(ExternalProvider {
                     key,
                     display,
                     url,
-                    api_key: get_str(
-                        engine,
-                        node_key_id,
-                        &format!("status.external.{key}.api_key"),
-                    )
-                    .await,
+                    api_key: get_str(engine, &format!("status.external.{key}.api_key")).await,
                     header,
                     expected_text: *expected,
                     authenticated,
@@ -202,7 +177,7 @@ impl Config {
             }
         }
 
-        let ghcr_url = get_str(engine, node_key_id, "status.ghcr_url")
+        let ghcr_url = get_str(engine, "status.ghcr_url")
             .await
             .unwrap_or_else(|| "https://ghcr.io/v2/".into());
 
@@ -210,8 +185,8 @@ impl Config {
             db_path,
             poll_seconds,
             version: env!("CARGO_PKG_VERSION"),
-            grafana_url: get_str(engine, node_key_id, "status.grafana_url").await,
-            database_url: get_str(engine, node_key_id, "status.database_url").await,
+            grafana_url: get_str(engine, "status.grafana_url").await,
+            database_url: get_str(engine, "status.database_url").await,
             ghcr_url,
             regions,
             external,
@@ -250,8 +225,8 @@ impl Config {
 
 /// Read a `config:*` string key, treating an empty string as unset (so an owner
 /// can clear a probe target by setting it to `""` as well as by omitting it).
-async fn get_str(engine: &Arc<Engine>, node_key_id: &str, key: &str) -> Option<String> {
-    graph_config::get_str(engine, node_key_id, key)
+async fn get_str(engine: &Arc<Engine>, key: &str) -> Option<String> {
+    graph_config::get_str(engine, key)
         .await
         .ok()
         .flatten()
@@ -357,6 +332,10 @@ mod config_ceg {
         let sig = engine.sign_hybrid(&canonical).await.unwrap();
         let now = chrono::Utc::now();
         let rec = KeyRecord {
+            // renamed from `roles` — empty is correct for a test subject/attester
+            // key: capability_roles is the co-scrub plane's serve-node grant
+            // ([infra:serve, infra:attest, …]), which a scoring fixture does not hold.
+            capability_roles: Vec::new(),
             key_id: key_id.into(),
             pubkey_ed25519_base64: B64.encode(&sig.classical.public_key),
             pubkey_ml_dsa_65_base64: Some(B64.encode(&sig.pqc.public_key)),
@@ -373,7 +352,6 @@ mod config_ceg {
             scrub_timestamp: now,
             pqc_completed_at: Some(now),
             persist_row_hash: String::new(),
-            roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -404,7 +382,6 @@ mod config_ceg {
         // Seed an owner-authored config:* set.
         set_config(
             &engine,
-            node,
             "status.poll_secs",
             ConfigValue::I64(15),
             node,
@@ -414,7 +391,6 @@ mod config_ceg {
         .expect("set poll_secs");
         set_config(
             &engine,
-            node,
             "status.cors_origins",
             ConfigValue::List(vec![serde_json::Value::String(
                 "https://example.test".into(),
@@ -426,7 +402,6 @@ mod config_ceg {
         .expect("set cors_origins");
         set_config(
             &engine,
-            node,
             "status.region.us.billing_url",
             ConfigValue::Str("https://billing.us.test/".into()),
             node,
@@ -436,7 +411,6 @@ mod config_ceg {
         .expect("set us billing_url");
         set_config(
             &engine,
-            node,
             "status.external.exa.url",
             ConfigValue::Str("https://exa.test/health".into()),
             node,
@@ -446,7 +420,6 @@ mod config_ceg {
         .expect("set exa url");
         set_config(
             &engine,
-            node,
             "status.external.exa.auth",
             ConfigValue::Bool(true),
             node,
@@ -455,7 +428,7 @@ mod config_ceg {
         .await
         .expect("set exa auth");
 
-        let cfg = Config::resolve(&engine, node, "/data/status.db".into()).await;
+        let cfg = Config::resolve(&engine, "/data/status.db".into()).await;
 
         assert_eq!(cfg.poll_seconds, 15, "poll cadence from config:*");
         assert_eq!(cfg.cors_origins, vec!["https://example.test".to_string()]);
@@ -476,7 +449,7 @@ mod config_ceg {
         register_self_key(&engine, NODE).await;
 
         // No config:* authored → baked defaults (the fresh-node path).
-        let cfg = Config::resolve(&engine, NODE, "/data/status.db".into()).await;
+        let cfg = Config::resolve(&engine, "/data/status.db".into()).await;
         assert_eq!(cfg.poll_seconds, 60);
         assert!(cfg.external.is_empty());
         assert!(cfg.regions.iter().all(|r| r.billing_url.is_none()));

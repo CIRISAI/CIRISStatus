@@ -266,7 +266,7 @@ impl StatusAdapter {
     /// across the swap. Loudly flags any provider opted into BILLABLE keyed probing.
     async fn refresh_config(&self, ctx: &AdapterContext) {
         let db_path = self.state.cfg().db_path;
-        let cfg = Config::resolve(&ctx.engine, &ctx.key_id, db_path).await;
+        let cfg = Config::resolve(&ctx.engine, db_path).await;
 
         for ext in cfg.external.iter().filter(|e| e.authenticated) {
             tracing::warn!(
@@ -386,11 +386,7 @@ impl Adapter for StatusAdapter {
         // router's CORS layer. `routers` runs on a runtime worker thread inside
         // `serve_with_adapter`, so block on the async resolve via block_in_place.
         let cfg = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(Config::resolve(
-                &ctx.engine,
-                &ctx.key_id,
-                db_path,
-            ))
+            tokio::runtime::Handle::current().block_on(Config::resolve(&ctx.engine, db_path))
         });
         let cors_layer = cors(&cfg);
         *self.state.cfg.write().expect("cfg lock") = cfg;
