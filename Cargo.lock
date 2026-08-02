@@ -846,7 +846,7 @@ dependencies = [
 [[package]]
 name = "ciris-lens-core"
 version = "1.4.4"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.151#b6bac237f39c7b6c8e964635514b116461a16ddd"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.152#4055e3d02239c1ce54f167f62fcf04c9bae8b9e4"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -908,8 +908,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-server"
-version = "0.5.151"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.151#b6bac237f39c7b6c8e964635514b116461a16ddd"
+version = "0.5.152"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.152#4055e3d02239c1ce54f167f62fcf04c9bae8b9e4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -926,6 +926,7 @@ dependencies = [
  "flate2",
  "fs2",
  "futures-util",
+ "h3o",
  "hex",
  "jsonwebtoken",
  "libsqlite3-sys",
@@ -947,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-status"
-version = "0.3.31"
+version = "0.3.32"
 dependencies = [
  "anyhow",
  "async-trait",
