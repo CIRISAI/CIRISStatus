@@ -405,7 +405,7 @@ mod flow_a_real_data {
         subject: &str,
         attester_key_id: &str,
     ) {
-        use ciris_persist::federation::admission::CAPACITY_CONSENT_SCOPE;
+        use ciris_persist::federation::admission::ANALYZE_CONSENT_SCOPE;
         use ciris_persist::federation::consent::consent_dimension;
         use ciris_persist::federation::envelope::paths;
 
@@ -413,7 +413,7 @@ mod flow_a_real_data {
         // hand-mirrored literal compiles and skews the wire (CIRISServer#322).
         let envelope = serde_json::json!({
             (paths::DIMENSION): format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX),
-            "scope": CAPACITY_CONSENT_SCOPE,
+            "scope": ANALYZE_CONSENT_SCOPE,
         });
         let canonical = ceg_produce_canonicalize(&envelope).unwrap();
         let och = hex::encode(Sha256::digest(&canonical));

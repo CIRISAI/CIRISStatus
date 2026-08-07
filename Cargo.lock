@@ -718,6 +718,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "ciborium"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
+dependencies = [
+ "ciborium-io",
+ "ciborium-ll",
+ "serde",
+]
+
+[[package]]
+name = "ciborium-io"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
+
+[[package]]
+name = "ciborium-ll"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
+dependencies = [
+ "ciborium-io",
+ "half",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -730,8 +757,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-crypto"
-version = "10.6.3"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v10.6.3#9bd5a7e28ba9ce24f188523ac63b45007eb6dc35"
+version = "13.0.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v13.0.0#04ad42cc81d807bb03994d8af65982f558eb6b5d"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -757,8 +784,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "15.9.1"
-source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v15.9.1#d53c7d42ca77467d8381d6e44e090a9fe5360179"
+version = "15.20.3"
+source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v15.20.3#a712caaf14afeb16e3cdf4170c0812d2e693ea24"
 dependencies = [
  "async-trait",
  "axum",
@@ -776,6 +803,7 @@ dependencies = [
  "hyper",
  "jsonwebtoken",
  "leviculum-core",
+ "leviculum-lxmf",
  "leviculum-std",
  "openmls",
  "openmls_basic_credential",
@@ -808,8 +836,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-keyring"
-version = "10.6.3"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v10.6.3#9bd5a7e28ba9ce24f188523ac63b45007eb6dc35"
+version = "13.0.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v13.0.0#04ad42cc81d807bb03994d8af65982f558eb6b5d"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -846,7 +874,7 @@ dependencies = [
 [[package]]
 name = "ciris-lens-core"
 version = "1.4.4"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.152#4055e3d02239c1ce54f167f62fcf04c9bae8b9e4"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.159#a45312d3b1a28983ebbc0fc03f5915b6bc79b616"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -871,8 +899,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "24.2.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v24.2.0#676cef4e7f3491968b3454b7916425db4daafa61"
+version = "30.3.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v30.3.0#5ae2d2346e2c98a429fca9baca50295a8efa38e4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -908,8 +936,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-server"
-version = "0.5.152"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.152#4055e3d02239c1ce54f167f62fcf04c9bae8b9e4"
+version = "0.5.159"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.159#a45312d3b1a28983ebbc0fc03f5915b6bc79b616"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -948,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-status"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -973,14 +1001,15 @@ dependencies = [
 
 [[package]]
 name = "ciris-verify-core"
-version = "10.6.3"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v10.6.3#9bd5a7e28ba9ce24f188523ac63b45007eb6dc35"
+version = "13.0.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v13.0.0#04ad42cc81d807bb03994d8af65982f558eb6b5d"
 dependencies = [
  "android_system_properties",
  "async-trait",
  "base64 0.21.7",
  "chacha20poly1305",
  "chrono",
+ "ciborium",
  "ciris-crypto",
  "ciris-keyring",
  "clap",
@@ -2067,6 +2096,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b42eb4efef1f96510ae1a33b2682562a677d504641e9903a77bf5c666b9013e"
 
 [[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2854,8 +2894,8 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "leviculum-core"
-version = "0.12.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.12.0%2Bciris.1#674f9e4c3dd33f5db481ce40a59e6f162c4ab4f4"
+version = "0.14.0+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.14.0%2Bciris.1#5f6bb3981701e77d4385a5d752f9d3e06a635f01"
 dependencies = [
  "aes",
  "cbc",
@@ -2871,9 +2911,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "leviculum-lxmf"
+version = "0.14.0+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.14.0%2Bciris.1#5f6bb3981701e77d4385a5d752f9d3e06a635f01"
+dependencies = [
+ "leviculum-core",
+ "rand_core 0.6.4",
+ "rmp",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "leviculum-std"
-version = "0.12.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.12.0%2Bciris.1#674f9e4c3dd33f5db481ce40a59e6f162c4ab4f4"
+version = "0.14.0+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.14.0%2Bciris.1#5f6bb3981701e77d4385a5d752f9d3e06a635f01"
 dependencies = [
  "clap",
  "hmac 0.12.1",
