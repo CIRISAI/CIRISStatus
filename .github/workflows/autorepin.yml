@@ -89,6 +89,28 @@ jobs:
           - \`version\` → **${{ steps.calc.outputs.newver }}**
 
           CI \`build\` + \`boot-smoke\` gate this PR — a bad substrate bump lands RED, never a crash-looping image. Merge on green, then tag \`v${{ steps.calc.outputs.newver }}\` for the ghcr image." \
-            || echo "a PR for $branch may already exist"
+            > /tmp/prcreate.out 2>&1 && rc=0 || rc=$?
+          cat /tmp/prcreate.out
+
+          # DO NOT swallow the failure. This line used to be
+          #   || echo "a PR for $branch may already exist"
+          # which turned EVERY `gh pr create` failure into a benign-sounding
+          # guess and exited 0 — including the real one:
+          #   "GitHub Actions is not permitted to create or approve pull requests"
+          # The result was 70 orphaned autorepin/* branches going back to
+          # v0.5.101, every repin computed and pushed correctly and then going
+          # nowhere, while this workflow reported SUCCESS every 6 hours. The node
+          # sat 7 releases behind with a green schedule.
+          #
+          # So: verify the PR EXISTS rather than trusting the create call. An
+          # already-open PR is the one benign outcome; anything else is fatal.
+          existing=$(gh pr list --head "$branch" --state open \
+                       --json url --jq '.[0].url // empty' 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            echo "✓ repin PR open: $existing"
+            exit 0
+          fi
+          echo "::error::auto-repin pushed $branch but NO PULL REQUEST EXISTS for it, so this repin will go nowhere while this workflow reports success. gh pr create exited $rc. The usual cause is the org setting 'Allow GitHub Actions to create and approve pull requests' being off, which the default GITHUB_TOKEN cannot bypass. FIX: set the REPIN_PAT repo secret to a fine-grained PAT with contents:write + pull-requests:write. Until then every scheduled run will keep stranding a branch — there are already several dozen. Open the PR by hand from $branch to unblock this one."
+          exit 1
         env:
           GH_TOKEN: ${{ secrets.REPIN_PAT || github.token }}
