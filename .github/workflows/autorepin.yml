@@ -110,7 +110,7 @@ jobs:
             echo "✓ repin PR open: $existing"
             exit 0
           fi
-          echo "::error::auto-repin pushed $branch but NO PULL REQUEST EXISTS for it, so this repin will go nowhere while this workflow reports success. gh pr create exited $rc. The usual cause is the org setting 'Allow GitHub Actions to create and approve pull requests' being off, which the default GITHUB_TOKEN cannot bypass. FIX: set the REPIN_PAT repo secret to a fine-grained PAT with contents:write + pull-requests:write. Until then every scheduled run will keep stranding a branch — there are already several dozen. Open the PR by hand from $branch to unblock this one."
+          echo "::error::auto-repin pushed $branch but NO PULL REQUEST EXISTS for it, so this repin will go nowhere while this workflow reports success. gh pr create exited $rc. The usual cause is the org setting 'Allow GitHub Actions to create and approve pull requests' being off, which the default GITHUB_TOKEN cannot bypass. FIX: set the REPIN_PAT repo secret to a fine-grained PAT with contents:write + pull-requests:write. Until then every scheduled run will keep stranding a branch. Open the PR by hand from $branch to unblock this one."
           exit 1
         env:
           GH_TOKEN: ${{ secrets.REPIN_PAT || github.token }}
