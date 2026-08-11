@@ -93,8 +93,13 @@ jobs:
             *)       PLAT=unknown ;;
           esac
           RUSTC=$(rustc -V | awk '{print $2}')
-          # persist is pinned in Cargo.toml; edge + verify are transitive → Cargo.lock.
-          P=$(grep -m1 'CIRISPersist.*tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
+          # ALL THREE are transitive now (0.3.37): this crate pins ciris-server
+          # alone and reaches persist through its `pub use ciris_persist`
+          # re-export, so there is no CIRISPersist line in Cargo.toml to read.
+          # Grepping for one exited 1 under `set -e`, which failed the step —
+          # the lockfile is the honest source for a resolved version anyway,
+          # and it is where edge and verify were already read from.
+          P=$(grep -A1 'name = "ciris-persist"' Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([0-9.]+)".*/\1/')
           EDGE=$(grep -A1 'name = "ciris-edge"'        Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([0-9.]+)".*/\1/')
           V=$(grep -A1 'name = "ciris-verify-core"'    Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([0-9.]+)".*/\1/')
           BASE="ciris-substrate-v1-${PLAT}-release-rustc${RUSTC}"
