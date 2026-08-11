@@ -34,7 +34,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ciris_persist::prelude::Engine;
+use ciris_server::ciris_persist::prelude::Engine;
 use ciris_server::graph_config;
 
 /// One regional deployment (US / EU): its public billing + proxy `/v1/status`
@@ -272,10 +272,10 @@ mod tests {
 mod config_ceg {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    use ciris_persist::federation::types::{algorithm, KeyRecord, SignedKeyRecord};
-    use ciris_persist::federation::Error as FederationError;
-    use ciris_persist::prelude::{Engine, LocalSigner, LocalSignerConfig};
-    use ciris_persist::verify::canonical::ceg_produce_canonicalize;
+    use ciris_server::ciris_persist::federation::types::{algorithm, KeyRecord, SignedKeyRecord};
+    use ciris_server::ciris_persist::federation::Error as FederationError;
+    use ciris_server::ciris_persist::prelude::{Engine, LocalSigner, LocalSignerConfig};
+    use ciris_server::ciris_persist::verify::canonical::ceg_produce_canonicalize;
     use ciris_server::graph_config::{set_config, ConfigScope, ConfigValue};
     use sha2::{Digest, Sha256};
 

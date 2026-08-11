@@ -100,10 +100,10 @@ pub mod read {
     use super::*;
     use anyhow::Result;
 
-    use ciris_persist::ceg::list::federation::AttestationFilter;
-    use ciris_persist::ceg::ReadEngine;
-    use ciris_persist::federation::types::Attestation;
-    use ciris_persist::scope::CallerScope;
+    use ciris_server::ciris_persist::ceg::list::federation::AttestationFilter;
+    use ciris_server::ciris_persist::ceg::ReadEngine;
+    use ciris_server::ciris_persist::federation::types::Attestation;
+    use ciris_server::ciris_persist::scope::CallerScope;
 
     /// Read all currently-valid `capacity:*` `scores` rows from this node's own
     /// corpus, gated to the public/opted-in projection, and fold them into the
@@ -262,14 +262,14 @@ mod flow_a_real_data {
 
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use chrono::Utc;
-    use ciris_persist::federation::types::{
+    use ciris_server::ciris_persist::federation::types::{
         algorithm, attestation_tier, cohort_scope, identity_type, Attestation, KeyRecord,
         SignedAttestation, SignedKeyRecord,
     };
-    use ciris_persist::federation::{Error as FederationError, FederationDirectory};
-    use ciris_persist::prelude::{Engine, LocalSigner, LocalSignerConfig};
-    use ciris_persist::scope::CallerScope;
-    use ciris_persist::verify::canonical::ceg_produce_canonicalize;
+    use ciris_server::ciris_persist::federation::{Error as FederationError, FederationDirectory};
+    use ciris_server::ciris_persist::prelude::{Engine, LocalSigner, LocalSignerConfig};
+    use ciris_server::ciris_persist::scope::CallerScope;
+    use ciris_server::ciris_persist::verify::canonical::ceg_produce_canonicalize;
     use sha2::{Digest, Sha256};
 
     pub(super) mod tempdir {
@@ -405,9 +405,9 @@ mod flow_a_real_data {
         subject: &str,
         attester_key_id: &str,
     ) {
-        use ciris_persist::federation::admission::ANALYZE_CONSENT_SCOPE;
-        use ciris_persist::federation::consent::consent_dimension;
-        use ciris_persist::federation::envelope::paths;
+        use ciris_server::ciris_persist::federation::admission::ANALYZE_CONSENT_SCOPE;
+        use ciris_server::ciris_persist::federation::consent::consent_dimension;
+        use ciris_server::ciris_persist::federation::envelope::paths;
 
         // Single-source the KEYS and the dimension prefix from persist — a
         // hand-mirrored literal compiles and skews the wire (CIRISServer#322).

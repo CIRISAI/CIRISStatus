@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.36"
+version = "0.3.37"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -28,15 +28,15 @@ path = "src/main.rs"
 # fleet (wire-coherent with Node A + agents on >=0.5.114). Also ships the full
 # edge event-bus logger, so Node B's logs now narrate announce/link/path
 # lifecycle. Zero-env boot unchanged (config-as-CEG via graph_config).
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.163" }
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.166" }
 
-# ciris-persist (sqlite) at the SAME pin ciris-server uses (v11.9.1) so the
-# lockfile resolves a SINGLE ciris-persist (ciris-server v0.5.72 pins v11.9.1 too).
-# The adapter touches persist types directly: `Engine::sqlite_backend()`
-# (the SqliteBackend handle that impls both ReadEngine + FederationDirectory),
-# `CallerScope::Unauthenticated` (the Flow-A public read scope), and the
-# federation `Attestation` row emit_liveness assembles.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v30.6.0", features = ["sqlite"] }
+# NO ciris-persist PIN. persist arrives through ciris-server's `pub use
+# ciris_persist` re-export, so this crate cannot resolve a different persist
+# than the server it embeds. A second git pin here would be a second source of
+# truth for one substrate: cargo resolves both, and `Engine` from one is then a
+# different TYPE from `Engine` in the other — the CIRISPersist#109 cross-instance
+# shape, arriving by the source-tree door. Reach persist as
+# `ciris_server::ciris_persist::…` (each module aliases it with one `use`).
 
 # Impl `ciris_server::Adapter` (async fn in trait). async-trait 0.1 + axum 0.8
 # match ciris-server.
@@ -68,3 +68,4 @@ anyhow = "1"
 
 [profile.release]
 strip = "symbols"
+
