@@ -34,7 +34,7 @@ pub const WITNESS_RELATION_EXTERNAL: &str = "external";
 pub const STAKE_REPUTATIONAL: &str = "reputational";
 
 /// CEG `attestation_type` for state claims (matches
-/// `ciris_persist::federation::types::attestation_type::SCORES`).
+/// `ciris_server::ciris_persist::federation::types::attestation_type::SCORES`).
 pub const ATTESTATION_TYPE_SCORES: &str = "scores";
 
 /// Map a component health string → the CEG `scores` value on `health:liveness`:
@@ -156,7 +156,7 @@ fn rfc3339(t: chrono::DateTime<chrono::Utc>) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 use anyhow::Result;
-use ciris_persist::prelude::Engine;
+use ciris_server::ciris_persist::prelude::Engine;
 // v9.0.0 federation-tier ingest gate (CC 5.3.2.4.3.1) re-derives the signed
 // canonical bytes via `ceg_produce_canonicalize` (the PRODUCE-side JCS gate)
 // and cross-checks `SHA-256(canonical) == original_content_hash` before a
@@ -198,7 +198,7 @@ pub async fn emit_liveness(
     // hybrid-signs, and assembles the federation-tier row — so it CANNOT pick the
     // raw form. `attested_key_id = None` defaults it to the same derived self key
     // (this node attesting its own liveness); the envelope carries the subject.
-    use ciris_persist::federation::EmitAttestationInput;
+    use ciris_server::ciris_persist::federation::EmitAttestationInput;
 
     // persist #519/#527 added an explicit write-side cohort_scope: write and read
     // must not share one default. `federation` is correct here for the same reason
@@ -208,8 +208,10 @@ pub async fn emit_liveness(
     // how the trace plane shipped zero rows for eight releases while staying green.
     let mut input = EmitAttestationInput::with_envelope(
         ATTESTATION_TYPE_SCORES,
-        ciris_persist::federation::envelope::EnvelopeCore::from_value(env.to_envelope())?,
-        ciris_persist::federation::types::cohort_scope::FEDERATION,
+        ciris_server::ciris_persist::federation::envelope::EnvelopeCore::from_value(
+            env.to_envelope(),
+        )?,
+        ciris_server::ciris_persist::federation::types::cohort_scope::FEDERATION,
     )
     .with_weight(Some(env.confidence));
     input.expires_at = Some(env.valid_until);
@@ -278,8 +280,8 @@ mod tests {
 mod flow_b_emit {
     use super::*;
 
-    use ciris_persist::federation::Error as FederationError;
-    use ciris_persist::prelude::{Engine, LocalSigner, LocalSignerConfig};
+    use ciris_server::ciris_persist::federation::Error as FederationError;
+    use ciris_server::ciris_persist::prelude::{Engine, LocalSigner, LocalSignerConfig};
 
     struct SeedDir {
         dir: std::path::PathBuf,

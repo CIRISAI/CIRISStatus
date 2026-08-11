@@ -47,7 +47,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use ciris_persist::scope::CallerScope;
+use ciris_server::ciris_persist::scope::CallerScope;
 use ciris_server::{Adapter, AdapterConfig, AdapterContext, AdapterStatus};
 
 use crate::config::Config;
