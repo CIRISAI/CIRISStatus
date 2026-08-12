@@ -53,23 +53,58 @@ pub async fn service_status(cfg: &Config, client: &Client) -> ServiceStatus {
     }
 }
 
-/// Extract `[(name, status, latency_ms)]` from an upstream service's reported
-/// `providers` (tolerant of both the `{name: {...}}` map and `[{...}]` list shapes).
-pub fn upstream_providers(body: &Value) -> Vec<(String, String, Option<i64>)> {
+/// One provider entry parsed out of an upstream service's `/v1/status`.
+pub struct Upstream {
+    /// The **stable id**, never the display name: the map key (CIRISBilling's
+    /// `{"postgresql": {...}}`) or the `provider` field (CIRISProxy's
+    /// `[{"provider": "openrouter", "name": "OpenRouter", ...}]`).
+    pub id: String,
+    /// The upstream's own bucket hint — `llm` | `search` | `internal`. CIRISProxy
+    /// emits it as `type`; CIRISBilling's map shape has none.
+    pub kind: Option<String>,
+    pub status: String,
+    pub latency_ms: Option<i64>,
+}
+
+/// Last-resort id when an upstream gives us only a display name: `"Together AI"`
+/// → `"together_ai"`, so a bucket key can never contain spaces or capitals.
+fn slug(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Extract the providers an upstream service reports, tolerant of both wire
+/// shapes we consume: CIRISBilling's `{id: {...}}` map and CIRISProxy's
+/// `[{provider, name, type, ...}]` list.
+///
+/// The id MUST come from `provider` for the list shape — `name` is the human
+/// label (`"Together AI"`, `"Brave Search"`), and keying on it silently dropped
+/// every LLM/search provider at the categorization step downstream.
+pub fn upstream_providers(body: &Value) -> Vec<Upstream> {
     let mut out = Vec::new();
     let pv = match body.get("providers") {
         Some(v) => v,
         None => return out,
     };
-    let mut push = |name: String, v: &Value| {
+    let mut push = |id: String, v: &Value| {
         let status = v
             .get("status")
             .and_then(Value::as_str)
             .or_else(|| v.as_str())
             .unwrap_or(OPERATIONAL)
             .to_string();
-        let latency = v.get("latency_ms").and_then(Value::as_i64);
-        out.push((name, status, latency));
+        out.push(Upstream {
+            id,
+            kind: v
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|s| s.to_lowercase()),
+            status,
+            latency_ms: v.get("latency_ms").and_then(Value::as_i64),
+        });
     };
     match pv {
         Value::Object(map) => {
@@ -79,13 +114,14 @@ pub fn upstream_providers(body: &Value) -> Vec<(String, String, Option<i64>)> {
         }
         Value::Array(arr) => {
             for item in arr {
-                let name = item
-                    .get("name")
+                let id = item
+                    .get("provider")
                     .and_then(Value::as_str)
-                    .or_else(|| item.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                push(name, item);
+                    .map(str::to_string)
+                    .or_else(|| item.get("name").and_then(Value::as_str).map(slug))
+                    .or_else(|| item.as_str().map(slug))
+                    .unwrap_or_else(|| "unknown".into());
+                push(id, item);
             }
         }
         _ => {}
@@ -93,11 +129,96 @@ pub fn upstream_providers(body: &Value) -> Vec<(String, String, Option<i64>)> {
     out
 }
 
+/// Insert `d` under `key`, keeping the **worst** status when more than one
+/// region reports the same shared provider. A plain `insert` here made the
+/// last-iterated region silently overwrite the others, so a US-side outage
+/// disappeared behind an operational EU report.
+fn merge_worst(map: &mut BTreeMap<String, ProviderDetail>, key: String, d: ProviderDetail) {
+    match map.get(&key) {
+        Some(existing) if severity(&existing.status) >= severity(&d.status) => {}
+        _ => {
+            map.insert(key, d);
+        }
+    }
+}
+
 fn detail(status: &str, latency: Option<i64>, source: String) -> ProviderDetail {
     ProviderDetail {
         status: status.to_string(),
         latency_ms: latency,
         source: Some(source),
+    }
+}
+
+/// Is this provider **shared across regions** (one external service every region
+/// probes) rather than a per-region dependency? Shared ones collapse to a single
+/// bare-keyed row; regional ones keep a `<region>.` prefix, as `us.postgresql`
+/// always has.
+///
+/// The upstream's own `type` decides when it declares one — the id list is only
+/// the fallback for an upstream that doesn't. Neither path may DROP an entry:
+/// silently discarding unrecognized providers is how every LLM and search
+/// provider disappeared from this page after the Lens cutover.
+fn is_shared_llm(p: &Upstream) -> bool {
+    p.kind.as_deref() == Some("llm")
+        || (p.kind.is_none()
+            && matches!(p.id.as_str(), "openrouter" | "groq" | "together" | "openai"))
+}
+
+fn is_shared_search(p: &Upstream) -> bool {
+    p.kind.as_deref() == Some("search")
+        || (p.kind.is_none() && matches!(p.id.as_str(), "exa" | "brave"))
+}
+
+/// Fold one region's CIRISProxy `/v1/status` into the LLM + internal buckets.
+pub(crate) fn fold_proxy(
+    llm: &mut BTreeMap<String, ProviderDetail>,
+    internal: &mut BTreeMap<String, ProviderDetail>,
+    region_key: &str,
+    body: &Value,
+) {
+    for p in upstream_providers(body) {
+        let d = detail(&p.status, p.latency_ms, format!("cirisproxy.{region_key}"));
+        if is_shared_llm(&p) {
+            merge_worst(llm, p.id, d);
+        } else if is_shared_search(&p) {
+            merge_worst(internal, p.id, d);
+        } else {
+            // The proxy's own regional dependencies (e.g. `billing`).
+            internal.insert(format!("{}.{}", region_key, p.id), d);
+        }
+    }
+}
+
+/// Fold one region's CIRISBilling `/v1/status` into the database + auth +
+/// internal buckets.
+pub(crate) fn fold_billing(
+    database: &mut BTreeMap<String, ProviderDetail>,
+    auth: &mut BTreeMap<String, ProviderDetail>,
+    internal: &mut BTreeMap<String, ProviderDetail>,
+    region_key: &str,
+    body: &Value,
+) {
+    for p in upstream_providers(body) {
+        let d = detail(
+            &p.status,
+            p.latency_ms,
+            format!("cirisbilling.{region_key}"),
+        );
+        match p.id.as_str() {
+            // A regional dependency → region-prefixed key.
+            "postgresql" => {
+                database.insert(format!("{region_key}.postgresql"), d);
+            }
+            // Shared external identity providers, checked from every region →
+            // one row, worst vantage point wins.
+            "google_oauth" | "google_play" => merge_worst(auth, p.id, d),
+            // Anything billing grows later: surfaced as a regional internal dep
+            // instead of dropped on the floor.
+            _ => {
+                internal.insert(format!("{}.{}", region_key, p.id), d);
+            }
+        }
     }
 }
 
@@ -125,21 +246,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
                 },
             );
             if let Some(b) = &body {
-                for (name, status, latency) in upstream_providers(b) {
-                    let src = format!("cirisbilling.{}", region.key);
-                    match name.as_str() {
-                        "postgresql" => {
-                            database.insert(
-                                format!("{}.postgresql", region.key),
-                                detail(&status, latency, src),
-                            );
-                        }
-                        "google_oauth" | "google_play" => {
-                            auth.insert(name, detail(&status, latency, src));
-                        }
-                        _ => {}
-                    }
-                }
+                fold_billing(&mut database, &mut auth, &mut internal, region.key, b);
             }
         }
 
@@ -154,21 +261,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
                 },
             );
             if let Some(b) = &body {
-                for (name, status, latency) in upstream_providers(b) {
-                    let src = format!("cirisproxy.{}", region.key);
-                    match name.as_str() {
-                        "openrouter" | "groq" | "together" | "openai" => {
-                            llm.insert(name, detail(&status, latency, src));
-                        }
-                        "exa" | "brave" => {
-                            // Only if a direct external check didn't already cover it.
-                            internal
-                                .entry("web_search".into())
-                                .or_insert_with(|| detail(&status, latency, src.clone()));
-                        }
-                        _ => {}
-                    }
-                }
+                fold_proxy(&mut llm, &mut internal, region.key, b);
             }
         }
 
@@ -278,5 +371,183 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
         auth_providers: auth,
         database_providers: database,
         internal_providers: internal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// CIRISProxy's real wire shape (`hooks/status_handler.py`): a LIST whose
+    /// stable id is `provider` and whose `name` is the human label. Keying on
+    /// `name` yielded "OpenRouter"/"Together AI", which matched no categorization
+    /// arm — every LLM + search provider silently vanished from the status page,
+    /// the uptime history, and the signed liveness evidence.
+    #[test]
+    fn parses_proxy_list_shape_by_provider_id() {
+        let body = json!({
+            "service": "cirisproxy",
+            "status": "degraded",
+            "providers": [
+                {"provider": "openrouter", "name": "OpenRouter", "type": "llm",
+                 "status": "operational", "latency_ms": 210},
+                {"provider": "together", "name": "Together AI", "type": "llm",
+                 "status": "outage", "latency_ms": null, "error": "HTTP 503"},
+                {"provider": "brave", "name": "Brave Search", "type": "search",
+                 "status": "operational", "latency_ms": 340},
+                {"provider": "billing", "name": "CIRISBilling", "type": "internal",
+                 "status": "operational", "latency_ms": 12},
+            ]
+        });
+        let got = upstream_providers(&body);
+        let ids: Vec<_> = got.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["openrouter", "together", "brave", "billing"]);
+        assert_eq!(got[0].kind.as_deref(), Some("llm"));
+        assert_eq!(got[1].status, "outage");
+        assert_eq!(got[2].kind.as_deref(), Some("search"));
+        assert_eq!(got[0].latency_ms, Some(210));
+        assert_eq!(got[1].latency_ms, None);
+    }
+
+    /// CIRISBilling's real wire shape (`app/api/status_routes.py`): a MAP already
+    /// keyed by the stable id, with no `type` field.
+    #[test]
+    fn parses_billing_map_shape() {
+        let body = json!({
+            "service": "cirisbilling",
+            "status": "operational",
+            "providers": {
+                "postgresql": {"status": "operational", "latency_ms": 29},
+                "google_oauth": {"status": "degraded", "latency_ms": 1500},
+            }
+        });
+        let got = upstream_providers(&body);
+        assert_eq!(got.len(), 2);
+        let pg = got.iter().find(|p| p.id == "postgresql").unwrap();
+        assert_eq!(pg.status, "operational");
+        assert!(pg.kind.is_none(), "billing declares no type");
+    }
+
+    /// An upstream that gives only a display name still gets a usable key.
+    #[test]
+    fn falls_back_to_slugged_display_name() {
+        let body = json!({"providers": [{"name": "Together AI", "status": "operational"}]});
+        assert_eq!(upstream_providers(&body)[0].id, "together_ai");
+    }
+
+    #[test]
+    fn missing_or_scalar_providers_is_empty_not_a_panic() {
+        assert!(upstream_providers(&json!({"status": "operational"})).is_empty());
+        assert!(upstream_providers(&json!({"providers": "none"})).is_empty());
+    }
+
+    /// The REAL payload both deployed proxies returned on 2026-08-12, verbatim
+    /// (`llm01.ciris-services-1.ai` / `llm01.ciris-services-eu-1.com`). Before the
+    /// id fix this produced `llm_providers: {}` and `internal_providers: {}` —
+    /// the page reported "degraded" in both regions and showed nothing that
+    /// explained it, while Brave had been failing HTTP 422 the whole time.
+    fn proxy_body(brave_latency: i64, together_latency: i64) -> Value {
+        json!({
+            "service": "cirisproxy",
+            "status": "degraded",
+            "providers": [
+                {"provider": "openrouter", "name": "OpenRouter", "type": "llm",
+                 "status": "operational", "latency_ms": 71, "error": null},
+                {"provider": "groq", "name": "Groq", "type": "llm",
+                 "status": "operational", "latency_ms": 124, "error": null},
+                {"provider": "together", "name": "Together AI", "type": "llm",
+                 "status": "operational", "latency_ms": together_latency, "error": null},
+                {"provider": "billing", "name": "CIRISBilling", "type": "internal",
+                 "status": "operational", "latency_ms": 30, "error": null},
+                {"provider": "brave", "name": "Brave Search", "type": "search",
+                 "status": "outage", "latency_ms": brave_latency, "error": "HTTP 422"},
+            ]
+        })
+    }
+
+    #[test]
+    fn live_proxy_payload_surfaces_the_cause_of_degraded() {
+        let mut llm = BTreeMap::new();
+        let mut internal = BTreeMap::new();
+        fold_proxy(&mut llm, &mut internal, "us", &proxy_body(177, 177));
+        fold_proxy(&mut llm, &mut internal, "eu", &proxy_body(509, 624));
+
+        // Every LLM provider is visible, bare-keyed, one row per provider.
+        assert_eq!(
+            llm.keys().collect::<Vec<_>>(),
+            ["groq", "openrouter", "together"]
+        );
+        assert!(llm.values().all(|d| d.status == OPERATIONAL));
+
+        // The reason the regions read "degraded" is now on the page.
+        assert_eq!(internal["brave"].status, OUTAGE);
+
+        // The proxy's regional dependency stays region-scoped.
+        assert_eq!(internal["us.billing"].status, OPERATIONAL);
+        assert_eq!(internal["eu.billing"].status, OPERATIONAL);
+
+        // No display names leaked in as keys.
+        assert!(!llm.contains_key("OpenRouter") && !internal.contains_key("Brave Search"));
+    }
+
+    #[test]
+    fn live_billing_payload_keeps_both_regions_databases() {
+        let body = |pg: &str| {
+            json!({"service": "cirisbilling", "status": "operational", "providers": {
+                "postgresql": {"status": pg, "latency_ms": 29},
+                "google_oauth": {"status": "operational", "latency_ms": 150},
+                "google_play": {"status": "operational", "latency_ms": 484},
+            }})
+        };
+        let (mut db, mut auth, mut internal) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        fold_billing(&mut db, &mut auth, &mut internal, "us", &body(OUTAGE));
+        fold_billing(&mut db, &mut auth, &mut internal, "eu", &body(OPERATIONAL));
+
+        // Regional databases stay distinct — a US outage cannot hide behind EU.
+        assert_eq!(db["us.postgresql"].status, OUTAGE);
+        assert_eq!(db["eu.postgresql"].status, OPERATIONAL);
+        // Shared identity providers collapse to one row each.
+        assert_eq!(auth.len(), 2);
+        assert!(auth.contains_key("google_oauth") && auth.contains_key("google_play"));
+    }
+
+    /// A shared provider probed from every region collapses to ONE row that keeps
+    /// the worst vantage point. A plain insert let the last region iterated
+    /// overwrite an outage seen by the first.
+    #[test]
+    fn merge_worst_keeps_the_unhealthy_region() {
+        let mut m: BTreeMap<String, ProviderDetail> = BTreeMap::new();
+        merge_worst(
+            &mut m,
+            "google_oauth".into(),
+            detail(OUTAGE, None, "cirisbilling.us".into()),
+        );
+        merge_worst(
+            &mut m,
+            "google_oauth".into(),
+            detail(OPERATIONAL, Some(150), "cirisbilling.eu".into()),
+        );
+        let e = &m["google_oauth"];
+        assert_eq!(e.status, OUTAGE);
+        assert_eq!(e.source.as_deref(), Some("cirisbilling.us"));
+        assert_eq!(m.len(), 1, "one row per shared provider");
+    }
+
+    #[test]
+    fn merge_worst_upgrades_severity_regardless_of_order() {
+        let mut m: BTreeMap<String, ProviderDetail> = BTreeMap::new();
+        merge_worst(
+            &mut m,
+            "groq".into(),
+            detail(OPERATIONAL, Some(90), "cirisproxy.eu".into()),
+        );
+        merge_worst(
+            &mut m,
+            "groq".into(),
+            detail(DEGRADED, Some(2100), "cirisproxy.us".into()),
+        );
+        assert_eq!(m["groq"].status, DEGRADED);
+        assert_eq!(m["groq"].source.as_deref(), Some("cirisproxy.us"));
     }
 }
