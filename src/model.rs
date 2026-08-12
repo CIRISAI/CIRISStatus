@@ -12,16 +12,23 @@ pub const DEGRADED: &str = "degraded";
 pub const OUTAGE: &str = "outage";
 pub const UNKNOWN: &str = "unknown";
 
+/// Severity rank of a component status — the ordering behind [`worst`] and the
+/// worst-wins merge of a provider reported by more than one region.
+/// Unknown strings rank as `operational` (Lens-faithful: an unrecognized status
+/// never invents an outage).
+pub fn severity(status: &str) -> i8 {
+    match status {
+        DEGRADED => 1,
+        OUTAGE => 2,
+        _ => 0,
+    }
+}
+
 /// Worst (most-severe) of a set of component statuses; `None` → no components.
 pub fn worst<'a>(statuses: impl IntoIterator<Item = &'a str>) -> Option<&'static str> {
     let mut rank = -1i8;
     for s in statuses {
-        let r = match s {
-            OPERATIONAL => 0,
-            DEGRADED => 1,
-            OUTAGE => 2,
-            _ => 0,
-        };
+        let r = severity(s);
         if r > rank {
             rank = r;
         }

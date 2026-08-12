@@ -29,7 +29,79 @@ pub fn init(path: &str) -> Result<Db> {
          CREATE INDEX IF NOT EXISTS idx_status_checks_ts ON status_checks(ts);
          CREATE INDEX IF NOT EXISTS idx_status_checks_region ON status_checks(region);",
     )?;
+    normalize_legacy_provider_names(&conn);
+    purge_unmonitored_brave_rows(&conn);
     Ok(Arc::new(Mutex::new(conn)))
+}
+
+/// Rows recorded *before* this date are subject to the Brave purge below. A
+/// hard cutoff, not an open-ended `WHERE provider_name = 'brave'`: if search
+/// health is ever legitimately reported again, this repair must not eat it on
+/// the next restart.
+const BRAVE_PURGE_BEFORE: &str = "2026-08-13";
+
+/// One-time repair: drop the CIRISProxy `brave` rows that recorded a
+/// deliberately-disabled key as an outage.
+///
+/// CIRISProxy health-checked Brave with a live, billable search request. The key
+/// was disabled to stop that spend — but an unconfigured provider reported
+/// `outage`, so the poller wrote ~1440 outage rows a day for a service that was
+/// never down. Because a region's uptime is an unweighted mean over its provider
+/// rows, that one component published 73.2% overall uptime on a day when
+/// everything was healthy. The probe is gone from CIRISProxy now (search health
+/// is monitored passively); these rows are the residue.
+fn purge_unmonitored_brave_rows(conn: &Connection) {
+    match conn.execute(
+        "DELETE FROM status_checks
+         WHERE service_name = 'cirisproxy'
+           AND provider_name IN ('brave', 'Brave Search')
+           AND ts < ?1",
+        rusqlite::params![BRAVE_PURGE_BEFORE],
+    ) {
+        Ok(n) if n > 0 => tracing::info!(
+            rows = n,
+            "history: purged brave rows from the disabled-key window"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "history: brave purge failed"),
+    }
+}
+
+/// One-time repair of rows written while the upstream parser keyed CIRISProxy's
+/// providers by their DISPLAY name. Those rows read `cirisproxy.Brave Search`
+/// in `/api/v1/status/history`; new rows use the stable id, so without this the
+/// series splits in two at the deploy and every chart shows a cliff.
+///
+/// Idempotent (matches only the legacy spellings) and scoped to `cirisproxy`,
+/// whose display names are a known, closed set.
+fn normalize_legacy_provider_names(conn: &Connection) {
+    const RENAMES: &[(&str, &str)] = &[
+        ("OpenRouter", "openrouter"),
+        ("Groq", "groq"),
+        ("Together AI", "together"),
+        ("Brave Search", "brave"),
+        ("CIRISBilling", "billing"),
+    ];
+    for (old, new) in RENAMES {
+        match conn.execute(
+            "UPDATE status_checks SET provider_name = ?1
+             WHERE service_name = 'cirisproxy' AND provider_name = ?2",
+            rusqlite::params![new, old],
+        ) {
+            Ok(n) if n > 0 => {
+                tracing::info!(
+                    rows = n,
+                    from = old,
+                    to = new,
+                    "history: normalized legacy provider name"
+                )
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, from = old, "history: provider-name migration failed")
+            }
+        }
+    }
 }
 
 fn record(conn: &Connection, ts: &str, service: &str, provider: &str, region: &str, p: &Probe) {
@@ -43,6 +115,12 @@ fn record(conn: &Connection, ts: &str, service: &str, provider: &str, region: &s
 /// One poll cycle: probe everything we track and append rows. Region "global"
 /// for cross-region providers (LLMs, local deps), the region key otherwise.
 /// Driven by the StatusAdapter's `run_lifecycle` interval loop.
+///
+/// Each upstream's own `service` row is written on EVERY poll, not only when the
+/// fetch fails. Recording it only on failure made it 0% by construction: the row
+/// existed exactly on the polls that were down, so two bad polls out of 1440
+/// published `cirisproxy.service: 0.0% uptime` and — since a region's uptime is
+/// an unweighted mean over its provider rows — cost that region ~11 points.
 pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut rows: Vec<(String, String, String, Probe)> = Vec::new();
@@ -71,26 +149,25 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
                 .as_ref()
                 .map(crate::aggregate::upstream_providers)
                 .unwrap_or_default();
-            if providers.is_empty() {
+            // The service's own reachability, recorded EVERY poll — see
+            // `poll_once`'s note on why a failure-only row is unreadable.
+            rows.push((
+                "cirisbilling".into(),
+                "service".into(),
+                region.key.into(),
+                probe,
+            ));
+            for p in providers {
                 rows.push((
                     "cirisbilling".into(),
-                    "service".into(),
+                    p.id,
                     region.key.into(),
-                    probe,
+                    Probe {
+                        status: leak(p.status),
+                        latency_ms: p.latency_ms,
+                        message: None,
+                    },
                 ));
-            } else {
-                for (name, status, latency) in providers {
-                    rows.push((
-                        "cirisbilling".into(),
-                        name,
-                        region.key.into(),
-                        Probe {
-                            status: leak(status),
-                            latency_ms: latency,
-                            message: None,
-                        },
-                    ));
-                }
             }
         }
         if let Some(url) = &region.proxy_url {
@@ -99,34 +176,34 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
                 .as_ref()
                 .map(crate::aggregate::upstream_providers)
                 .unwrap_or_default();
-            if providers.is_empty() {
+            rows.push((
+                "cirisproxy".into(),
+                "service".into(),
+                region.key.into(),
+                probe,
+            ));
+            for p in providers {
+                // LLM providers are cross-region → record under "global".
+                // Trust the upstream's own `type` first; the id list only
+                // covers an upstream that doesn't declare one.
+                let is_llm = p.kind.as_deref() == Some("llm")
+                    || (p.kind.is_none()
+                        && matches!(p.id.as_str(), "openrouter" | "groq" | "together" | "openai"));
+                let reg = if is_llm {
+                    "global".to_string()
+                } else {
+                    region.key.to_string()
+                };
                 rows.push((
                     "cirisproxy".into(),
-                    "service".into(),
-                    region.key.into(),
-                    probe,
+                    p.id,
+                    reg,
+                    Probe {
+                        status: leak(p.status),
+                        latency_ms: p.latency_ms,
+                        message: None,
+                    },
                 ));
-            } else {
-                for (name, status, latency) in providers {
-                    // LLM providers are cross-region → record under "global".
-                    let is_llm =
-                        matches!(name.as_str(), "openrouter" | "groq" | "together" | "openai");
-                    let reg = if is_llm {
-                        "global".to_string()
-                    } else {
-                        region.key.to_string()
-                    };
-                    rows.push((
-                        "cirisproxy".into(),
-                        name,
-                        reg,
-                        Probe {
-                            status: leak(status),
-                            latency_ms: latency,
-                            message: None,
-                        },
-                    ));
-                }
             }
         }
     }
@@ -246,4 +323,174 @@ fn mean_uptime<'a>(it: impl Iterator<Item = &'a ServiceUptime>) -> f64 {
 
 fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    fn tmp_db() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ciris-status-hist-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("status.db").to_string_lossy().into_owned()
+    }
+
+    fn insert(conn: &Connection, ts: &str, service: &str, provider: &str, status: &str) {
+        conn.execute(
+            "INSERT INTO status_checks (ts, service_name, provider_name, region, status, latency_ms)
+             VALUES (?1, ?2, ?3, 'us', ?4, 10)",
+            rusqlite::params![ts, service, provider, status],
+        )
+        .unwrap();
+    }
+
+    fn names(conn: &Connection) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT provider_name, status FROM status_checks ORDER BY provider_name, ts")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows
+    }
+
+    /// Legacy display-name rows are renamed to the stable id, so the history
+    /// series doesn't split in two at the deploy.
+    #[test]
+    fn migration_renames_display_names_and_is_idempotent() {
+        let path = tmp_db();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            insert(
+                &conn,
+                "2026-08-11T00:00:00Z",
+                "cirisproxy",
+                "Together AI",
+                "operational",
+            );
+            insert(
+                &conn,
+                "2026-08-11T00:01:00Z",
+                "cirisproxy",
+                "OpenRouter",
+                "operational",
+            );
+            // A same-named provider on a DIFFERENT service must not be touched.
+            insert(
+                &conn,
+                "2026-08-11T00:02:00Z",
+                "cirisbilling",
+                "OpenRouter",
+                "operational",
+            );
+        }
+        // Re-open twice: the repair runs on every boot and must be idempotent.
+        let db = init(&path).unwrap();
+        drop(db);
+        let db = init(&path).unwrap();
+        let conn = db.lock().unwrap();
+        let got = names(&conn);
+        assert!(got.contains(&("together".into(), "operational".into())));
+        assert!(got.contains(&("openrouter".into(), "operational".into())));
+        assert_eq!(
+            got.iter().filter(|(n, _)| n == "OpenRouter").count(),
+            1,
+            "the cirisbilling row keeps its own name"
+        );
+    }
+
+    /// The disabled-key Brave rows are purged — under either spelling, since the
+    /// rename runs first — and only inside the historical window.
+    #[test]
+    fn brave_purge_is_bounded_by_the_cutoff() {
+        let path = tmp_db();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            insert(
+                &conn,
+                "2026-08-11T00:00:00Z",
+                "cirisproxy",
+                "Brave Search",
+                "outage",
+            );
+            insert(
+                &conn,
+                "2026-08-12T00:00:00Z",
+                "cirisproxy",
+                "brave",
+                "outage",
+            );
+            // After the cutoff: a legitimate future report survives.
+            insert(
+                &conn,
+                "2026-09-01T00:00:00Z",
+                "cirisproxy",
+                "brave",
+                "operational",
+            );
+            insert(
+                &conn,
+                "2026-08-11T00:00:00Z",
+                "cirisproxy",
+                "groq",
+                "operational",
+            );
+        }
+        let db = init(&path).unwrap();
+        let conn = db.lock().unwrap();
+        let got = names(&conn);
+        assert_eq!(
+            got.iter().filter(|(n, _)| n == "brave").count(),
+            1,
+            "only the post-cutoff brave row remains"
+        );
+        assert!(got.iter().any(|(n, s)| n == "brave" && s == "operational"));
+        assert!(
+            got.iter().any(|(n, _)| n == "groq"),
+            "other providers untouched"
+        );
+    }
+
+    /// The published uptime the purge restores: with the bogus 0% component
+    /// gone, the day reads ~100% instead of being dragged down by one row.
+    #[test]
+    fn purge_restores_published_uptime() {
+        let path = tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            for p in ["groq", "openrouter", "together", "service"] {
+                insert(&conn, &today, "cirisproxy", p, "operational");
+            }
+            // Pre-cutoff brave outages, exactly as the poller wrote them.
+            for _ in 0..10 {
+                insert(
+                    &conn,
+                    "2026-08-11T00:00:00Z",
+                    "cirisproxy",
+                    "brave",
+                    "outage",
+                );
+            }
+        }
+        let db = init(&path).unwrap();
+        let days = query_history(&db, 365, None).unwrap();
+        for day in &days {
+            assert_eq!(
+                day.overall_uptime_pct,
+                100.0,
+                "no day may be dragged by the purged component: {day:?}",
+                day = day.date
+            );
+        }
+    }
 }
