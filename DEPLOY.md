@@ -75,6 +75,7 @@ claiming ownership. Keys (full table in `src/config.rs` / `README.md`):
 | `status.grafana_url` / `status.database_url` | str | — (skipped) |
 | `status.region.<us\|eu>.{name,billing_url,proxy_url,infra_url}` | str | baked label / skipped |
 | `status.external.<exa\|brave\|serper\|tavily>.{url,api_key,auth}` | str/bool | skipped / keyless |
+| `status.ci.{owner,repos,token,poll_secs}` | str/list/str/i64 | `CIRISAI` / the substrate five / — / `300` |
 
 A region or external provider is probed **only** when its `*_url` is set. On a
 fresh node (no `config:*` yet) the adapter runs with defaults: **no probes**, the

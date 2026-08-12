@@ -5,13 +5,14 @@
 //! [`RUNS_PER_REPO`] GitHub Actions runs, oldest → newest. Doing that from the
 //! device directly is not viable — the unauthenticated Actions API allows 60
 //! requests/hour per IP (five repos per refresh burns that in minutes) and each
-//! `actions/runs?per_page=10` response is tens of KB of JSON, enough to exhaust
-//! a Pico's heap. So this node polls GitHub on its own cadence and serves a
-//! ~600-byte projection.
+//! `actions/runs?per_page=10` response is ~120 KB of JSON (measured: 124,809
+//! bytes for CIRISServer) — five of those would flatten a Pico's heap. So this
+//! node polls GitHub on its own cadence and serves a ~600-byte projection.
 //!
 //! Rate discipline: every request is conditional (`If-None-Match`). GitHub does
-//! not count a `304 Not Modified` against the rate limit, so a quiet stack costs
-//! effectively nothing no matter how often we poll.
+//! not count a `304 Not Modified` against the rate limit — verified against the
+//! live API: a 200 took `x-ratelimit-remaining` 60→59, and the following 304 left
+//! it at 59. A quiet stack costs effectively nothing no matter how often we poll.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};

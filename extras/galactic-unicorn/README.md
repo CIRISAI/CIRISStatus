@@ -83,9 +83,10 @@ GET https://lens.ciris-services-1.ai/status/api/v1/ci       (60s)
 
 `/api/v1/ci` exists because the Pico cannot poll GitHub itself: the
 unauthenticated Actions API allows 60 requests/hour per IP (five repos per
-refresh burns that quickly) and each `actions/runs` response is tens of KB —
-enough to exhaust the device's heap. The service polls GitHub on its own
-cadence with conditional requests and serves a ~600-byte projection. See
+refresh burns that quickly) and each `actions/runs` response is ~120 KB
+(measured: 124,809 bytes for CIRISServer) — five of those would flatten the
+device's heap. The service polls GitHub on its own cadence with conditional
+requests and serves a ~600-byte projection. See
 `src/ci.rs`; the repos, owner, token and cadence are `status.ci.*` config keys.
 
 ## History
