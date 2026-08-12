@@ -150,8 +150,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      # Shares the layer cache with release.yml's amd64 image build (same scope),
+      # so a cold substrate compile is paid once and reused by every later build
+      # of the same Cargo.toml + Cargo.lock — the rest of a PR's pushes, and the
+      # tag build that actually ships. Bare `docker build` cached nothing, so
+      # every push recompiled the whole substrate from scratch (~12 min).
+      #
+      # GitHub scopes caches per branch: a PR populates its own, main populates
+      # the default-branch one, and tag builds read main's. So the release build
+      # that gates a deploy starts warm.
       - name: Build the runtime image
-        run: docker build -t ciris-status:smoke .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ciris-status:smoke
+          cache-from: type=gha,scope=node-amd64
+          cache-to: type=gha,mode=max,scope=node-amd64
       - name: Exec the binary in the image (proves it loads — glibc + .so)
         run: |
           set -o pipefail

@@ -34,13 +34,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libtss2-dev libsqlite3-dev libudev-dev pkg-config build-essential git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# ciris-server is a git pin (tag v0.5.0) — fetched by cargo from the committed
-# Cargo.lock, so the build context is just this repo (no sibling path dep).
+# ciris-server is a git pin — fetched by cargo from the committed Cargo.lock, so
+# the build context is just this repo (no sibling path dep).
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
 
+# ── Substrate layer ──────────────────────────────────────────────────────────
+# Compile ONLY the dependency graph (ciris-server + persist + verify + edge +
+# keyring …) against a stub `main`. This is the expensive layer — ~12 minutes —
+# and splitting it out keys it on Cargo.toml + Cargo.lock ALONE, so editing
+# anything under src/ reuses it instead of rebuilding the whole substrate. That
+# is the difference between a 12-minute and a ~1-minute image build for the
+# common case (a source change), in CI and locally.
+#
+# It still cold-builds when a dependency or the crate version changes, which is
+# once per release cycle rather than once per push. The structural fix — build
+# FROM a published ciris-server base so the substrate is never recompiled here —
+# is CIRISServer#28.
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release --locked \
+    && rm -rf src target/release/ciris-status
+
+# ── Our crate ────────────────────────────────────────────────────────────────
 # `--locked` so the image build uses the committed Cargo.lock (reproducible).
-RUN cargo build --release --locked \
+# `touch` because COPY carries its own mtimes: without it cargo can consider the
+# stub fingerprint current and ship a `fn main() {}` binary.
+COPY src ./src
+RUN touch src/main.rs \
+    && cargo build --release --locked \
     && strip target/release/ciris-status \
     && cp target/release/ciris-status /ciris-status
 
