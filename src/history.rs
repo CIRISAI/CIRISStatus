@@ -31,7 +31,87 @@ pub fn init(path: &str) -> Result<Db> {
     )?;
     normalize_legacy_provider_names(&conn);
     purge_unmonitored_brave_rows(&conn);
+    refile_legacy_llm_rows(&conn);
+    purge_failure_only_service_rows(&conn);
+    prune_beyond_retention(&conn);
     Ok(Arc::new(Mutex::new(conn)))
+}
+
+/// Rows written before the always-record fix are indistinguishable from valid
+/// ones by content alone, so the repairs that cannot use a precise predicate are
+/// bounded by this date instead. It is the day the fix deployed — anything
+/// recorded from here on is already correct.
+const LEGACY_REPAIR_BEFORE: &str = "2026-08-12";
+
+/// Keep a bounded window. `/api/v1/status/history` accepts at most 365 days, so
+/// 400 leaves the whole queryable range intact with room to spare, and stops an
+/// append-only table growing without limit on a small node (~21k rows/day).
+const RETENTION_DAYS: i64 = 400;
+
+/// One-time repair: LLM providers are cross-region, and `poll_once` records them
+/// under `global`. Before the `provider`-id fix, `is_llm` never matched (it was
+/// comparing against display names), so every LLM sample was filed under the
+/// region whose proxy reported it — inflating that region's row count and
+/// double-counting the same external provider in `us` and `eu`.
+///
+/// The predicate is self-limiting: correct rows are already `global`, so a
+/// non-global LLM row is by definition pre-fix. No date bound needed.
+fn refile_legacy_llm_rows(conn: &Connection) {
+    match conn.execute(
+        "UPDATE status_checks SET region = 'global'
+         WHERE service_name = 'cirisproxy'
+           AND region <> 'global'
+           AND provider_name IN ('openrouter', 'groq', 'together', 'openai')",
+        [],
+    ) {
+        Ok(n) if n > 0 => {
+            tracing::info!(rows = n, "history: re-filed legacy LLM rows under global")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "history: LLM re-file failed"),
+    }
+}
+
+/// One-time repair: drop the `service` rows written while that row was only
+/// recorded on FAILURE.
+///
+/// Such a series is 0% uptime by construction — it exists exactly on the polls
+/// that failed and is absent on every poll that succeeded — so averaging it with
+/// real provider series does not measure availability, it just subtracts a fixed
+/// penalty. Two failed polls out of 1440 published `cirisproxy.service: 0.0%`
+/// and cost that region ~11 points. The successful polls it never wrote cannot
+/// be reconstructed, so the biased series is removed rather than repaired.
+/// Rows from [`LEGACY_REPAIR_BEFORE`] onward are written every poll and are kept.
+fn purge_failure_only_service_rows(conn: &Connection) {
+    match conn.execute(
+        "DELETE FROM status_checks WHERE provider_name = 'service' AND ts < ?1",
+        rusqlite::params![LEGACY_REPAIR_BEFORE],
+    ) {
+        Ok(n) if n > 0 => tracing::info!(
+            rows = n,
+            "history: purged failure-only service rows (0% by construction)"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "history: service-row purge failed"),
+    }
+}
+
+/// Trim samples older than the queryable window.
+fn prune_beyond_retention(conn: &Connection) {
+    match conn.execute(
+        "DELETE FROM status_checks WHERE ts < datetime('now', ?1)",
+        rusqlite::params![format!("-{RETENTION_DAYS} days")],
+    ) {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                rows = n,
+                days = RETENTION_DAYS,
+                "history: pruned old samples"
+            )
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "history: retention prune failed"),
+    }
 }
 
 /// Rows recorded *before* this date are subject to the Brave purge below. A
@@ -229,18 +309,29 @@ fn leak(s: String) -> &'static str {
 pub fn query_history(db: &Db, days: i64, region: Option<&str>) -> Result<Vec<HistoryDay>> {
     let conn = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
     let since = format!("-{days} days");
+    // `outages` counts INCIDENTS, not polls: a row is an incident only when the
+    // previous sample of the same series was not already an outage. Summing
+    // `status='outage'` counted one "outage" per poll, so a single sustained
+    // failure published as 1438 outages in a day — a number that says nothing
+    // about how often the thing actually broke. LAG() gives us the transition.
     let mut sql = String::from(
-        "SELECT date(ts) AS day, region, service_name, provider_name,
+        "SELECT day, region, service_name, provider_name,
                 AVG(CASE WHEN status='operational' THEN 100.0 ELSE 0.0 END) AS uptime,
                 AVG(COALESCE(latency_ms,0)) AS lat,
-                SUM(CASE WHEN status='outage' THEN 1 ELSE 0 END) AS outages
-         FROM status_checks
-         WHERE ts >= datetime('now', ?1)",
+                SUM(CASE WHEN status='outage' AND (prev IS NULL OR prev<>'outage')
+                         THEN 1 ELSE 0 END) AS outages
+         FROM (
+            SELECT date(ts) AS day, region, service_name, provider_name, status, latency_ms,
+                   LAG(status) OVER (
+                       PARTITION BY region, service_name, provider_name ORDER BY ts
+                   ) AS prev
+            FROM status_checks
+            WHERE ts >= datetime('now', ?1)",
     );
     if region.is_some() {
         sql.push_str(" AND region = ?2");
     }
-    sql.push_str(" GROUP BY day, region, service_name, provider_name ORDER BY day");
+    sql.push_str(" ) GROUP BY day, region, service_name, provider_name ORDER BY day");
 
     let mut stmt = conn.prepare(&sql)?;
     let map_row = |r: &rusqlite::Row| {
@@ -307,6 +398,8 @@ pub fn query_history(db: &Db, days: i64, region: Option<&str>) -> Result<Vec<His
             regions,
             services: flat,
             overall_uptime_pct: overall,
+            uptime_pct: overall,
+            status: crate::model::day_status(overall),
         });
     }
     Ok(out)
@@ -358,6 +451,181 @@ mod repair_tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         rows
+    }
+
+    /// `outage_count` must count INCIDENTS, not polls. A sustained failure is
+    /// one outage, however many samples it spans — the old `SUM(status='outage')`
+    /// published "1438 outages" for a single stuck component.
+    #[test]
+    fn outage_count_counts_incidents_not_polls() {
+        let path = tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            // one incident spanning 5 polls, recovery, then a second incident
+            let seq = [
+                ("00:00:00", "operational"),
+                ("00:01:00", "outage"),
+                ("00:02:00", "outage"),
+                ("00:03:00", "outage"),
+                ("00:04:00", "outage"),
+                ("00:05:00", "outage"),
+                ("00:06:00", "operational"),
+                ("00:07:00", "outage"),
+                ("00:08:00", "operational"),
+            ];
+            for (t, st) in seq {
+                insert(&conn, &format!("{today}T{t}Z"), "cirisproxy", "groq", st);
+            }
+        }
+        let db = init(&path).unwrap();
+        let days = query_history(&db, 2, None).unwrap();
+        let day = days.iter().find(|d| d.date == today).expect("today");
+        let row = day.services.values().next().expect("one series");
+        assert_eq!(row.outage_count, 2, "two incidents, not six outage samples");
+        // 3 operational of 9 samples.
+        assert!(
+            (row.uptime_pct - 33.3).abs() < 0.2,
+            "got {}",
+            row.uptime_pct
+        );
+    }
+
+    /// Legacy LLM rows were filed under the reporting region; they belong to
+    /// `global`. The predicate is self-limiting, so it is safe to run forever.
+    #[test]
+    fn llm_rows_are_refiled_to_global_and_repeat_is_a_noop() {
+        let path = tmp_db();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            insert(
+                &conn,
+                "2026-08-11T00:00:00Z",
+                "cirisproxy",
+                "groq",
+                "operational",
+            );
+            insert(
+                &conn,
+                "2026-08-11T00:00:00Z",
+                "cirisproxy",
+                "together",
+                "operational",
+            );
+            // Not an LLM provider: stays in its region.
+            insert(
+                &conn,
+                "2026-08-11T00:00:00Z",
+                "cirisproxy",
+                "billing",
+                "operational",
+            );
+            // A billing-service row of the same name must not be touched.
+            insert(
+                &conn,
+                "2026-08-11T00:00:00Z",
+                "cirisbilling",
+                "groq",
+                "operational",
+            );
+        }
+        let db = init(&path).unwrap();
+        let conn = db.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT service_name, provider_name, region FROM status_checks ORDER BY service_name, provider_name")
+            .unwrap();
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(rows.contains(&("cirisproxy".into(), "groq".into(), "global".into())));
+        assert!(rows.contains(&("cirisproxy".into(), "together".into(), "global".into())));
+        assert!(rows.contains(&("cirisproxy".into(), "billing".into(), "us".into())));
+        assert!(
+            rows.contains(&("cirisbilling".into(), "groq".into(), "us".into())),
+            "another service's provider of the same name is untouched"
+        );
+    }
+
+    /// The failure-only `service` series is removed for the legacy window and
+    /// kept for the always-recorded window.
+    #[test]
+    fn failure_only_service_rows_are_purged_only_before_the_cutoff() {
+        let path = tmp_db();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            insert(
+                &conn,
+                "2026-08-10T00:00:00Z",
+                "cirisproxy",
+                "service",
+                "outage",
+            );
+            insert(
+                &conn,
+                "2026-08-11T00:00:00Z",
+                "cirisbilling",
+                "service",
+                "outage",
+            );
+            insert(
+                &conn,
+                "2026-08-20T00:00:00Z",
+                "cirisproxy",
+                "service",
+                "operational",
+            );
+            insert(
+                &conn,
+                "2026-08-10T00:00:00Z",
+                "cirisproxy",
+                "groq",
+                "operational",
+            );
+        }
+        let db = init(&path).unwrap();
+        let conn = db.lock().unwrap();
+        let got = names(&conn);
+        assert_eq!(
+            got.iter().filter(|(n, _)| n == "service").count(),
+            1,
+            "only the post-cutoff service row survives"
+        );
+        assert!(got
+            .iter()
+            .any(|(n, s)| n == "service" && s == "operational"));
+        assert!(got.iter().any(|(n, _)| n == "groq"), "providers untouched");
+    }
+
+    /// A day now carries the fields a status page renders from: the alias plus a
+    /// one-word verdict.
+    #[test]
+    fn day_carries_uptime_alias_and_status() {
+        let path = tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            insert(
+                &conn,
+                &format!("{today}T00:00:00Z"),
+                "cirisproxy",
+                "groq",
+                "operational",
+            );
+        }
+        let db = init(&path).unwrap();
+        let days = query_history(&db, 2, None).unwrap();
+        let day = days.iter().find(|d| d.date == today).expect("today");
+        assert_eq!(day.uptime_pct, day.overall_uptime_pct);
+        assert_eq!(day.status, "operational");
+        assert_eq!(crate::model::day_status(99.95), "operational");
+        assert_eq!(crate::model::day_status(97.0), "degraded");
+        assert_eq!(crate::model::day_status(80.0), "outage");
     }
 
     /// Legacy display-name rows are renamed to the stable id, so the history

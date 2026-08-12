@@ -32,7 +32,7 @@ Drop-in for the Lens nginx route (`agents.ciris.ai/lens/api/…` → this servic
 | `GET /health` | Liveness: `{status:"healthy", timestamp, version}` |
 | `GET /v1/status` | Local providers (postgresql + grafana), live, only if configured |
 | `GET /api/v1/status` | Aggregated multi-region: regions (billing/proxy), infrastructure (Vultr/Hetzner/GHCR), LLM/auth/database/internal provider buckets — all live |
-| `GET /api/v1/status/history?days=&region=` | Daily uptime rollup from SQLite. `days` 1–365 (default 30), `region` ∈ `us\|eu\|global` |
+| `GET /api/v1/status/history?days=&region=` | Daily uptime rollup from SQLite. `days` 1–365 (default 30), `region` ∈ `us\|eu\|global`. Each day carries `date`, `uptime_pct` (and its `overall_uptime_pct` alias), a one-word `status`, and the per-region/service breakdown. `outage_count` counts **incidents**, not samples. |
 | `GET /api/v1/scoring` | **Public scoring roster** (Flow A): opted-in agents `{key_id, capacity_composite, factors?, valid_until}`, consent-gated. Replaces lens-python's scoring feed. Served from cache, populated from this node's OWN corpus by the adapter loop. |
 | `GET /api/v1/ci` | **Substrate build health**: the last 10 GitHub Actions runs per repo (verify → persist → edge → server → agent) as `{repo, runs[]}`, each run one of `success\|failure\|in_progress\|queued\|cancelled`. A ~600-byte projection so a microcontroller can read it in one request; polled server-side with conditional requests (see below). |
 | `GET /api/v1/scoring/live`, `GET /api/v1/status/live` | **SSE** live-push of roster + overall-health deltas (the "extra website sockets"). |
@@ -133,7 +133,24 @@ stale. A repo whose fetch fails or is rate-limited **keeps its previous row** �
 a GitHub hiccup must never turn a green centipede red, or blank the board.
 
 The uptime-history DB path is **not** config — it is derived by convention from
-the node data dir (`<data_dir>/status.db`).
+the node data dir (`<data_dir>/status.db`). It keeps 400 days (the 365-day
+maximum query window plus slack) and prunes older samples at boot, so an
+append-only table cannot grow without limit on a small node.
+
+### Reading the history honestly
+
+Two properties of this rollup are easy to get wrong, and both have burned us:
+
+- **`uptime_pct = mean(status == 'operational')` over a day's samples**, and a
+  region's figure is an unweighted mean over its component series. A component
+  that is permanently wrong therefore costs the whole region a fixed slice —
+  which is how a disabled Brave key published 73.2% uptime on a day when nothing
+  was down. Never record a series that can only take one value.
+- **`outage_count` counts incidents** — transitions into `outage`, not samples in
+  `outage`. Summing samples reported a single stuck component as "1438 outages
+  in a day", a number with no meaning to a reader.
+
+Repairs for both live in `history::init` and run once, idempotently, at boot.
 
 ### Monitoring billable providers — the right way
 

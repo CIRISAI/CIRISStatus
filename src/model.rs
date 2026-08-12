@@ -168,12 +168,36 @@ pub struct HistoryRegion {
     pub uptime_pct: f64,
 }
 
+/// Per-day rollup.
+///
+/// `uptime_pct` and `status` are the fields a status *page* actually renders one
+/// bar from; `overall_uptime_pct` is kept as-is so existing consumers don't
+/// break. Serving only the long name is what painted ciris.ai's 90-day bar
+/// yellow at "0.00% uptime" for months: the front-end read `uptime_pct`,
+/// defaulted the miss to `0`, and 0 < 99.9 renders degraded.
 #[derive(Serialize)]
 pub struct HistoryDay {
     pub date: String,
     pub regions: BTreeMap<String, HistoryRegion>,
     pub services: BTreeMap<String, ServiceUptime>,
     pub overall_uptime_pct: f64,
+    /// Alias of `overall_uptime_pct`.
+    pub uptime_pct: f64,
+    /// The day as one word: `operational` ≥ 99.9%, `degraded` ≥ 95%, else
+    /// `outage`. Derived here so every consumer draws the same conclusion from
+    /// the same number.
+    pub status: &'static str,
+}
+
+/// Bucket a day's uptime percentage into the status vocabulary.
+pub fn day_status(uptime_pct: f64) -> &'static str {
+    if uptime_pct >= 99.9 {
+        OPERATIONAL
+    } else if uptime_pct >= 95.0 {
+        DEGRADED
+    } else {
+        OUTAGE
+    }
 }
 
 #[derive(Serialize)]
