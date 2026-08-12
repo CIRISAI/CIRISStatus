@@ -1,29 +1,31 @@
 """
-CIRIS Infrastructure Status Display - Pimoroni Galactic Unicorn (53x11)
+CIRIS status board - Pimoroni Galactic Unicorn (53x11)
 
-One floating bubble per monitored component, colored by that component's status.
-Bubbles are derived from whatever /api/v1/status actually returns, so a config
-change on the server (a new region, a new LLM provider) shows up on the next
-poll with no reflash.
+Two sections, fixed positions, nothing floats:
 
-Colors:
-  GREEN  = operational
-  YELLOW = degraded
-  RED    = outage / partial_outage / major_outage
-  BLUE   = unknown, no data, or STALE (we could not reach the API)
+  rows 0-4   CENTIPEDES - the substrate's last 10 CI runs, one row per repo,
+             oldest run at the left, newest at the leading edge. A 2px tag on
+             the far left identifies the repo by hue.
+  row  5     divider, lit in the colour of the OVERALL status
+  rows 6-10  HEALTH GRID - static. Regions are column blocks ordered west to
+             east (US left of EU, like a map), then a GLOBAL block for things
+             that belong to no region. A tick gutter on the far left says which
+             row is which: 1 tick = billing, 2 = proxy, 3 = database,
+             4 = providers, 5 = infrastructure.
 
-Blue means "we don't know", never "it's fine" — if the fetch fails for
-STALE_AFTER_MS the whole display goes blue rather than showing colors from a
-snapshot that may be minutes old.
+Run colours   green success | red failure | pulsing amber in-progress |
+              dim blue queued | grey cancelled
+Health colours green operational | amber degraded | red outage | dim blue unknown
 
-Flash: copy this file to the Pico W as main.py, alongside a secrets.py holding
-WIFI_SSID / WIFI_PASSWORD. Buttons: A = refresh now, LUX +/- = brightness.
+Only in-progress CI cells animate. The health grid never moves.
+
+Flash: copy to the Pico W as main.py alongside a secrets.py with WIFI_SSID /
+WIFI_PASSWORD. Buttons: A = refresh now, LUX +/- = brightness.
 """
 
 import network
 import urequests
 import time
-import random
 import math
 from galactic import GalacticUnicorn
 from picographics import PicoGraphics, DISPLAY_GALACTIC_UNICORN
@@ -35,330 +37,407 @@ from picographics import PicoGraphics, DISPLAY_GALACTIC_UNICORN
 WIFI_SSID = "YOUR_WIFI_SSID"
 WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
 
-# ciris-status serves the public status surface that CIRISLens used to. This is
-# the same URL the ciris.ai status page reads (see the website's status page);
-# CIRISLens's old /lens-api/... route is retired and now 404s.
-STATUS_API_URL = "https://lens.ciris-services-1.ai/status/api/v1/status"
+API_ROOT = "https://lens.ciris-services-1.ai/status"
+STATUS_URL = API_ROOT + "/api/v1/status"
+CI_URL = API_ROOT + "/api/v1/ci"
 
 try:
     from secrets import WIFI_SSID, WIFI_PASSWORD
 except ImportError:
     pass
 
-REFRESH_INTERVAL_MS = 30000
-# Past this long without a successful fetch, stop trusting what's on screen.
-STALE_AFTER_MS = 3 * REFRESH_INTERVAL_MS
+STATUS_REFRESH_MS = 30000
+# The server polls GitHub on its own (slower) cadence and serves a cached
+# snapshot, so asking more often than this buys nothing.
+CI_REFRESH_MS = 60000
+# Past this long with no successful fetch, stop trusting what is on the wall.
+STALE_AFTER_MS = 3 * STATUS_REFRESH_MS
 BRIGHTNESS = 0.5
-# Frame-rate guard: the glow is drawn per-pixel, so cap how many bubbles float.
-MAX_BUBBLES = 24
 
 # =============================================================================
-# DISPLAY SETUP
+# DISPLAY
 # =============================================================================
 
 gu = GalacticUnicorn()
 graphics = PicoGraphics(DISPLAY_GALACTIC_UNICORN)
 
-WIDTH = GalacticUnicorn.WIDTH   # 53
+WIDTH = GalacticUnicorn.WIDTH    # 53
 HEIGHT = GalacticUnicorn.HEIGHT  # 11
 
-# Pre-create pens for performance
+# ── Layout ───────────────────────────────────────────────────────────────────
+CI_ROW0 = 0
+CI_ROWS = 5           # one per repo
+DIVIDER_ROW = 5
+HEALTH_ROW0 = 6
+HEALTH_ROWS = 5
+
+TAG_W = 2             # repo hue tag on each centipede
+CI_X0 = TAG_W + 2     # 2px gap after the tag
+RUNS = 10
+CELL_W = 4            # 10 cells of 4px + 9 gaps = 49px: x=4..52, flush right
+CELL_GAP = 1
+
+GUTTER_W = 5          # up to 5 ticks
+GRID_X0 = GUTTER_W + 1
+
 PEN_BLACK = graphics.create_pen(0, 0, 0)
-PEN_GREEN = graphics.create_pen(0, 200, 0)
-PEN_GREEN_DIM = graphics.create_pen(0, 80, 0)
-PEN_GREEN_BRIGHT = graphics.create_pen(0, 255, 0)
-PEN_YELLOW = graphics.create_pen(200, 160, 0)
-PEN_YELLOW_DIM = graphics.create_pen(80, 60, 0)
-PEN_YELLOW_BRIGHT = graphics.create_pen(255, 200, 0)
-PEN_RED = graphics.create_pen(200, 0, 0)
-PEN_RED_DIM = graphics.create_pen(80, 0, 0)
-PEN_RED_BRIGHT = graphics.create_pen(255, 0, 0)
-PEN_BLUE = graphics.create_pen(0, 60, 150)
-PEN_BLUE_DIM = graphics.create_pen(0, 25, 60)
-PEN_BLUE_BRIGHT = graphics.create_pen(0, 100, 200)
 
-PENS_GREEN = (PEN_GREEN_DIM, PEN_GREEN, PEN_GREEN_BRIGHT)
-PENS_YELLOW = (PEN_YELLOW_DIM, PEN_YELLOW, PEN_YELLOW_BRIGHT)
-PENS_RED = (PEN_RED_DIM, PEN_RED, PEN_RED_BRIGHT)
-PENS_BLUE = (PEN_BLUE_DIM, PEN_BLUE, PEN_BLUE_BRIGHT)
+# Health / run status colours.
+PENS = {
+    'operational': graphics.create_pen(0, 170, 0),
+    'degraded': graphics.create_pen(190, 130, 0),
+    'outage': graphics.create_pen(200, 0, 0),
+    'partial_outage': graphics.create_pen(200, 0, 0),
+    'major_outage': graphics.create_pen(220, 0, 0),
+    'unknown': graphics.create_pen(0, 22, 55),
 
-# The aggregate `status` field uses a wider vocabulary than the per-component
-# one: partial_outage / major_outage are outages, and must not fall through to
-# the blue "unknown" branch — that turned the overall bubble blue at exactly the
-# moment it should have been red.
-PENS_BY_STATUS = {
-    'operational': PENS_GREEN,
-    'degraded': PENS_YELLOW,
-    'outage': PENS_RED,
-    'partial_outage': PENS_RED,
-    'major_outage': PENS_RED,
+    'success': graphics.create_pen(0, 150, 0),
+    'failure': graphics.create_pen(200, 0, 0),
+    'queued': graphics.create_pen(0, 40, 120),
+    'cancelled': graphics.create_pen(45, 45, 45),
+    # in_progress is drawn with a pulse, built per frame
+}
+PEN_UNKNOWN = PENS['unknown']
+PEN_TICK = graphics.create_pen(40, 40, 40)
+PEN_EMPTY = graphics.create_pen(6, 6, 6)   # a cell that exists but has no data
+
+# Repo tag hues — deliberately not status colours, so the left edge never reads
+# as health. Same order as the centipede rows.
+REPO_TAGS = [
+    graphics.create_pen(0, 70, 70),     # teal
+    graphics.create_pen(70, 0, 70),     # magenta
+    graphics.create_pen(60, 60, 60),    # white
+    graphics.create_pen(80, 40, 0),     # amber-brown
+    graphics.create_pen(40, 0, 80),     # violet
+]
+
+# Region ordering, west to east, so US sits left of EU like a map. Unknown
+# regions sort after the known ones, alphabetically — a new region just appears.
+REGION_ORDER = {
+    'us': 0, 'usw': 1, 'use': 2, 'ca': 3,
+    'sa': 5,
+    'uk': 10, 'eu': 11, 'euw': 12, 'eue': 13,
+    'af': 20, 'me': 21,
+    'in': 30, 'apac': 31, 'jp': 32, 'au': 35,
 }
 
 # =============================================================================
-# METRICS STATE
+# STATE
 # =============================================================================
 
-metrics = {}          # name -> status string
-last_success_ms = None  # ticks_ms of the last good fetch, None = never
+overall = 'unknown'
+regions = []      # ordered [{'key','name','services':{...}}]
+grid = {}         # (row_index, block_index) -> [status, ...]
+blocks = []       # ordered block keys: region keys, then 'global'
+centipedes = []   # [(repo, [run_state, ...])]
+
+last_status_ok_ms = None
+last_ci_ok_ms = None
 
 
 def log(msg):
-    print(f"[{time.ticks_ms()}] {msg}")
+    print("[%d] %s" % (time.ticks_ms(), msg))
 
 
-def data_is_stale():
-    if last_success_ms is None:
+def _stale(mark, window):
+    if mark is None:
         return True
-    return time.ticks_diff(time.ticks_ms(), last_success_ms) > STALE_AFTER_MS
+    return time.ticks_diff(time.ticks_ms(), mark) > window
+
+
+def stale():
+    """Health data no longer trustworthy."""
+    return _stale(last_status_ok_ms, STALE_AFTER_MS)
+
+
+def ci_stale():
+    """CI data no longer trustworthy — tracked separately, so a broken
+    /api/v1/ci greys out the centipedes without touching the health grid (and
+    vice versa)."""
+    return _stale(last_ci_ok_ms, 3 * CI_REFRESH_MS)
 
 
 # =============================================================================
-# BUBBLE CLASS
+# LAYOUT MATH
 # =============================================================================
 
-class Bubble:
-    def __init__(self, metric_name, x=None):
-        self.metric_name = metric_name
-        self.x = float(x if x is not None else random.randint(0, WIDTH - 1))
-        self.y = float(random.randint(0, HEIGHT - 1))
-        self.r = random.uniform(2.0, 4.0)  # radius
-        self.speed = random.uniform(0.03, 0.1)  # upward speed
-        self.wobble = random.uniform(0, 6.28)  # phase offset
-        self.wobble_speed = random.uniform(0.03, 0.1)
+def block_spans(n):
+    """Split the grid area into n column blocks, 1px apart, remainder spread
+    across the leftmost blocks so the row always reaches the right edge."""
+    if n <= 0:
+        return []
+    span = WIDTH - GRID_X0
+    inner = span - (n - 1)
+    if inner < n:            # more blocks than pixels; degrade to 1px each
+        return [(GRID_X0 + i, 1) for i in range(min(n, span))]
+    w, extra = inner // n, inner % n
+    out, x = [], GRID_X0
+    for i in range(n):
+        bw = w + (1 if i < extra else 0)
+        out.append((x, bw))
+        x += bw + 1
+    return out
 
-    def update(self):
-        # Float upward
-        self.y -= self.speed
 
-        # Gentle horizontal wobble
-        self.wobble += self.wobble_speed
-        self.x += math.sin(self.wobble) * 0.15
-
-        # Wrap around
-        if self.y < -self.r:
-            self.y = HEIGHT + self.r
-            self.x = float(random.randint(3, WIDTH - 4))
-
-        # Keep in bounds horizontally
-        if self.x < 1:
-            self.x = 1
-        if self.x >= WIDTH - 1:
-            self.x = WIDTH - 2
-
-    def get_pens(self):
-        """(dim, mid, bright) pens for this bubble's current status."""
-        if data_is_stale():
-            return PENS_BLUE
-        return PENS_BY_STATUS.get(metrics.get(self.metric_name), PENS_BLUE)
+def region_sort_key(key):
+    return (REGION_ORDER.get(key, 50), key)
 
 
 # =============================================================================
-# BUBBLES — derived from the payload, not a hardcoded list
+# PARSING
 # =============================================================================
 
-bubbles = []
+def _status_of(d):
+    s = d.get('status') if isinstance(d, dict) else None
+    return s if s else 'unknown'
 
 
-def sync_bubbles():
-    """Reconcile the bubble list with whatever metrics the API returned.
+def parse_status(data):
+    """Fold /api/v1/status into the fixed grid.
 
-    New components get a bubble; components that disappear from the payload lose
-    theirs. A hardcoded list silently kept floating bubbles for things that no
-    longer exist (Lens's own database, Lens's Grafana) — permanently blue, and
-    indistinguishable from a real loss of signal.
+    Row 0 billing | 1 proxy | 2 databases | 3 providers (llm + internal) |
+    4 infrastructure + auth. A key like `us.postgresql` lands in the US block;
+    an unprefixed one is global. Infrastructure is matched back to its region by
+    the `name` the aggregator copies from the region label.
     """
-    global bubbles
+    global overall, regions, blocks, grid
 
-    wanted = list(metrics.keys())
-    if len(wanted) > MAX_BUBBLES:
-        dropped = len(wanted) - MAX_BUBBLES
-        wanted = wanted[:MAX_BUBBLES]
-        log(f"  NOTE: {dropped} metric(s) beyond MAX_BUBBLES not shown")
+    overall = data.get('status') or 'unknown'
 
-    have = {b.metric_name: b for b in bubbles}
-    kept = [have[n] for n in wanted if n in have]
-    added = [n for n in wanted if n not in have]
+    raw = data.get('regions', {}) or {}
+    regions = []
+    for key in sorted(raw.keys(), key=region_sort_key):
+        rd = raw[key] or {}
+        regions.append({
+            'key': key,
+            'name': rd.get('name', key),
+            'services': rd.get('services', {}) or {},
+        })
 
-    for i, name in enumerate(added):
-        x = ((len(kept) + i) * max(1, WIDTH // max(1, len(wanted)))) % WIDTH
-        kept.append(Bubble(name, x))
+    blocks = [r['key'] for r in regions] + ['global']
+    idx = {}
+    for i, b in enumerate(blocks):
+        idx[b] = i
+    g = {}
 
-    if added or len(kept) != len(bubbles):
-        log(f"  Bubbles: {len(kept)} ({len(added)} new)")
-    bubbles = kept
+    def put(row, block, status):
+        b = idx.get(block, idx['global'])
+        g.setdefault((row, b), []).append(status)
+
+    # Rows 0/1 — the regional services.
+    for r in regions:
+        svcs = r['services']
+        for row, name in ((0, 'billing'), (1, 'proxy')):
+            if name in svcs:
+                put(row, r['key'], _status_of(svcs[name]))
+
+    def spread(row, bucket):
+        """Region-prefixed keys go to their block; the rest are global."""
+        for name in sorted((data.get(bucket) or {}).keys()):
+            info = data[bucket][name]
+            block = name.split('.')[0] if '.' in name else 'global'
+            put(row, block, _status_of(info))
+
+    spread(2, 'database_providers')
+    spread(3, 'internal_providers')
+    for name in sorted((data.get('llm_providers') or {}).keys()):
+        put(3, 'global', _status_of(data['llm_providers'][name]))
+
+    # Row 4 — infrastructure under the region it hosts, plus global auth.
+    by_name = {}
+    for r in regions:
+        by_name[r['name']] = r['key']
+    for name in sorted((data.get('infrastructure') or {}).keys()):
+        info = data['infrastructure'][name] or {}
+        put(4, by_name.get(info.get('name'), 'global'), _status_of(info))
+    for name in sorted((data.get('auth_providers') or {}).keys()):
+        put(4, 'global', _status_of(data['auth_providers'][name]))
+
+    grid = g
+
+
+def parse_ci(data):
+    global centipedes
+    out = []
+    for entry in (data.get('repos') or [])[:CI_ROWS]:
+        out.append((entry.get('repo', '?'), entry.get('runs') or []))
+    centipedes = out
 
 
 # =============================================================================
-# NETWORKING
+# NETWORK
 # =============================================================================
 
 wlan = None
 
 
 def connect_wifi(timeout_s=30):
-    """Connect (or reconnect) to WiFi. Safe to call repeatedly."""
+    """Connect or reconnect. Safe to call repeatedly."""
     global wlan
-
     if wlan is None:
         wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-
     if wlan.isconnected():
         return True
 
-    log(f"Connecting to {WIFI_SSID}...")
+    log("connecting to %s..." % WIFI_SSID)
     try:
         wlan.connect(WIFI_SSID, WIFI_PASSWORD)
     except OSError as e:
-        log(f"  connect() failed: {e}")
+        log("  connect() failed: %s" % e)
         return False
-
     for _ in range(timeout_s):
         if wlan.isconnected():
-            log(f"Connected! IP: {wlan.ifconfig()[0]}")
+            log("  connected, ip=%s" % wlan.ifconfig()[0])
             return True
         time.sleep(1)
-
-    log("WiFi failed!")
+    log("  wifi failed")
     return False
 
 
-def _add(into, name, status):
-    into[name] = status if status else 'unknown'
-
-
-def fetch_metrics():
-    """Fetch status from the ciris-status public API.
-
-    Returns True on success. On failure the old values stay put until
-    STALE_AFTER_MS passes, after which the display goes blue.
-    """
-    global last_success_ms
-
-    # The radio drops silently; reconnect before blaming the API.
+def fetch_json(url):
     if wlan is None or not wlan.isconnected():
         if not connect_wifi(timeout_s=10):
-            return False
-
-    log("Fetching metrics...")
-    response = None
+            return None
+    r = None
     try:
-        response = urequests.get(STATUS_API_URL, timeout=15)
-
-        if response.status_code != 200:
-            log(f"  ERROR: HTTP {response.status_code}")
-            return False
-
-        data = response.json()
-
-        # Parse into a fresh dict and swap at the end, so a malformed payload
-        # can't leave the display half-updated.
-        fresh = {}
-
-        # Overall — note this field carries partial_outage / major_outage too.
-        _add(fresh, 'overall', data.get('status'))
-
-        # Regions: one bubble per service per region (billing_us, proxy_eu, ...)
-        for region_key, region_data in data.get('regions', {}).items():
-            region = region_key.split('.')[0].lower()
-            for svc_name, svc in region_data.get('services', {}).items():
-                _add(fresh, f"{svc_name}_{region}", svc.get('status'))
-
-        # Flat provider buckets. Keys can be region-qualified (us.postgresql),
-        # so keep the whole key — truncating at the dot merged distinct
-        # components into one bubble.
-        for bucket, prefix in (
-            ('infrastructure', 'infra'),
-            ('llm_providers', 'llm'),
-            ('database_providers', 'db'),
-            ('auth_providers', 'auth'),
-            ('internal_providers', 'internal'),
-        ):
-            for name, info in data.get(bucket, {}).items():
-                _add(fresh, f"{prefix}_{name.replace('.', '_')}", info.get('status'))
-
-        metrics.clear()
-        metrics.update(fresh)
-        last_success_ms = time.ticks_ms()
-        sync_bubbles()
-
-        unhealthy = [k for k, v in metrics.items() if v != 'operational']
-        log(f"  Loaded {len(metrics)} metrics, {len(unhealthy)} not operational")
-        for k in unhealthy:
-            log(f"    {k}: {metrics[k]}")
-        return True
-
+        r = urequests.get(url, timeout=15)
+        if r.status_code != 200:
+            log("  HTTP %d from %s" % (r.status_code, url))
+            return None
+        return r.json()
     except Exception as e:
-        log(f"  ERROR: {type(e).__name__}: {e}")
-        return False
+        log("  %s: %s" % (type(e).__name__, e))
+        return None
     finally:
-        if response is not None:
+        if r is not None:
             try:
-                response.close()
+                r.close()
             except Exception:
                 pass
 
 
+def refresh_status():
+    global last_status_ok_ms
+    data = fetch_json(STATUS_URL)
+    if data is None:
+        return False
+    parse_status(data)
+    last_status_ok_ms = time.ticks_ms()
+    bad = []
+    for (row, b), cells in grid.items():
+        for s in cells:
+            if s != 'operational':
+                bad.append("r%d/%s=%s" % (row, blocks[b], s))
+    log("status: overall=%s regions=%d cells=%d notok=%s"
+        % (overall, len(regions), sum(len(v) for v in grid.values()),
+           ",".join(sorted(bad)) if bad else "none"))
+    return True
+
+
+def refresh_ci():
+    global last_ci_ok_ms
+    data = fetch_json(CI_URL)
+    if data is None:
+        return False
+    parse_ci(data)
+    last_ci_ok_ms = time.ticks_ms()
+    log("ci: " + " ".join("%s=%s" % (r, "".join(s[0] for s in runs))
+                          for r, runs in centipedes))
+    return True
+
+
 # =============================================================================
-# RENDERING
+# RENDER
 # =============================================================================
 
-@micropython.native
-def draw_bubbles():
-    """Draw all bubbles with glow effect"""
-    # Clear to black
+def bar(x, y, w, pen):
+    if w <= 0:
+        return
+    graphics.set_pen(pen)
+    graphics.rectangle(x, y, w, 1)
+
+
+def pulse_pen(phase):
+    """Amber, breathing — what makes in-progress unmistakable next to queued."""
+    v = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(phase))
+    return graphics.create_pen(int(210 * v), int(140 * v), 0)
+
+
+def draw_centipedes(phase):
+    blue = ci_stale()
+    pulse = pulse_pen(phase)
+    for row in range(CI_ROWS):
+        y = CI_ROW0 + row
+        if row < len(centipedes):
+            bar(0, y, TAG_W, REPO_TAGS[row % len(REPO_TAGS)])
+            runs = centipedes[row][1]
+        else:
+            runs = []
+        for i in range(RUNS):
+            x = CI_X0 + i * (CELL_W + CELL_GAP)
+            if i < len(runs) and not blue:
+                state = runs[i]
+                pen = pulse if state == 'in_progress' else PENS.get(state, PEN_UNKNOWN)
+            else:
+                pen = PEN_UNKNOWN if (blue and i < len(runs)) else PEN_EMPTY
+            bar(x, y, CELL_W, pen)
+
+
+def draw_divider():
+    """The separator carries the overall status — one glance, whole system."""
+    pen = PEN_UNKNOWN if stale() else PENS.get(overall, PEN_UNKNOWN)
+    graphics.set_pen(pen)
+    for x in range(0, WIDTH, 2):
+        graphics.pixel(x, DIVIDER_ROW)
+
+
+def draw_health():
+    blue = stale()
+    spans = block_spans(len(blocks))
+    for row in range(HEALTH_ROWS):
+        y = HEALTH_ROW0 + row
+
+        # Tick gutter: this row's index, countable at a glance.
+        graphics.set_pen(PEN_TICK)
+        for t in range(row + 1):
+            graphics.pixel(t, y)
+
+        for b, (bx, bw) in enumerate(spans):
+            cells = grid.get((row, b), [])
+            if not cells:
+                continue
+            n = len(cells)
+            # Sub-cells share the block, 1px apart when there is room.
+            gap = 1 if n > 1 and bw >= 2 * n else 0
+            inner = bw - gap * (n - 1)
+            w = inner // n
+            if w < 1:
+                w, gap = 1, 0
+            extra = inner - w * n if w >= 1 else 0
+            x = bx
+            for i, status in enumerate(cells):
+                cw = w + (1 if i < extra else 0)
+                pen = PEN_UNKNOWN if blue else PENS.get(status, PEN_UNKNOWN)
+                bar(x, y, cw, pen)
+                x += cw + gap
+
+
+def draw(phase):
     graphics.set_pen(PEN_BLACK)
     graphics.clear()
-
-    # Draw each bubble
-    for bubble in bubbles:
-        bubble.update()
-        pen_dim, pen_mid, pen_bright = bubble.get_pens()
-
-        cx, cy = int(bubble.x), int(bubble.y)
-        radius = int(bubble.r)
-
-        # Draw concentric rings for glow effect (fast version)
-        for dy in range(-radius-1, radius+2):
-            for dx in range(-radius-1, radius+2):
-                px, py = cx + dx, cy + dy
-                if 0 <= px < WIDTH and 0 <= py < HEIGHT:
-                    dist_sq = dx*dx + dy*dy
-                    r_sq = (radius+1) * (radius+1)
-                    if dist_sq <= r_sq:
-                        if dist_sq <= radius * radius * 0.3:
-                            graphics.set_pen(pen_bright)
-                        elif dist_sq <= radius * radius * 0.7:
-                            graphics.set_pen(pen_mid)
-                        else:
-                            graphics.set_pen(pen_dim)
-                        graphics.pixel(px, py)
-
+    draw_centipedes(phase)
+    draw_divider()
+    draw_health()
     gu.update(graphics)
 
 
-def show_connecting():
-    """Yellow dots while connecting"""
+def splash(pen):
     graphics.set_pen(PEN_BLACK)
     graphics.clear()
-    graphics.set_pen(PEN_YELLOW_BRIGHT)
-
-    for i in range(5):
-        graphics.pixel(10 + i * 8, 5)
-
-    gu.update(graphics)
-
-
-def show_error():
-    """Red X on unrecoverable error"""
-    graphics.set_pen(PEN_BLACK)
-    graphics.clear()
-    graphics.set_pen(PEN_RED_BRIGHT)
-
-    for i in range(min(WIDTH, HEIGHT)):
-        graphics.pixel(i, i)
-        graphics.pixel(WIDTH - 1 - i, i)
-
+    graphics.set_pen(pen)
+    for x in range(10, WIDTH - 10):
+        graphics.pixel(x, HEIGHT // 2)
     gu.update(graphics)
 
 
@@ -367,46 +446,47 @@ def show_error():
 # =============================================================================
 
 def main():
-    log("=" * 40)
-    log("CIRIS Status Bubbles")
-    log(f"Display: {WIDTH}x{HEIGHT}")
-    log(f"API: {STATUS_API_URL}")
-    log("=" * 40)
+    log("=" * 46)
+    log("CIRIS status board  %dx%d" % (WIDTH, HEIGHT))
+    log("  rows 0-4 CI centipedes   row 5 overall   rows 6-10 health")
+    log("  ticks: 1=billing 2=proxy 3=database 4=providers 5=infra")
+    log("  %s" % STATUS_URL)
+    log("  %s" % CI_URL)
+    log("=" * 46)
 
     gu.set_brightness(BRIGHTNESS)
-    show_connecting()
+    splash(PENS['degraded'])
 
     if not connect_wifi():
-        show_error()
+        splash(PENS['outage'])
         return
 
-    if not fetch_metrics():
-        log("Initial fetch failed — showing unknown until one succeeds")
+    refresh_status()
+    refresh_ci()
+    last_status = last_ci = time.ticks_ms()
 
-    last_fetch = time.ticks_ms()
-
-    log("Starting bubble animation...")
-
+    phase = 0.0
     while True:
-        # Button controls
         if gu.is_pressed(GalacticUnicorn.SWITCH_BRIGHTNESS_UP):
             gu.adjust_brightness(+0.05)
         if gu.is_pressed(GalacticUnicorn.SWITCH_BRIGHTNESS_DOWN):
             gu.adjust_brightness(-0.05)
         if gu.is_pressed(GalacticUnicorn.SWITCH_A):
-            fetch_metrics()
-            last_fetch = time.ticks_ms()
+            refresh_status()
+            refresh_ci()
+            last_status = last_ci = time.ticks_ms()
 
-        # Periodic refresh (retries on the same cadence; the WiFi reconnect and
-        # the stale-out both live in fetch_metrics/get_pens)
-        if time.ticks_diff(time.ticks_ms(), last_fetch) > REFRESH_INTERVAL_MS:
-            fetch_metrics()
-            last_fetch = time.ticks_ms()
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_status) > STATUS_REFRESH_MS:
+            refresh_status()
+            last_status = now
+        if time.ticks_diff(now, last_ci) > CI_REFRESH_MS:
+            refresh_ci()
+            last_ci = now
 
-        # Animate
-        draw_bubbles()
-
-        time.sleep_ms(50)  # ~20 FPS
+        phase += 0.16          # ~1.2s breath at 20 FPS
+        draw(phase)
+        time.sleep_ms(50)
 
 
 if __name__ == "__main__":

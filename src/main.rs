@@ -21,6 +21,7 @@
 mod adapter;
 mod aggregate;
 mod ceg;
+mod ci;
 mod config;
 mod history;
 mod model;

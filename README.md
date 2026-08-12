@@ -34,6 +34,7 @@ Drop-in for the Lens nginx route (`agents.ciris.ai/lens/api/…` → this servic
 | `GET /api/v1/status` | Aggregated multi-region: regions (billing/proxy), infrastructure (Vultr/Hetzner/GHCR), LLM/auth/database/internal provider buckets — all live |
 | `GET /api/v1/status/history?days=&region=` | Daily uptime rollup from SQLite. `days` 1–365 (default 30), `region` ∈ `us\|eu\|global` |
 | `GET /api/v1/scoring` | **Public scoring roster** (Flow A): opted-in agents `{key_id, capacity_composite, factors?, valid_until}`, consent-gated. Replaces lens-python's scoring feed. Served from cache, populated from this node's OWN corpus by the adapter loop. |
+| `GET /api/v1/ci` | **Substrate build health**: the last 10 GitHub Actions runs per repo (verify → persist → edge → server → agent) as `{repo, runs[]}`, each run one of `success\|failure\|in_progress\|queued\|cancelled`. A ~600-byte projection so a microcontroller can read it in one request; polled server-side with conditional requests (see below). |
 | `GET /api/v1/scoring/live`, `GET /api/v1/status/live` | **SSE** live-push of roster + overall-health deltas (the "extra website sockets"). |
 | `GET /api/v1/status/ws` | **WebSocket** variant of the same live-push. |
 
@@ -111,6 +112,25 @@ baked CORS allow-list, and 60s cadence.
 | `status.external.<exa\|brave\|serper\|tavily>.url` | str | — | external search provider health URL |
 | `status.external.<…>.api_key` | str | — | key sent only when `.auth = true` |
 | `status.external.<…>.auth` | bool | `false` | send the live key when probing — **billable for some providers** |
+| `status.ci.owner` | str | `CIRISAI` | GitHub org the CI repos live in |
+| `status.ci.repos` | list | the substrate five | repos `/api/v1/ci` reports, in render order. Empty ⇒ CI polling off |
+| `status.ci.token` | str | — | GitHub token. Optional: unauthenticated works, but a token raises the ceiling from 60 to 5000 req/hour |
+| `status.ci.poll_secs` | i64 | `300` | CI poll cadence — deliberately slower than `status.poll_secs` |
+
+### Why `/api/v1/ci` exists
+
+The physical status board (`extras/galactic-unicorn/`) renders these as one
+"centipede" per repo, and it cannot poll GitHub itself: the unauthenticated
+Actions API allows **60 requests/hour per IP** (five repos per refresh burns
+that in minutes) and each `actions/runs?per_page=10` response is **~120 KB** of
+JSON (measured: 124,809 bytes for CIRISServer) — five of those would flatten a
+Pico's heap. So the node polls on its own cadence and serves a cached snapshot.
+
+Every poll is conditional (`If-None-Match`, one ETag per repo). GitHub does not
+count a `304 Not Modified` against the rate limit, so a quiet stack costs
+almost nothing; `status.ci.poll_secs` is the backstop for when ETags do go
+stale. A repo whose fetch fails or is rate-limited **keeps its previous row** —
+a GitHub hiccup must never turn a green centipede red, or blank the board.
 
 The uptime-history DB path is **not** config — it is derived by convention from
 the node data dir (`<data_dir>/status.db`).

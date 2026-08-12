@@ -26,6 +26,10 @@
 //! | `status.external.<p>.url`          | str  | — (skipped)          |
 //! | `status.external.<p>.api_key`      | str  | —                    |
 //! | `status.external.<p>.auth`         | bool | `false` (keyless)    |
+//! | `status.ci.owner`                  | str  | `CIRISAI`            |
+//! | `status.ci.repos`                  | list | the substrate five   |
+//! | `status.ci.token`                  | str  | — (unauthenticated)  |
+//! | `status.ci.poll_secs`              | i64  | `300`                |
 //!
 //! `<r>` ∈ {`us`,`eu`}; `<p>` ∈ {`exa`,`brave`,`serper`,`tavily`}. A region/
 //! external provider is probed only when its `*_url` config key is set; an unset
@@ -83,6 +87,17 @@ pub struct Config {
     pub regions: Vec<Region>,
     pub external: Vec<ExternalProvider>,
     pub cors_origins: Vec<String>,
+    /// GitHub org owning the substrate repos `/api/v1/ci` reports on.
+    pub ci_owner: String,
+    /// Repos rendered as centipedes, in dependency order. Empty ⇒ CI polling off.
+    pub ci_repos: Vec<String>,
+    /// Optional GitHub token. Unset is workable — every poll is conditional and
+    /// a `304` costs no rate limit — but a token raises the ceiling from 60 to
+    /// 5000 requests/hour, which matters the first time each ETag goes stale.
+    pub ci_token: Option<String>,
+    /// CI poll cadence. Slower than the health cadence by default: five repos
+    /// per cycle against a 60/hour unauthenticated ceiling.
+    pub ci_poll_seconds: u64,
 }
 
 /// The baked CORS allow-list used when `status.cors_origins` is unset.
@@ -181,6 +196,18 @@ impl Config {
             .await
             .unwrap_or_else(|| "https://ghcr.io/v2/".into());
 
+        let ci_repos = graph_config::get_str_list(engine, "status.ci.repos")
+            .await
+            .ok()
+            .flatten()
+            .filter(|v: &Vec<String>| !v.is_empty())
+            .unwrap_or_else(|| {
+                crate::ci::DEFAULT_REPOS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            });
+
         Config {
             db_path,
             poll_seconds,
@@ -191,6 +218,17 @@ impl Config {
             regions,
             external,
             cors_origins,
+            ci_owner: get_str(engine, "status.ci.owner")
+                .await
+                .unwrap_or_else(|| crate::ci::DEFAULT_OWNER.into()),
+            ci_repos,
+            ci_token: get_str(engine, "status.ci.token").await,
+            ci_poll_seconds: graph_config::get_i64(engine, "status.ci.poll_secs")
+                .await
+                .ok()
+                .flatten()
+                .filter(|v| *v > 0)
+                .unwrap_or(300) as u64,
         }
     }
 
@@ -219,6 +257,13 @@ impl Config {
             regions,
             external: Vec::new(),
             cors_origins: default_cors_origins(),
+            ci_owner: crate::ci::DEFAULT_OWNER.into(),
+            ci_repos: crate::ci::DEFAULT_REPOS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ci_token: None,
+            ci_poll_seconds: 300,
         }
     }
 }

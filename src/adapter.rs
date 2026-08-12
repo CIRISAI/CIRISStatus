@@ -70,6 +70,9 @@ struct AppState {
     db: Arc<RwLock<Option<history::Db>>>,
     /// Flow A public roster snapshot (served by `/api/v1/scoring`).
     roster: RosterCache,
+    /// Substrate CI snapshot (served by `/api/v1/ci`), refreshed on its own
+    /// slower cadence so five GitHub calls don't ride the health poll.
+    ci: crate::ci::CiCache,
     /// Live-push fan-out for roster + health deltas (the "extra website sockets").
     live_tx: broadcast::Sender<LiveDelta>,
 }
@@ -164,6 +167,12 @@ async fn scoring(State(st): State<AppState>) -> impl IntoResponse {
     Json(st.roster.snapshot())
 }
 
+/// `GET /api/v1/ci` — the substrate's last-N build states per repo, served from
+/// the cache so a microcontroller gets one small, instant response.
+async fn ci(State(st): State<AppState>) -> impl IntoResponse {
+    Json(st.ci.snapshot())
+}
+
 /// `GET /api/v1/status/live` (and `/api/v1/scoring/live`) — SSE live-push of
 /// roster + health deltas.
 async fn live_sse(
@@ -255,6 +264,7 @@ impl StatusAdapter {
             client,
             db: Arc::new(RwLock::new(None)),
             roster: RosterCache::default(),
+            ci: crate::ci::CiCache::default(),
             live_tx,
         };
         Ok(StatusAdapter { state })
@@ -405,6 +415,7 @@ impl Adapter for StatusAdapter {
             .route("/api/v1/status/history", get(history))
             .route("/api/v1/history", get(history))
             .route("/api/v1/scoring", get(scoring))
+            .route("/api/v1/ci", get(ci))
             .route("/api/v1/scoring/live", get(live_sse))
             .route("/api/v1/status/live", get(live_sse))
             .route("/api/v1/status/ws", get(live_ws))
@@ -444,6 +455,8 @@ impl Adapter for StatusAdapter {
         let mut tick =
             tokio::time::interval(Duration::from_secs(self.state.cfg().poll_seconds.max(1)));
         let mut last_poll = self.state.cfg().poll_seconds;
+        // Far enough in the past that the first tick refreshes CI immediately.
+        let mut last_ci = std::time::Instant::now() - Duration::from_secs(86_400);
         tracing::info!(
             poll_s = last_poll,
             "StatusAdapter lifecycle running (probe → emit_liveness → roster refresh → history)"
@@ -475,6 +488,25 @@ impl Adapter for StatusAdapter {
 
                     // ── Flow A: rebuild the public roster from the OWN corpus. ──
                     self.refresh_roster(ctx).await;
+
+                    // ── Substrate CI, on its OWN (slower) cadence. Five GitHub
+                    // calls must not ride the health poll: unauthenticated, the
+                    // Actions API allows 60/hour. Conditional requests make a
+                    // quiet stack nearly free, but the cadence is the backstop.
+                    if !cfg.ci_repos.is_empty()
+                        && last_ci.elapsed() >= Duration::from_secs(cfg.ci_poll_seconds.max(1))
+                    {
+                        last_ci = std::time::Instant::now();
+                        self.state
+                            .ci
+                            .refresh(
+                                &self.state.client,
+                                &cfg.ci_owner,
+                                &cfg.ci_repos,
+                                cfg.ci_token.as_deref(),
+                            )
+                            .await;
+                    }
 
                     // ── Live push: roster + overall-health delta to open sockets. ──
                     if self.state.live_tx.receiver_count() > 0 {
