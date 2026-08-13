@@ -12,44 +12,79 @@ floats, nothing cycles.
 ```
      +-----------+
    0 |# #        |   V verify
-   1 |# #  GGGGG |                 runs 1-5  (oldest first)
+   1 |# #GGGGG   |   runs 1-5  (oldest first)
    2 |# #        |
-   3 |# #  GGGGG |                 runs 6-10 (newest last)
+   3 |# #GGGGG   |   runs 6-10 (newest last)
    4 | #         |
-   5 |        ## |   P persist     letter on the far edge …
-   6 | b##G#  # #|                 … runs on the near one
-   8 | G#b#G  #  |
+   5 |        ## |   P persist    letter on the far edge …
+   6 |   b##G## #|   … dots never move
+   7 |        ## |
+   8 |   G#b#G#  |
+   9 |        #  |
   10 |###        |   E edge
-  11 |#    GGRGG |                 a failure in the older five
+  11 |#  GGRGG   |   a failure in the older five
+  12 |##         |
+  13 |#  GGGGG   |
+  14 |###        |
   15 |         ##|   S server
-  18 | GGGGY    #|                 newest run in progress
+  16 |   GGGGG#  |
+  17 |         # |
+  18 |   GGGGY  #|   newest run in progress
+  19 |        ## |
   20 | #         |   A agent
-  21 |# #  GGG.. |                 a young repo: only three runs
+  21 |# #GGG..   |   a young repo: only three runs
+  22 |###        |
+  23 |# #.....   |
+  24 |# #        |
   25 |       Y   |   region header: column 3 = three dots
-  26 |     Y Y   |                 column 2 = two dots
-  27 |   Y Y Y   |                 column 1 = one dot
+  26 |     Y Y   |   column 2 = two dots
+  27 |   Y Y Y   |   column 1 = one dot
   28 |        ## |   B billing
-  30 |   G G  ## |                 dots in the fixed centre columns …
+  29 |        # #|
+  30 |   G G  ## |   US EU, on the grid the runs use
+  31 |        # #|
+  32 |        ## |
   33 |##         |   P proxy
-  35 |## Y Y     |                 … so they line up under the header
+  34 |# #        |
+  35 |## Y Y     |
+  36 |#          |
+  37 |#          |
   38 |        ## |   D database
+  39 |        # #|
   40 |   G G  # #|
-  43 |#    G G Y |   L providers
-  48 |   G G G   |   I infra
+  41 |        # #|
+  42 |        ## |
+  43 |#          |   L providers
+  44 |#          |
+  45 |#  G G Y   |   GLOBAL degraded behind two healthy regions
+  46 |#          |
+  47 |###        |
+  48 |        ###|   I infra
+  49 |         # |
+  50 |   G G G # |
+  51 |         # |
+  52 |        ###|
      +-----------+
 
-     x=      3 5 7   = US, EU, GLOBAL
+     x=   3 4 5 6 7   = the one grid both halves use
 ```
 
 Every row is a 3×5 letter with its status as single-pixel dots beside it. Ten
 rows fill the board exactly.
 
-Rows **alternate edges** — letter left, letter right, letter left. Ten 5-row
-letters stacked flush leave no blank row between them, so two neighbours on the
-same edge touch and blur into each other; putting them on opposite edges
-separates them horizontally instead. The whole band mirrors, letter and dots
-together, but the dots always read left to right, so run order and the
-west-to-east region order never flip.
+**Letters** alternate edges — left, right, left. Ten 5-row letters stacked flush
+leave no blank row between them, so two neighbours on the same edge touch and
+blur; opposite edges separate them horizontally instead.
+
+**Dots never move.** Letters take either the first three columns or the last
+three, so 3–7 are the only five never covered by a glyph, and both halves use
+exactly those. A repo's run columns and the service blocks sit on one grid
+running down the middle of the board. Dots always read left to right, so run
+order and the west→east region order never flip with the letter.
+
+Five columns also means a fourth region needs no layout change. A block beyond
+the fifth is **logged, not dropped** — a board that omits a region silently
+looks healthy by omission.
 
 **Repos (rows 0–24)** — V/P/E/S/A, the substrate in dependency order: verify →
 persist → edge → server → agent. Each row carries that repo's ten most recent
@@ -78,10 +113,10 @@ pack into adjacent columns but their heights would both cap at three and the
 count would start lying. Three blocks (US, EU, GLOBAL) is what exists today.
 
 **Services (rows 28–52)** — B/P/D/L/I: billing, proxy, database, LLM providers,
-infrastructure. One dot per block, centred on the letter's middle row, in the
-**fixed centre columns 3/5/7** — the only columns never covered by a glyph,
-which is what lets them line up under the header. Sorted **west → east** (US
-left of EU, like a map), with GLOBAL one column further along — whatever belongs to no region. Adding
+infrastructure. One dot per block, centred on the letter's middle row, on the
+same centre grid the runs use — spaced every other column while they fit, which
+reads better and keeps neighbours from merging. Sorted **west → east** (US left
+of EU, like a map), with GLOBAL last — whatever belongs to no region. Adding
 a region adds a dot, no code change. Each dot is the **worst** status among that
 block's components, so a single sick provider cannot hide behind healthy
 siblings. Green operational, amber degraded, red outage, dim blue unknown.
@@ -93,6 +128,12 @@ the differing dot layouts keep them apart.
 independently: no successful `/api/v1/status` for 90 s turns the health grid
 blue, and no successful `/api/v1/ci` for 3 minutes turns the centipedes blue,
 each without touching the other.
+
+The service also reports staleness of its own: when its poll loop has not
+produced a snapshot within the poll window it answers `stale: true` with
+`age_seconds`, and the board goes blue on that alone. Otherwise an HTTP 200
+carrying a stalled node's last healthy snapshot would render as current
+indefinitely — the board would be reporting freshness it does not have.
 
 ## Orientation
 

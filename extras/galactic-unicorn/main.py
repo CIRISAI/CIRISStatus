@@ -497,14 +497,20 @@ def pulse_pen(phase):
 
 
 def region_cols(n):
-    """One column per block, packed from the left of the centre grid — the SAME
-    five columns a repo's runs use, so block N sits directly under run column N.
+    """x for each block, on the same centre grid the runs use.
 
-    Two same-coloured neighbours do merge into a bar, which is fine horizontally:
-    a run of green reads as "all green", and anything else breaks the run exactly
-    where it is. That is not the vertical fusion that made the old health rows
-    unreadable, where you could not tell which category you were looking at."""
-    return [CENTRE_X0 + i for i in range(max(0, min(n, CENTRE_COLS)))]
+    Spaced every other column while they fit (3, 5, 7) — it reads better, and
+    two neighbours cannot merge into a bar. A fourth or fifth block packs
+    adjacent instead, since the grid is five wide; adjacent dots of one colour
+    do fuse, which is tolerable horizontally (a run of green reads as all-green
+    and anything else breaks it exactly where it is) but is why spacing wins
+    while there is room for it.
+    """
+    if n <= 0:
+        return []
+    if n <= (CENTRE_COLS + 1) // 2:
+        return [CENTRE_X0 + 2 * i for i in range(n)]
+    return [CENTRE_X0 + i for i in range(min(n, CENTRE_COLS))]
 
 
 def letter_x(idx):
