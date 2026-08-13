@@ -83,14 +83,14 @@ pub struct ServiceSummary {
     pub latency_ms: Option<i64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct RegionStatus {
     pub name: String,
     pub status: String,
     pub services: BTreeMap<String, ServiceSummary>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct InfrastructureStatus {
     pub name: String,
     pub status: String,
@@ -105,7 +105,7 @@ pub struct ProviderDetail {
     pub source: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct AggregatedStatus {
     pub status: String,
     pub timestamp: String,
@@ -116,6 +116,24 @@ pub struct AggregatedStatus {
     pub auth_providers: BTreeMap<String, ProviderDetail>,
     pub database_providers: BTreeMap<String, ProviderDetail>,
     pub internal_providers: BTreeMap<String, ProviderDetail>,
+}
+
+// ── /api/v1/status/events ────────────────────────────────────────────────────
+/// One observed transition of one component. The thing a daily uptime rollup
+/// cannot tell you: that `eu.proxy` was `degraded` for ninety seconds at 14:03.
+#[derive(Serialize, Clone, PartialEq, Debug)]
+pub struct StatusEvent {
+    pub ts: String,
+    /// Stable component id — `eu.proxy`, `llm.together`, `us.postgresql`.
+    pub component: String,
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Serialize)]
+pub struct EventsResponse {
+    pub days: i64,
+    pub events: Vec<StatusEvent>,
 }
 
 // ── /api/v1/scoring (public roster — Flow A projection) ──────────────────────

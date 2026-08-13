@@ -1,5 +1,7 @@
 //! The status builders: `/v1/status` (local) and `/api/v1/status` (aggregated
-//! multi-region). All live outbound probes at request time, run concurrently.
+//! multi-region). Outbound probes run concurrently, ONCE per poll cycle — the
+//! adapter serves the resulting snapshot rather than re-probing per request, so
+//! served, recorded, and attested are the same observation.
 //! Faithful to CIRISLens's overall-status arithmetic.
 
 use std::collections::BTreeMap;
@@ -220,6 +222,69 @@ pub(crate) fn fold_billing(
             }
         }
     }
+}
+
+/// Flatten a snapshot into `component -> status`, the form transition detection
+/// works on. Component ids are stable and self-describing (`eu.proxy`,
+/// `llm.together`, `us.postgresql`) because they end up in an event log a human
+/// reads months later.
+pub fn flatten(agg: &AggregatedStatus) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    out.insert("overall".to_string(), agg.status.clone());
+    for (region, r) in &agg.regions {
+        for (svc, s) in &r.services {
+            out.insert(format!("{region}.{svc}"), s.status.clone());
+        }
+    }
+    for (name, i) in &agg.infrastructure {
+        out.insert(format!("infra.{name}"), i.status.clone());
+    }
+    for (bucket, map) in [
+        ("llm", &agg.llm_providers),
+        ("auth", &agg.auth_providers),
+        ("db", &agg.database_providers),
+        ("internal", &agg.internal_providers),
+    ] {
+        for (name, d) in map {
+            out.insert(format!("{bucket}.{name}"), d.status.clone());
+        }
+    }
+    out
+}
+
+/// The transitions between two snapshots, as events stamped `ts`.
+///
+/// A component that appears or disappears is a transition too — from/to
+/// `unknown` — because "we stopped being able to see it" is exactly the kind of
+/// thing that otherwise vanishes silently.
+pub fn transitions(
+    prev: &BTreeMap<String, String>,
+    now: &BTreeMap<String, String>,
+    ts: &str,
+) -> Vec<StatusEvent> {
+    let mut events = Vec::new();
+    for (component, to) in now {
+        let from = prev.get(component).map(String::as_str).unwrap_or(UNKNOWN);
+        if from != to {
+            events.push(StatusEvent {
+                ts: ts.to_string(),
+                component: component.clone(),
+                from: from.to_string(),
+                to: to.clone(),
+            });
+        }
+    }
+    for (component, from) in prev {
+        if !now.contains_key(component) {
+            events.push(StatusEvent {
+                ts: ts.to_string(),
+                component: component.clone(),
+                from: from.clone(),
+                to: UNKNOWN.to_string(),
+            });
+        }
+    }
+    events
 }
 
 /// `GET /api/v1/status` — the aggregated multi-region status page contract.
@@ -549,5 +614,113 @@ mod tests {
         );
         assert_eq!(m["groq"].status, DEGRADED);
         assert_eq!(m["groq"].source.as_deref(), Some("cirisproxy.us"));
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+
+    fn snap(status: &str, proxy_eu: &str, together: &str) -> AggregatedStatus {
+        let mut regions = BTreeMap::new();
+        let mut services = BTreeMap::new();
+        services.insert(
+            "proxy".to_string(),
+            ServiceSummary {
+                name: "LLM Proxy".into(),
+                status: proxy_eu.to_string(),
+                latency_ms: Some(10),
+            },
+        );
+        regions.insert(
+            "eu".to_string(),
+            RegionStatus {
+                name: "EU (Germany)".into(),
+                status: proxy_eu.to_string(),
+                services,
+            },
+        );
+        let mut llm = BTreeMap::new();
+        llm.insert(
+            "together".to_string(),
+            detail(together, Some(10), "cirisproxy.eu".into()),
+        );
+        AggregatedStatus {
+            status: status.to_string(),
+            timestamp: "2026-08-13T14:03:00Z".into(),
+            last_incident: None,
+            regions,
+            infrastructure: BTreeMap::new(),
+            llm_providers: llm,
+            auth_providers: BTreeMap::new(),
+            database_providers: BTreeMap::new(),
+            internal_providers: BTreeMap::new(),
+        }
+    }
+
+    /// The exact shape of the blip that prompted this: an LLM provider goes
+    /// slow, so the provider row AND the proxy that reports it both degrade,
+    /// then both recover. Two transitions out, two back — none of which a daily
+    /// uptime rollup can express.
+    #[test]
+    fn records_a_transient_degradation_and_its_recovery() {
+        let healthy = flatten(&snap(OPERATIONAL, OPERATIONAL, OPERATIONAL));
+        let blip = flatten(&snap(DEGRADED, DEGRADED, DEGRADED));
+
+        let out = transitions(&healthy, &blip, "2026-08-13T14:03:00Z");
+        let mut got: Vec<_> = out
+            .iter()
+            .map(|e| (e.component.as_str(), e.to.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("eu.proxy", DEGRADED),
+                ("llm.together", DEGRADED),
+                ("overall", DEGRADED),
+            ]
+        );
+        assert!(out.iter().all(|e| e.from == OPERATIONAL));
+
+        let back = transitions(&blip, &healthy, "2026-08-13T14:04:00Z");
+        assert_eq!(back.len(), 3);
+        assert!(back
+            .iter()
+            .all(|e| e.from == DEGRADED && e.to == OPERATIONAL));
+    }
+
+    #[test]
+    fn a_steady_state_produces_nothing() {
+        let a = flatten(&snap(OPERATIONAL, OPERATIONAL, OPERATIONAL));
+        assert!(transitions(&a, &a.clone(), "t").is_empty());
+    }
+
+    /// A component that stops being reported is itself a transition. Losing
+    /// sight of something must not look identical to it being fine.
+    #[test]
+    fn appearing_and_disappearing_components_are_transitions() {
+        let with = flatten(&snap(OPERATIONAL, OPERATIONAL, OPERATIONAL));
+        let mut without = with.clone();
+        without.remove("llm.together");
+
+        let lost = transitions(&with, &without, "t");
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].component, "llm.together");
+        assert_eq!(lost[0].to, UNKNOWN);
+
+        let found = transitions(&without, &with, "t");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].from, UNKNOWN);
+        assert_eq!(found[0].to, OPERATIONAL);
+    }
+
+    /// Component ids end up in a log a human reads months later.
+    #[test]
+    fn component_ids_are_stable_and_self_describing() {
+        let f = flatten(&snap(OPERATIONAL, DEGRADED, OPERATIONAL));
+        assert_eq!(f.get("eu.proxy").map(String::as_str), Some(DEGRADED));
+        assert_eq!(f.get("llm.together").map(String::as_str), Some(OPERATIONAL));
+        assert!(f.contains_key("overall"));
     }
 }

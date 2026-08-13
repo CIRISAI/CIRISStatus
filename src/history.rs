@@ -9,7 +9,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::config::Config;
-use crate::model::{HistoryDay, HistoryRegion, ServiceUptime};
+use crate::model::{HistoryDay, HistoryRegion, ServiceUptime, StatusEvent};
 use crate::probe::{check_grafana, check_postgres_tcp, fetch_service_status, Probe};
 
 pub type Db = Arc<Mutex<Connection>>;
@@ -27,7 +27,19 @@ pub fn init(path: &str) -> Result<Db> {
             latency_ms   INTEGER
          );
          CREATE INDEX IF NOT EXISTS idx_status_checks_ts ON status_checks(ts);
-         CREATE INDEX IF NOT EXISTS idx_status_checks_region ON status_checks(region);",
+         CREATE INDEX IF NOT EXISTS idx_status_checks_region ON status_checks(region);
+         -- Transitions, not samples. A daily uptime rollup cannot tell you that
+         -- eu.proxy was degraded for ninety seconds at 14:03 — a 60s blip moves
+         -- a day's mean by 0.07% and is indistinguishable from noise. This is
+         -- where a transient becomes a thing you can point at.
+         CREATE TABLE IF NOT EXISTS status_events (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        TEXT NOT NULL,
+            component TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_status_events_ts ON status_events(ts);",
     )?;
     normalize_legacy_provider_names(&conn);
     purge_unmonitored_brave_rows(&conn);
@@ -182,6 +194,44 @@ fn normalize_legacy_provider_names(conn: &Connection) {
             }
         }
     }
+}
+
+/// Append observed transitions.
+pub fn record_events(db: &Db, events: &[StatusEvent]) {
+    if events.is_empty() {
+        return;
+    }
+    if let Ok(conn) = db.lock() {
+        for e in events {
+            if let Err(err) = conn.execute(
+                "INSERT INTO status_events (ts, component, from_status, to_status)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![e.ts, e.component, e.from, e.to],
+            ) {
+                tracing::warn!(error = %err, component = %e.component, "history: event insert failed");
+            }
+        }
+    }
+}
+
+/// `/api/v1/status/events` — transitions newest-first within the window.
+pub fn query_events(db: &Db, days: i64, limit: i64) -> Result<Vec<StatusEvent>> {
+    let conn = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
+    let mut stmt = conn.prepare(
+        "SELECT ts, component, from_status, to_status FROM status_events
+         WHERE ts >= datetime('now', ?1) ORDER BY ts DESC, id DESC LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![format!("-{days} days"), limit], |r| {
+            Ok(StatusEvent {
+                ts: r.get(0)?,
+                component: r.get(1)?,
+                from: r.get(2)?,
+                to: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 fn record(conn: &Connection, ts: &str, service: &str, provider: &str, region: &str, p: &Probe) {
@@ -422,7 +472,7 @@ fn round1(v: f64) -> f64 {
 mod repair_tests {
     use super::*;
 
-    fn tmp_db() -> String {
+    pub(super) fn tmp_db() -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::Relaxed);
@@ -760,5 +810,61 @@ mod repair_tests {
                 day = day.date
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    #[test]
+    fn events_round_trip_newest_first_and_prune_with_retention() {
+        let path = repair_tests::tmp_db();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        {
+            let db = init(&path).unwrap();
+            record_events(
+                &db,
+                &[
+                    StatusEvent {
+                        ts: now.clone(),
+                        component: "eu.proxy".into(),
+                        from: "operational".into(),
+                        to: "degraded".into(),
+                    },
+                    StatusEvent {
+                        ts: now.clone(),
+                        component: "llm.together".into(),
+                        from: "operational".into(),
+                        to: "degraded".into(),
+                    },
+                ],
+            );
+            // Older than retention: must not survive the next boot.
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO status_events (ts, component, from_status, to_status)
+                 VALUES ('2020-01-01T00:00:00Z', 'ancient.thing', 'operational', 'outage')",
+                [],
+            )
+            .unwrap();
+        }
+        let db = init(&path).unwrap();
+        let got = query_events(&db, 7, 100).unwrap();
+        let names: Vec<_> = got.iter().map(|e| e.component.as_str()).collect();
+        assert!(names.contains(&"eu.proxy") && names.contains(&"llm.together"));
+        assert!(
+            !names.contains(&"ancient.thing"),
+            "retention prunes the events table too"
+        );
+        assert!(got.iter().all(|e| e.to == "degraded"));
+    }
+
+    #[test]
+    fn empty_event_list_is_a_noop() {
+        let path = repair_tests::tmp_db();
+        let db = init(&path).unwrap();
+        record_events(&db, &[]);
+        assert!(query_events(&db, 7, 100).unwrap().is_empty());
     }
 }
