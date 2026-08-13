@@ -47,6 +47,13 @@ use ciris_server::graph_config;
 pub struct Region {
     pub key: &'static str, // "us" / "eu"
     pub name: String,      // "US (Chicago)"
+    /// Physics floor for probes to this region, subtracted before the latency
+    /// threshold. A US→EU probe carries ~450-520ms of transatlantic RTT before
+    /// anything is wrong; judging it against a US-local constant makes EU
+    /// structurally closer to `degraded` for identical health (FSD §3.4).
+    /// CONFIGURED, never learned — a learned baseline drifts upward during a
+    /// slow degradation and quietly redefines normal.
+    pub latency_baseline_ms: i64,
     pub billing_url: Option<String>,
     pub proxy_url: Option<String>,
     pub infra_url: Option<String>,
@@ -98,6 +105,10 @@ pub struct Config {
     /// CI poll cadence. Slower than the health cadence by default: five repos
     /// per cycle against a 60/hour unauthenticated ceiling.
     pub ci_poll_seconds: u64,
+    /// Declared capability pools (FSD §2). Declared rather than inferred, so a
+    /// member nobody measures shows as `unknown` instead of being absent and
+    /// therefore invisibly fine.
+    pub capabilities: Vec<crate::capability::CapabilitySpec>,
 }
 
 /// The baked CORS allow-list used when `status.cors_origins` is unset.
@@ -163,6 +174,15 @@ impl Config {
             regions.push(Region {
                 key,
                 name,
+                latency_baseline_ms: graph_config::get_i64(
+                    engine,
+                    &format!("status.region.{key}.latency_baseline_ms"),
+                )
+                .await
+                .ok()
+                .flatten()
+                .filter(|v| *v >= 0)
+                .unwrap_or(0),
                 billing_url: get_str(engine, &format!("status.region.{key}.billing_url")).await,
                 proxy_url: get_str(engine, &format!("status.region.{key}.proxy_url")).await,
                 infra_url: get_str(engine, &format!("status.region.{key}.infra_url")).await,
@@ -223,6 +243,7 @@ impl Config {
                 .unwrap_or_else(|| crate::ci::DEFAULT_OWNER.into()),
             ci_repos,
             ci_token: get_str(engine, "status.ci.token").await,
+            capabilities: resolve_capabilities(engine).await,
             ci_poll_seconds: graph_config::get_i64(engine, "status.ci.poll_secs")
                 .await
                 .ok()
@@ -241,6 +262,7 @@ impl Config {
             .map(|(key, label, provider)| Region {
                 key,
                 name: (*label).to_string(),
+                latency_baseline_ms: 0,
                 billing_url: None,
                 proxy_url: None,
                 infra_url: None,
@@ -264,8 +286,51 @@ impl Config {
                 .collect(),
             ci_token: None,
             ci_poll_seconds: 300,
+            capabilities: crate::capability::default_specs(),
         }
     }
+}
+
+/// Resolve declared capability pools. `status.capability.<id>.members` is a
+/// list in call-path order, `*` marking the primary (`deepinfra*,openrouter`);
+/// `status.capability.<id>.min_available` is the threshold. Unset → the baked
+/// default, so a fresh node still declares what it expects to measure.
+async fn resolve_capabilities(engine: &Arc<Engine>) -> Vec<crate::capability::CapabilitySpec> {
+    let mut out = Vec::new();
+    for spec in crate::capability::default_specs() {
+        let members =
+            graph_config::get_str_list(engine, &format!("status.capability.{}.members", spec.id))
+                .await
+                .ok()
+                .flatten()
+                .filter(|v: &Vec<String>| !v.is_empty())
+                .map(|v| {
+                    v.iter()
+                        .map(|m| {
+                            let primary = m.ends_with('*');
+                            (m.trim_end_matches('*').trim().to_string(), primary)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or(spec.members);
+        let min_available = graph_config::get_i64(
+            engine,
+            &format!("status.capability.{}.min_available", spec.id),
+        )
+        .await
+        .ok()
+        .flatten()
+        .filter(|v| *v > 0)
+        .map(|v| v as usize)
+        .unwrap_or(spec.min_available);
+        out.push(crate::capability::CapabilitySpec {
+            id: spec.id,
+            label: spec.label,
+            members,
+            min_available,
+        });
+    }
+    out
 }
 
 /// Read a `config:*` string key, treating an empty string as unset (so an owner
