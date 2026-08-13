@@ -11,34 +11,34 @@ floats, nothing cycles.
 
 ```
      +-----------+
-   0 |# #        |   V — CIRISVerify, a 3x5 letter …
+   0 |# #  GGGGG |   V verify      runs 1-5  (oldest first)
    1 |# #        |
-   2 |# #        |
+   2 |# #  GGGGG |                 runs 6-10 (newest last)
    3 |# #        |
    4 | #         |
-   5 |GGGGGGGGGG |   … with all 10 runs beneath it, oldest left, newest right
-   6 |GGGGGGGGGG |
-   7 |##         |   P — CIRISPersist
-  12 |b##G#G#b#G |      queued / cancelled churn
-  14 |###        |   E — CIRISEdge
-  19 |GGRGGGGGGG |      a failure three runs back
-  21 | ##        |   S — CIRISServer
-  26 |GGGGGGGGGY |      newest run in progress (pulsing amber)
-  28 | #         |   A — CIRISAgent
-  33 |GGG....... |      a young repo draws a short centipede
-  35 |Y Y Y Y Y Y|   overall status
-  37 |GGG GGG    |   health: billing          US | EU | GLOBAL
-  40 |YYY YYY    |   health: proxy
-  43 |GGG GGG    |   health: databases
-  46 |GGG GGG GGY|   health: providers
-  49 |GGG GGG GGG|   health: infrastructure
+   5 |##   b##G# |   P persist     queued / cancelled churn
+   7 |##   G#b#G |
+  10 |###  GGRGG |   E edge        a failure in the older five
+  15 | ##  GGGGG |   S server
+  17 | #   GGGGY |                 newest run in progress
+  20 | #   GGG.. |   A agent       a young repo: only three runs
+  25 |Y Y Y Y Y Y|   overall status
+  26 |##   GG    |   B billing     US EU
+  31 |##   YY    |   P proxy
+  36 |##   GG    |   D database
+  41 |#    GG Y  |   L providers   US EU | GLOBAL
+  46 |###  GG G  |   I infra
      +-----------+
 ```
 
-**Centipedes (rows 0–34)** — one band per repo, all five visible at once. The
-repos are the substrate in dependency order: verify → persist → edge → server →
-agent. Each band is a 3×5 letter with that repo's ten most recent GitHub Actions
-runs as a full-width bar directly beneath it.
+Every row is a 3×5 letter with its status as single-pixel dots in the columns to
+its right. Ten rows fill the board exactly.
+
+**Repos (rows 0–24)** — V/P/E/S/A, the substrate in dependency order: verify →
+persist → edge → server → agent. Each row carries that repo's ten most recent
+GitHub Actions runs as **two rows of five dots** — the older five on the band's
+first row, the newer five two rows below, with a blank row between so they
+cannot fuse.
 
 | Run | Colour |
 |---|---|
@@ -49,18 +49,18 @@ runs as a full-width bar directly beneath it.
 | cancelled / skipped | grey (deliberately *not* red — superseded PR pushes cancel runs constantly) |
 | no data yet | near-black |
 
-**Divider (row 35)** — a dotted line carrying the aggregate `status`:
+**Divider (row 25)** — a dotted line carrying the aggregate `status`:
 green, amber, or red (`partial_outage` and `major_outage` both read red).
 
-**Health grid (rows 37–50)** — completely static, with a blank row between
-categories: without it, adjacent rows of the same colour fuse into one tall
-block and the five categories read as an arbitrary stack of boxes. Three column
-blocks sorted **west → east** — US, EU, then GLOBAL for what belongs to no
-region — and five rows, top to bottom: billing, proxy, databases, providers,
-infrastructure.
-Adding a region re-widths the blocks with no code change. Green operational,
-amber degraded, red outage, dim blue unknown; where a row has several components
-in one block they share it as sub-cells.
+**Services (rows 26–50)** — B/P/D/L/I: billing, proxy, database, LLM providers,
+infrastructure. One dot per region sorted **west → east** (US left of EU, like a
+map), then a gap and one dot for GLOBAL — whatever belongs to no region. Adding
+a region adds a dot, no code change. Each dot is the **worst** status among that
+block's components, so a single sick provider cannot hide behind healthy
+siblings. Green operational, amber degraded, red outage, dim blue unknown.
+
+`P` appears twice — persist above the divider, proxy below it. The divider and
+the differing dot layouts keep them apart.
 
 **Blue means "we don't know", never "it's fine."** The two feeds go stale
 independently: no successful `/api/v1/status` for 90 s turns the health grid

@@ -7,15 +7,21 @@ viewer coordinates — `vpixel`/`vrect` rotate into panel space on the way out.
 Getting this backwards is what made the first version unreadable: five 1px-tall
 rows and a letter drawn sideways.
 
-  vy  0-34   CENTIPEDES - one band per repo, five of them, no cycling:
-             a 3x5 letter naming the repo (V/P/E/S/A = verify, persist, edge,
-             server, agent) with all 10 CI runs as a full-width bar directly
-             beneath it — oldest at the left, newest at the right.
-  vy  35     divider, lit in the colour of the OVERALL status
-  vy  37-50  HEALTH GRID - static, one blank row between categories so they
-             cannot fuse. Three column blocks ordered west to east: US, EU,
-             then GLOBAL for what belongs to no region. Rows are, top to
-             bottom: billing, proxy, databases, providers, infrastructure.
+Ten lettered rows, one list, nothing floats and nothing cycles. Each row is a
+3x5 letter with its status as single-pixel dots in the columns to its right.
+
+  vy  0-24   REPOS - V/P/E/S/A: verify, persist, edge, server, agent. The ten
+             most recent CI runs as two rows of five dots: older five on the
+             band's first row, newer five two rows below.
+  vy  25     divider, lit in the colour of the OVERALL status
+  vy  26-50  SERVICES - B/P/D/L/I: billing, proxy, database, LLM providers,
+             infrastructure. One dot per region, ordered west to east, then a
+             gap and one dot for GLOBAL (what belongs to no region). Each dot
+             is the WORST status among that block's components, so nothing
+             hides behind a healthy sibling.
+
+The repeated P (persist, proxy) is never ambiguous: the divider separates the
+two groups, and their dot layouts differ.
 
 Run colours    green success | red failure | pulsing amber in-progress |
                dim blue queued | grey cancelled
@@ -120,19 +126,25 @@ def vpixel(x, y, pen):
 # ── Layout, in viewer coordinates ────────────────────────────────────────────
 LETTER_W = 3
 LETTER_H = 5
-RUNS_H = 2                      # run bar height
-BAND_H = LETTER_H + RUNS_H      # 7 rows per repo: the bar sits under its letter
+BAND_H = LETTER_H               # a row is exactly one letter tall
 CI_BANDS = 5
 RUNS = 10
 
-DIVIDER_Y = CI_BANDS * BAND_H   # 35
-HEALTH_Y0 = DIVIDER_Y + 2       # 37
-HEALTH_ROW_H = 2
-# One blank row between health rows. Without it, adjacent rows of the same
-# colour fuse into a single tall block and the five categories read as a random
-# stack of boxes — you cannot see where billing ends and proxy begins.
-HEALTH_PITCH = HEALTH_ROW_H + 1
+DOT_X = LETTER_W + 2            # first dot column: letter + a 2px gap
+RUNS_PER_ROW = 5                # 10 runs as 2 rows of 5 — what makes 10 rows fit
+RUN_ROWS = (0, 2)               # a blank row between them so they cannot fuse
+
+DIVIDER_Y = CI_BANDS * BAND_H   # 25
+HEALTH_Y0 = DIVIDER_Y + 1       # 26
 HEALTH_ROWS = 5                 # billing, proxy, db, providers, infra
+# Initials for the service rows. `P` repeats (persist above, proxy here); the
+# divider and the differing dot layouts keep them apart.
+HEALTH_LETTERS = ('B', 'P', 'D', 'L', 'I')
+
+# Worst-wins ranking for collapsing a block's components to one dot. `unknown`
+# outranks `operational`: not knowing is not the same as being fine.
+STATUS_RANK = {'outage': 4, 'major_outage': 4, 'partial_outage': 4,
+               'degraded': 3, 'unknown': 1, 'operational': 0}
 
 PEN_BLACK = graphics.create_pen(0, 0, 0)
 
@@ -239,23 +251,6 @@ def ci_stale():
 # =============================================================================
 # LAYOUT MATH
 # =============================================================================
-
-def block_spans(n):
-    """Split the width into n column blocks 1px apart, remainder to the
-    leftmost, so the row always reaches the right edge."""
-    if n <= 0:
-        return []
-    inner = VW - (n - 1)
-    if inner < n:
-        return [(i, 1) for i in range(min(n, VW))]
-    w, extra = inner // n, inner % n
-    out, x = [], 0
-    for i in range(n):
-        bw = w + (1 if i < extra else 0)
-        out.append((x, bw))
-        x += bw + 1
-    return out
-
 
 def region_sort_key(key):
     return (REGION_ORDER.get(key, 50), key)
@@ -450,11 +445,20 @@ def pulse_pen(phase):
     return graphics.create_pen(int(210 * v), int(140 * v), 0)
 
 
+def worst_status(cells):
+    """Collapse a block's components to the one status that matters."""
+    worst, rank = 'unknown', -1
+    for c in cells:
+        r = STATUS_RANK.get(c, 1)
+        if r > rank:
+            worst, rank = c, r
+    return worst
+
+
 def draw_centipedes(phase):
-    """One band per repo: letter + state pip, then the 10-run bar beneath."""
+    """Five repo rows: letter, then 10 runs as two rows of five dots."""
     blue = ci_stale()
     pulse = pulse_pen(phase)
-    cell_w = VW // RUNS          # 1px per run at 11 wide
 
     for band in range(CI_BANDS):
         top = band * BAND_H
@@ -466,7 +470,6 @@ def draw_centipedes(phase):
         draw_letter(0, top, repo_letter(name),
                     PEN_UNKNOWN if blue else PEN_LETTER)
 
-        runs_y = top + LETTER_H
         for i in range(RUNS):
             if i < len(runs):
                 pen = PEN_UNKNOWN if blue else (
@@ -475,7 +478,8 @@ def draw_centipedes(phase):
                 )
             else:
                 pen = PEN_EMPTY          # a young repo draws a short centipede
-            vrect(i * cell_w, runs_y, cell_w, RUNS_H, pen)
+            vpixel(DOT_X + i % RUNS_PER_ROW,
+                   top + RUN_ROWS[i // RUNS_PER_ROW], pen)
 
 
 def draw_divider():
@@ -486,27 +490,25 @@ def draw_divider():
 
 
 def draw_health():
+    """Five service rows: letter, one dot per region west to east, then a gap
+    and one dot for GLOBAL."""
     blue = stale()
-    spans = block_spans(len(blocks))
+    last = len(blocks) - 1
     for row in range(HEALTH_ROWS):
-        y = HEALTH_Y0 + row * HEALTH_PITCH
-        for b, (bx, bw) in enumerate(spans):
-            cells = grid.get((row, b), [])
+        y = HEALTH_Y0 + row * BAND_H
+        draw_letter(0, y, HEALTH_LETTERS[row],
+                    PEN_UNKNOWN if blue else PEN_LETTER)
+        for b in range(len(blocks)):
+            cells = grid.get((row, b))
             if not cells:
                 continue
-            n = len(cells)
-            w = max(1, bw // n)
-            extra = bw - w * n
-            x = bx
-            for i, status in enumerate(cells):
-                cw = w + (1 if i < extra else 0)
-                if x + cw > bx + bw:
-                    cw = bx + bw - x
-                if cw <= 0:
-                    break
-                vrect(x, y, cw, HEALTH_ROW_H,
-                      PEN_UNKNOWN if blue else PENS.get(status, PEN_UNKNOWN))
-                x += cw
+            # GLOBAL sits one column further right, so region and global never
+            # read as one run of dots.
+            x = DOT_X + b + (1 if b == last else 0)
+            if x >= VW:
+                continue
+            vpixel(x, y, PEN_UNKNOWN if blue
+                   else PENS.get(worst_status(cells), PEN_UNKNOWN))
 
 
 def draw(phase):
