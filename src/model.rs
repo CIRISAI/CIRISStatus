@@ -248,6 +248,31 @@ pub struct LiveDelta {
     pub overall: Option<String>,
 }
 
+// ── /api/v1/status/vantage ───────────────────────────────────────────────────
+/// One component's day, as seen from every vantage that reported it.
+///
+/// Agreement across vantages implicates the component; disagreement implicates
+/// the path between a vantage and it. Without this, a monitor cannot tell
+/// "the provider is down" from "my route to it is", and attributes its own
+/// network to the world.
+#[derive(Serialize, Clone, Debug)]
+pub struct VantageRow {
+    pub date: String,
+    pub component: String,
+    /// Sample instants where at least one vantage reported.
+    pub samples: i64,
+    /// Instants where the vantages did NOT agree.
+    pub disagreements: i64,
+    /// Non-operational samples per vantage — who kept dissenting.
+    pub dissent_by_vantage: BTreeMap<String, i64>,
+}
+
+#[derive(Serialize)]
+pub struct VantageResponse {
+    pub days: i64,
+    pub rows: Vec<VantageRow>,
+}
+
 // ── /api/v1/status/history ───────────────────────────────────────────────────
 #[derive(Serialize, Clone)]
 pub struct ServiceUptime {

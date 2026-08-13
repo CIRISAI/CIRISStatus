@@ -252,6 +252,37 @@ async fn ci(State(st): State<AppState>) -> impl IntoResponse {
     Json(st.ci.snapshot())
 }
 
+/// `GET /api/v1/status/vantage` — where independent vantages disagreed about
+/// the same component. Agreement implicates the component; disagreement
+/// implicates the path between a vantage and it.
+async fn vantage(State(st): State<AppState>, Query(q): Query<EventParams>) -> Response {
+    let days = q.days.unwrap_or(7);
+    if !(1..=365).contains(&days) {
+        return bad("Days must be between 1 and 365");
+    }
+    let db = match st.db.read().expect("db lock").clone() {
+        Some(db) => db,
+        None => {
+            return Json(crate::model::VantageResponse {
+                days,
+                rows: Vec::new(),
+            })
+            .into_response()
+        }
+    };
+    match history::query_vantage(&db, days) {
+        Ok(rows) => Json(crate::model::VantageResponse { days, rows }).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "vantage query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "detail": "Failed to fetch vantage data" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// `GET /api/v1/status/live` (and `/api/v1/scoring/live`) — SSE live-push of
 /// roster + health deltas.
 async fn live_sse(
@@ -495,6 +526,7 @@ impl Adapter for StatusAdapter {
             .route("/api/v1/status", get(api_status))
             .route("/api/v1/status/history", get(history))
             .route("/api/v1/status/events", get(events))
+            .route("/api/v1/status/vantage", get(vantage))
             .route("/api/v1/history", get(history))
             .route("/api/v1/scoring", get(scoring))
             .route("/api/v1/ci", get(ci))

@@ -32,6 +32,7 @@ Drop-in for the Lens nginx route (`agents.ciris.ai/lens/api/…` → this servic
 | `GET /health` | Liveness: `{status:"healthy", timestamp, version}` |
 | `GET /v1/status` | Local providers (postgresql + grafana), live, only if configured |
 | `GET /api/v1/status` | Aggregated multi-region: regions (billing/proxy), infrastructure (Vultr/Hetzner/GHCR), LLM/auth/database/internal provider buckets. Served from the poll loop's snapshot (≤ `status.poll_secs` old) so what a caller sees is what was recorded and attested |
+| `GET /api/v1/status/vantage?days=` | **Where independent vantages disagreed** about the same component: `{date, component, samples, disagreements, dissent_by_vantage}`. Agreement implicates the component; disagreement implicates the path between a vantage and it |
 | `GET /api/v1/status/events?days=&limit=` | **Observed transitions**, newest first: `{ts, component, from, to}`. `days` 1–365 (default 7), `limit` ≤ 1000 |
 | `GET /api/v1/status/history?days=&region=` | Daily uptime rollup from SQLite. `days` 1–365 (default 30), `region` ∈ `us\|eu\|global`. Each day carries `date`, `uptime_pct` (and its `overall_uptime_pct` alias), a one-word `status`, and the per-region/service breakdown. `outage_count` counts **incidents**, not samples. |
 | `GET /api/v1/scoring` | **Public scoring roster** (Flow A): opted-in agents `{key_id, capacity_composite, factors?, valid_until}`, consent-gated. Replaces lens-python's scoring feed. Served from cache, populated from this node's OWN corpus by the adapter loop. |
@@ -204,6 +205,22 @@ Daily capability SLIs are computed by **exact overlap**, not bounded: every row
 in a poll cycle shares one timestamp, so "were enough members up at the same
 instant" is a `GROUP BY ts`. A consumer working from daily rollups can only say
 "at least the best member's uptime"; we hold the samples, so we say what it was.
+
+### Is it them, or is it us?
+
+Every region's proxy reports the same external providers, so we hold several
+independent views of one component. Those per-vantage views used to be merged
+away (worst-wins, which was the right fix for a US outage hiding behind a
+healthy EU report) — they are now also kept under an `observation` service that
+every rollup ignores, and served by `/api/v1/status/vantage`:
+
+- **All vantages agree it is down** → it is the component.
+- **One vantage dissents** → it is the path between that vantage and the
+  component, or that vantage itself.
+
+This answers from our own data what a vendor status page mostly cannot: of six
+vendors we depend on, only two publish machine-readable status, and one actively
+blocks automated reads.
 
 ### When the monitor is the thing that broke
 

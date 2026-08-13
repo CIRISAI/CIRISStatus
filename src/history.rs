@@ -287,6 +287,82 @@ pub fn query_capability_sli(
     Ok(rows.into_iter().collect())
 }
 
+/// `/api/v1/status/vantage` — where the vantages disagreed.
+///
+/// Every region's proxy reports the same external providers, so we hold several
+/// independent views of one component. Agreement implicates the component;
+/// disagreement implicates the path. This is the query that answers "is it them
+/// or is it us" from our own data, without asking a vendor status page that
+/// half of them do not publish.
+pub fn query_vantage(db: &Db, days: i64) -> Result<Vec<crate::model::VantageRow>> {
+    let conn = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
+    let since = format!("-{days} days");
+
+    let mut stmt = conn.prepare(
+        "SELECT day, provider_name, COUNT(*) AS samples,
+                SUM(CASE WHEN distinct_statuses > 1 THEN 1 ELSE 0 END) AS disagreements
+         FROM (
+            SELECT date(ts) AS day, ts, provider_name,
+                   COUNT(DISTINCT status) AS distinct_statuses
+            FROM status_checks
+            WHERE service_name = ?1
+              AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+            GROUP BY ts, provider_name)
+         GROUP BY day, provider_name
+         ORDER BY day DESC, provider_name",
+    )?;
+    let base = stmt
+        .query_map(rusqlite::params![OBSERVATION_SERVICE, since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut dissent = conn.prepare(
+        "SELECT date(ts), provider_name, region,
+                SUM(CASE WHEN status <> 'operational' THEN 1 ELSE 0 END)
+         FROM status_checks
+         WHERE service_name = ?1
+           AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+         GROUP BY date(ts), provider_name, region",
+    )?;
+    let mut by_key: BTreeMap<(String, String), BTreeMap<String, i64>> = BTreeMap::new();
+    for row in dissent.query_map(rusqlite::params![OBSERVATION_SERVICE, since], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })? {
+        let (day, component, region, bad) = row?;
+        by_key
+            .entry((day, component))
+            .or_default()
+            .insert(region, bad);
+    }
+
+    Ok(base
+        .into_iter()
+        .map(
+            |(date, component, samples, disagreements)| crate::model::VantageRow {
+                dissent_by_vantage: by_key
+                    .get(&(date.clone(), component.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
+                date,
+                component,
+                samples,
+                disagreements,
+            },
+        )
+        .collect())
+}
+
 /// `/api/v1/status/events` — transitions newest-first within the window.
 pub fn query_events(db: &Db, days: i64, limit: i64) -> Result<Vec<StatusEvent>> {
     let conn = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
@@ -690,6 +766,22 @@ mod repair_tests {
             std::env::temp_dir().join(format!("ciris-status-hist-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("status.db").to_string_lossy().into_owned()
+    }
+
+    pub(super) fn insert_region(
+        conn: &Connection,
+        ts: &str,
+        service: &str,
+        provider: &str,
+        region: &str,
+        status: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO status_checks (ts, service_name, provider_name, region, status, latency_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 10)",
+            rusqlite::params![ts, service, provider, region, status],
+        )
+        .unwrap();
     }
 
     pub(super) fn insert(conn: &Connection, ts: &str, service: &str, provider: &str, status: &str) {
@@ -1292,6 +1384,60 @@ mod event_tests {
                 .copied(),
             Some(100.0)
         );
+    }
+
+    /// The question a single-vantage monitor cannot answer: is the provider
+    /// down, or is my route to it? Two vantages, one disagreeing, names which.
+    #[test]
+    fn vantage_disagreement_names_the_dissenting_observer() {
+        let path = repair_tests::tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            // Instant 1: both vantages agree it is fine.
+            let ts = format!("{today}T00:00:00Z");
+            repair_tests::insert_region(
+                &conn,
+                &ts,
+                OBSERVATION_SERVICE,
+                "groq",
+                "us",
+                "operational",
+            );
+            repair_tests::insert_region(
+                &conn,
+                &ts,
+                OBSERVATION_SERVICE,
+                "groq",
+                "eu",
+                "operational",
+            );
+            // Instant 2: only EU cannot reach it — a path problem, not groq's.
+            let ts = format!("{today}T00:01:00Z");
+            repair_tests::insert_region(
+                &conn,
+                &ts,
+                OBSERVATION_SERVICE,
+                "groq",
+                "us",
+                "operational",
+            );
+            repair_tests::insert_region(&conn, &ts, OBSERVATION_SERVICE, "groq", "eu", "outage");
+            // Instant 3: BOTH see it down — that one is groq.
+            let ts = format!("{today}T00:02:00Z");
+            repair_tests::insert_region(&conn, &ts, OBSERVATION_SERVICE, "groq", "us", "outage");
+            repair_tests::insert_region(&conn, &ts, OBSERVATION_SERVICE, "groq", "eu", "outage");
+        }
+        let rows = query_vantage(&init(&path).unwrap(), 2).unwrap();
+        let row = rows.iter().find(|r| r.component == "groq").expect("groq");
+        assert_eq!(row.samples, 3);
+        assert_eq!(
+            row.disagreements, 1,
+            "exactly one instant where they differed"
+        );
+        assert_eq!(row.dissent_by_vantage.get("eu").copied(), Some(2));
+        assert_eq!(row.dissent_by_vantage.get("us").copied(), Some(1));
     }
 
     #[test]
