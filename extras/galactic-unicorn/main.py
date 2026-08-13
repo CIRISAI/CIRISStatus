@@ -152,8 +152,21 @@ DOT_X_LEFT = LETTER_W + DOT_GAP                          # 5
 LETTER_X_RIGHT = VW - LETTER_W                           # 8
 DOT_X_RIGHT = LETTER_X_RIGHT - DOT_GAP - RUNS_PER_ROW    # 1
 
-DIVIDER_Y = CI_BANDS * BAND_H   # 25
-HEALTH_Y0 = DIVIDER_Y + 1       # 26
+# The three rows between the two groups are the REGION HEADER: one column per
+# block, lit in that block's own rollup colour, its height counting the column
+# (1 = first, 2 = second, 3 = third) so you can tell which is which without a
+# legend to memorise. It replaces the dotted overall-status divider, which cost
+# a row and said less.
+HEADER_Y0 = CI_BANDS * BAND_H   # 25
+HEADER_H = 3
+HEALTH_Y0 = HEADER_Y0 + HEADER_H  # 28 — the board is now exactly full
+
+# Letters alternate edges, so columns 3..7 are the only ones NEVER covered by a
+# glyph. Region dots live there, at a fixed x per block, which is what lets them
+# line up into readable columns under the header — beside-the-letter dots
+# zigzagged with the letter and could not.
+CENTRE_X0 = LETTER_W            # 3
+CENTRE_COLS = VW - 2 * LETTER_W  # 5
 HEALTH_ROWS = 5                 # billing, proxy, db, providers, infra
 # Initials for the service rows. `P` repeats (persist above, proxy here); the
 # divider and the differing dot layouts keep them apart.
@@ -463,6 +476,17 @@ def pulse_pen(phase):
     return graphics.create_pen(int(210 * v), int(140 * v), 0)
 
 
+def region_cols(n):
+    """x for each block. Spaced every other column while they fit (3, 5, 7) so
+    neighbouring dots cannot fuse; packed adjacent only if there are more blocks
+    than that allows."""
+    if n <= 0:
+        return []
+    if n <= (CENTRE_COLS + 1) // 2:
+        return [CENTRE_X0 + 2 * i for i in range(n)]
+    return [CENTRE_X0 + i for i in range(min(n, CENTRE_COLS))]
+
+
 def band_side(idx):
     """(letter_x, first_dot_x) for row `idx`, alternating edges."""
     if idx % 2:
@@ -508,34 +532,38 @@ def draw_centipedes(phase):
                    top + RUN_ROWS[i // RUNS_PER_ROW], pen)
 
 
-def draw_divider():
-    """The separator carries the overall status — one glance, whole system."""
-    pen = PEN_UNKNOWN if stale() else PENS.get(overall, PEN_UNKNOWN)
-    for x in range(0, VW, 2):
-        vpixel(x, DIVIDER_Y, pen)
+def draw_region_header():
+    """One column per block: `i + 1` dots rising from the header's bottom row,
+    in that block's worst-of colour."""
+    blue = stale()
+    cols = region_cols(len(blocks))
+    for b, x in enumerate(cols):
+        cells = []
+        for row in range(HEALTH_ROWS):
+            cells.extend(grid.get((row, b), ()))
+        if blue or not cells:
+            pen = PEN_UNKNOWN if blue else PEN_EMPTY
+        else:
+            pen = PENS.get(worst_status(cells), PEN_UNKNOWN)
+        # Height counts the column; more blocks than header rows cannot be
+        # counted, so they are capped rather than drawn misleadingly.
+        for j in range(min(b + 1, HEADER_H)):
+            vpixel(x, HEADER_Y0 + HEADER_H - 1 - j, pen)
 
 
 def draw_health():
-    """Five service rows: letter, one dot per region west to east, then a gap
-    and one dot for GLOBAL."""
+    """Five service rows: a letter on the alternating edge, and one dot per
+    block in the fixed centre columns, aligned under the header."""
     blue = stale()
-    last = len(blocks) - 1
+    cols = region_cols(len(blocks))
     for row in range(HEALTH_ROWS):
         y = HEALTH_Y0 + row * BAND_H
-        # Keep alternating across the divider: the service rows continue the
-        # repo rows' zigzag rather than restarting it.
-        letter_x, dot_x = band_side(CI_BANDS + row)
+        letter_x, _ = band_side(CI_BANDS + row)
         draw_letter(letter_x, y, HEALTH_LETTERS[row],
                     PEN_UNKNOWN if blue else PEN_LETTER)
-        limit = VW if letter_x == 0 else letter_x - 1
-        for b in range(len(blocks)):
+        for b, x in enumerate(cols):
             cells = grid.get((row, b))
             if not cells:
-                continue
-            # GLOBAL sits one column further along, so region and global never
-            # read as one run of dots.
-            x = dot_x + b + (1 if b == last else 0)
-            if x >= limit:
                 continue
             vpixel(x, y + HEALTH_DOT_ROW, PEN_UNKNOWN if blue
                    else PENS.get(worst_status(cells), PEN_UNKNOWN))
@@ -545,7 +573,7 @@ def draw(phase):
     graphics.set_pen(PEN_BLACK)
     graphics.clear()
     draw_centipedes(phase)
-    draw_divider()
+    draw_region_header()
     draw_health()
     gu.update(graphics)
 
