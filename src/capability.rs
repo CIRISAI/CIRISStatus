@@ -95,6 +95,11 @@ pub fn roll_up(spec: &CapabilitySpec, observed: &BTreeMap<String, String>) -> Ca
     } else if available > 0 {
         // Serving, but the margin is gone. Not an outage; not "fine" either.
         DEGRADED
+    } else if members.iter().any(|m| m.status == UNKNOWN) {
+        // Nothing observed is up, but a declared member was never measured —
+        // and it may be the one serving. DeepInfra is exactly this today. An
+        // absence of evidence about the primary is not evidence of an outage.
+        UNKNOWN
     } else {
         "major_outage"
     };
@@ -247,6 +252,29 @@ mod tests {
             "unknown members are not counted available"
         );
         assert_eq!(cap.status, OPERATIONAL);
+    }
+
+    /// (6) Every OBSERVED member is down, but the primary was never measured.
+    /// It may be serving; we do not know, and must not assert an outage.
+    #[test]
+    fn an_unmeasured_member_prevents_an_outage_verdict() {
+        let cap = roll_up(
+            &spec(1),
+            // deepinfra absent entirely — exactly today's production shape.
+            &observed(&[("openrouter", OUTAGE), ("groq", OUTAGE)]),
+        );
+        assert_eq!(cap.status, UNKNOWN, "no evidence about the primary");
+
+        // Measure it and find it down too — NOW it is an outage.
+        let cap = roll_up(
+            &spec(1),
+            &observed(&[
+                ("deepinfra", OUTAGE),
+                ("openrouter", OUTAGE),
+                ("groq", OUTAGE),
+            ]),
+        );
+        assert_eq!(cap.status, "major_outage");
     }
 
     /// Serving on a fallback: no headline change, but it is reported.

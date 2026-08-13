@@ -143,6 +143,11 @@ async fn api_status(State(st): State<AppState>) -> impl IntoResponse {
                 );
                 agg.stale = true;
                 agg.status = crate::model::UNKNOWN.to_string();
+                // The indicator describes `status`; leaving the old one made the
+                // response say "unknown" and "critical" at once, so a client
+                // reading the Statuspage field kept showing a verdict we had
+                // just withdrawn.
+                agg.indicator = crate::model::indicator_for(&agg.status);
             }
             Json(agg)
         }
@@ -598,12 +603,34 @@ impl Adapter for StatusAdapter {
 
                     // ── Flow B: probe-derived signed health:liveness emit. ──
                     let agg = aggregate::aggregated_status(&cfg, &self.state.client).await;
-                    self.emit_liveness(ctx, &agg).await;
+                    // A vantage failure means we could not SEE, so the snapshot
+                    // is full of synthetic outages we have no evidence for.
+                    // Marking its headline `unknown` was not enough: it was
+                    // still flattened into outage transitions, signed as
+                    // liveness evidence, installed as the baseline and served.
+                    // The only honest handling is to record that WE went blind
+                    // and otherwise change nothing.
+                    if !agg.vantage_failure {
+                        self.emit_liveness(ctx, &agg).await;
+                    } else {
+                        tracing::warn!(
+                            "vantage failure — not attesting, not installing this snapshot"
+                        );
+                    }
 
                     // ── Transitions: diff this snapshot against the last, and
                     // record what changed. This is the only place a transient
                     // becomes durable — the daily rollup cannot hold it. ──
-                    let flat = aggregate::flatten(&agg);
+                    // On a vantage failure the only thing we learned is that we
+                    // went blind: keep every other component at its last known
+                    // value rather than asserting outages we cannot support.
+                    let flat = if agg.vantage_failure {
+                        let mut f = self.state.prev_flat.read().expect("flat lock").clone();
+                        f.insert("monitor.network".to_string(), "outage".to_string());
+                        f
+                    } else {
+                        aggregate::flatten(&agg)
+                    };
                     let events = {
                         let prev = self.state.prev_flat.read().expect("flat lock").clone();
                         // The first cycle after boot has no previous snapshot;
@@ -645,8 +672,12 @@ impl Adapter for StatusAdapter {
                         *self.state.prev_flat.write().expect("flat lock") = flat;
                     }
 
-                    // Serve what we just recorded.
-                    *self.state.status.write().expect("status lock") = Some(agg.clone());
+                    // Serve what we just recorded — unless we could not see, in
+                    // which case the previous snapshot stands and ages into
+                    // `stale` on its own.
+                    if !agg.vantage_failure {
+                        *self.state.status.write().expect("status lock") = Some(agg.clone());
+                    }
 
                     // ── Flow A: rebuild the public roster from the OWN corpus. ──
                     self.refresh_roster(ctx).await;

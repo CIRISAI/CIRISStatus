@@ -276,16 +276,30 @@ pub fn flatten(agg: &AggregatedStatus) -> BTreeMap<String, String> {
     // have to correlate. And serving on a fallback gets its own component, so
     // it is recorded WITHOUT moving the headline (FSD §2.3) — it precedes cost,
     // latency and quality changes nothing else on the board would explain.
+    // Always present, so a recovery is a transition rather than a component
+    // silently reappearing.
+    out.insert(
+        "monitor.network".to_string(),
+        if agg.vantage_failure {
+            OUTAGE.to_string()
+        } else {
+            OPERATIONAL.to_string()
+        },
+    );
     for (id, cap) in &agg.capabilities {
         out.insert(format!("capability.{id}"), cap.status.clone());
         // Derived from the PRIMARY MEMBER, never from the capability: with a
         // threshold above one, losing a FALLBACK degrades the capability while
         // the primary is perfectly healthy, and inheriting that status emits a
         // primary failure that never happened — plus a false recovery later.
+        // Only a POOL can serve on a fallback. Every region and infra entry is a
+        // singleton whose sole member carries the primary role, so emitting a
+        // `.primary` component for them recorded two transitions for one event.
         if let Some(primary) = cap
             .members
             .iter()
             .find(|m| m.role == crate::model::ROLE_PRIMARY)
+            .filter(|_| cap.members.len() > 1)
         {
             out.insert(
                 format!("capability.{id}.primary"),
@@ -969,6 +983,54 @@ mod transition_tests {
             ["capability.ai_providers"],
             "the capability moved; the primary did not, and must not say it did"
         );
+    }
+
+    /// (10) A singleton cannot serve on a fallback — it has none. Emitting a
+    /// `.primary` component for regions and infrastructure recorded two
+    /// transitions for one event.
+    #[test]
+    fn singletons_do_not_get_a_primary_component() {
+        let mut agg = snap(OPERATIONAL, OPERATIONAL, OPERATIONAL);
+        agg.capabilities.insert(
+            "region.us".into(),
+            crate::capability::singleton("region.us", OPERATIONAL),
+        );
+        let flat = flatten(&agg);
+        assert!(flat.contains_key("capability.region.us"));
+        assert!(
+            !flat.contains_key("capability.region.us.primary"),
+            "no fallback exists, so there is no primary state to report"
+        );
+    }
+
+    /// (3) Going blind is ONE fact. It must not be recorded as every component
+    /// failing at once — that is the monitor reporting its own outage as the
+    /// world's, which is the defect the detection exists to prevent.
+    #[test]
+    fn a_vantage_failure_reports_only_that_we_went_blind() {
+        let healthy = flatten(&snap(OPERATIONAL, OPERATIONAL, OPERATIONAL));
+        assert_eq!(
+            healthy.get("monitor.network").map(String::as_str),
+            Some(OPERATIONAL)
+        );
+
+        // What the lifecycle builds when it cannot see: last known values, plus
+        // the one thing actually learned.
+        let mut blind = healthy.clone();
+        blind.insert("monitor.network".into(), OUTAGE.into());
+
+        let events = transitions(&healthy, &blind, "t");
+        let subjects: Vec<_> = events.iter().map(|e| e.component.as_str()).collect();
+        assert_eq!(
+            subjects,
+            ["monitor.network"],
+            "one event: we went blind. Not an outage per component."
+        );
+
+        // And recovery is a transition, not a component quietly reappearing.
+        let back = transitions(&blind, &healthy, "t");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].to, OPERATIONAL);
     }
 
     #[test]

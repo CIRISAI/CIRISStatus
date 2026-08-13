@@ -18,8 +18,10 @@ pub const UNKNOWN: &str = "unknown";
 /// never invents an outage).
 pub fn severity(status: &str) -> i8 {
     match status {
-        DEGRADED => 1,
-        OUTAGE => 2,
+        // Aliases accepted on the way in, so an upstream speaking Statuspage's
+        // vocabulary ranks the same as one speaking ours.
+        DEGRADED | "degraded_performance" => 1,
+        OUTAGE | "partial_outage" | "major_outage" => 2,
         _ => 0,
     }
 }
@@ -55,6 +57,21 @@ mod tests {
         // Clock skew must not read as impossibly old and flap the endpoint.
         assert_eq!(age_seconds("2026-08-13T14:06:00Z", now), 0);
         assert_eq!(age_seconds("not a timestamp", now), 0);
+    }
+
+    /// The capability rollup emits `major_outage`, and `severity` used to rank
+    /// every unrecognised word 0 — so a pool with EVERY member down counted as
+    /// zero outages and the headline published `operational`. The one failure
+    /// the rollup exists to surface was the one it could not.
+    #[test]
+    fn outage_shaped_words_all_rank_as_outages() {
+        assert_eq!(severity("major_outage"), 2);
+        assert_eq!(severity("partial_outage"), 2);
+        assert_eq!(severity(OUTAGE), 2);
+        assert_eq!(severity("degraded_performance"), 1);
+        assert_eq!(severity(DEGRADED), 1);
+        assert_eq!(severity(OPERATIONAL), 0);
+        assert_eq!(severity(UNKNOWN), 0);
     }
 
     #[test]
