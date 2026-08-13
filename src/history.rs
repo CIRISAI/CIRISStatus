@@ -42,10 +42,13 @@ pub fn init(path: &str) -> Result<Db> {
             ts        TEXT NOT NULL,
             component TEXT NOT NULL,
             from_status TEXT NOT NULL,
-            to_status TEXT NOT NULL
+            to_status TEXT NOT NULL,
+            capability TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_status_events_ts ON status_events(ts);",
     )?;
+    // Additive column on an existing table; harmless when it already exists.
+    let _ = conn.execute("ALTER TABLE status_events ADD COLUMN capability TEXT", []);
     normalize_legacy_provider_names(&conn);
     purge_unmonitored_brave_rows(&conn);
     refile_legacy_llm_rows(&conn);
@@ -223,9 +226,9 @@ pub fn record_events(db: &Db, events: &[StatusEvent]) -> Result<usize> {
     let tx = guard.transaction()?;
     for e in events {
         tx.execute(
-            "INSERT INTO status_events (ts, component, from_status, to_status)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![e.ts, e.component, e.from, e.to],
+            "INSERT INTO status_events (ts, component, from_status, to_status, capability)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![e.ts, e.component, e.from, e.to, e.capability],
         )?;
     }
     tx.commit()?;
@@ -322,13 +325,27 @@ pub fn query_vantage(db: &Db, days: i64) -> Result<Vec<crate::model::VantageRow>
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    // Only instants where the vantages DISAGREED. Counting every
+    // non-operational sample meant a universally-agreed outage reported one
+    // "dissent" per observer per sample — swamping the samples that actually
+    // differed, which are the only ones that localise a fault to a path.
     let mut dissent = conn.prepare(
-        "SELECT date(ts), provider_name, region,
-                SUM(CASE WHEN status <> 'operational' THEN 1 ELSE 0 END)
-         FROM status_checks
-         WHERE service_name = ?1
-           AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
-         GROUP BY date(ts), provider_name, region",
+        "SELECT c.day, c.provider_name, c.region, COUNT(*)
+         FROM (
+            SELECT date(ts) AS day, ts, provider_name, region, status
+            FROM status_checks
+            WHERE service_name = ?1
+              AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)) AS c
+         JOIN (
+            SELECT ts, provider_name
+            FROM status_checks
+            WHERE service_name = ?1
+              AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+            GROUP BY ts, provider_name
+            HAVING COUNT(DISTINCT status) > 1) AS d
+           ON d.ts = c.ts AND d.provider_name = c.provider_name
+         WHERE c.status <> 'operational'
+         GROUP BY c.day, c.provider_name, c.region",
     )?;
     let mut by_key: BTreeMap<(String, String), BTreeMap<String, i64>> = BTreeMap::new();
     for row in dissent.query_map(rusqlite::params![OBSERVATION_SERVICE, since], |r| {
@@ -367,7 +384,7 @@ pub fn query_vantage(db: &Db, days: i64) -> Result<Vec<crate::model::VantageRow>
 pub fn query_events(db: &Db, days: i64, limit: i64) -> Result<Vec<StatusEvent>> {
     let conn = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT ts, component, from_status, to_status FROM status_events
+        "SELECT ts, component, from_status, to_status, capability FROM status_events
          WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)
          ORDER BY ts DESC, id DESC LIMIT ?2",
     )?;
@@ -378,6 +395,7 @@ pub fn query_events(db: &Db, days: i64, limit: i64) -> Result<Vec<StatusEvent>> 
                 component: r.get(1)?,
                 from: r.get(2)?,
                 to: r.get(3)?,
+                capability: r.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -596,8 +614,12 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
 // Map the three known values to statics (anything else → "operational").
 fn leak(s: String) -> &'static str {
     match s.as_str() {
-        "degraded" => "degraded",
-        "outage" => "outage",
+        // The Statuspage spellings normalise here too. Passing them through to
+        // `operational` inflated provider uptime and every capability SLI while
+        // the live response correctly showed the member unhealthy — the same
+        // alias hole as the live fold, one write later.
+        "degraded" | "degraded_performance" => "degraded",
+        "outage" | "partial_outage" | "major_outage" => "outage",
         _ => "operational",
     }
 }
@@ -727,9 +749,33 @@ pub fn query_history(
         // precisely the component-versus-service conflation this field exists
         // to end. `overall` is the fallback only when no capability was
         // measured at all.
+        // Pools contribute their SLI; everything else that is not a pool member
+        // contributes its own series, because a region or an infrastructure host
+        // has no alternative — it IS a capability of one. Without these, a day
+        // with a regional outage could report 100% service uptime while its own
+        // `status` said otherwise.
+        let pool_members: std::collections::BTreeSet<&str> = sli_by_spec
+            .iter()
+            .flat_map(|(spec, _)| spec.members.iter().map(|(m, _)| m.as_str()))
+            .collect();
+        let singleton_worst = flat
+            .iter()
+            .filter(|(key, _)| {
+                let provider = key.rsplit('.').next().unwrap_or("");
+                // Pool members are represented by their capability; informational
+                // providers are in nobody's serving path; `monitor.network` is
+                // about US, not about the fabric we report on.
+                !pool_members.contains(provider)
+                    && provider != "network"
+                    && !key.starts_with("global.observation")
+            })
+            .map(|(_, u)| u.uptime_pct)
+            .fold(f64::INFINITY, f64::min);
+
         let service_uptime_pct = capabilities
             .values()
             .map(|c| c.sli_pct)
+            .chain(std::iter::once(singleton_worst).filter(|v| v.is_finite()))
             .fold(f64::INFINITY, f64::min);
         let service_uptime_pct = if service_uptime_pct.is_finite() {
             service_uptime_pct
@@ -1150,12 +1196,14 @@ mod event_tests {
                         component: "eu.proxy".into(),
                         from: "operational".into(),
                         to: "degraded".into(),
+                        capability: None,
                     },
                     StatusEvent {
                         ts: now.clone(),
                         component: "llm.together".into(),
                         from: "operational".into(),
                         to: "degraded".into(),
+                        capability: None,
                     },
                 ],
             );
@@ -1201,12 +1249,14 @@ mod event_tests {
                     component: "too.old".into(),
                     from: "operational".into(),
                     to: "degraded".into(),
+                    capability: None,
                 },
                 StatusEvent {
                     ts: recent,
                     component: "in.window".into(),
                     from: "operational".into(),
                     to: "degraded".into(),
+                    capability: None,
                 },
             ],
         );
@@ -1446,8 +1496,57 @@ mod event_tests {
             row.disagreements, 1,
             "exactly one instant where they differed"
         );
-        assert_eq!(row.dissent_by_vantage.get("eu").copied(), Some(2));
-        assert_eq!(row.dissent_by_vantage.get("us").copied(), Some(1));
+        // ONLY the disagreement instant counts. EU dissented once; US never did.
+        // The instant where BOTH saw an outage is agreement — it says the
+        // provider was down, not that either observer's path was.
+        assert_eq!(row.dissent_by_vantage.get("eu").copied(), Some(1));
+        assert_eq!(
+            row.dissent_by_vantage.get("us").copied(),
+            None,
+            "a universally-agreed outage is not dissent"
+        );
+    }
+
+    /// A region outage must show in service uptime. Populating `capabilities`
+    /// only from declared pools let a day with a regional outage publish 100%
+    /// service uptime while its own `status` said degraded.
+    #[test]
+    fn a_regional_outage_lowers_service_uptime() {
+        let path = repair_tests::tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            for (t, billing) in [("00:00:00", "outage"), ("00:01:00", "operational")] {
+                let ts = format!("{today}T{t}Z");
+                repair_tests::insert_region(&conn, &ts, "cirisbilling", "service", "eu", billing);
+                repair_tests::insert_region(
+                    &conn,
+                    &ts,
+                    "cirisproxy",
+                    "groq",
+                    "global",
+                    "operational",
+                );
+            }
+        }
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai_providers".into(),
+            label: "AI".into(),
+            members: vec![("groq".into(), false)],
+            min_available: 1,
+        };
+        let db = init(&path).unwrap();
+        let days = query_history(&db, 2, None, std::slice::from_ref(&spec)).unwrap();
+        let day = days.iter().find(|d| d.date == today).expect("today");
+        assert_eq!(
+            day.capabilities["ai_providers"].sli_pct, 100.0,
+            "the pool was fine throughout"
+        );
+        assert_eq!(
+            day.service_uptime_pct, 50.0,
+            "but EU billing was down half the samples, and nothing else serves it"
+        );
     }
 
     #[test]
@@ -1470,6 +1569,7 @@ mod event_tests {
             component: c.into(),
             from: "operational".into(),
             to: "degraded".into(),
+            capability: None,
         };
         assert_eq!(record_events(&db, &[ev("a"), ev("b")]).unwrap(), 2);
 

@@ -329,6 +329,13 @@ pub fn flatten(agg: &AggregatedStatus) -> BTreeMap<String, String> {
     out
 }
 
+/// `capability.ai_providers` / `capability.ai_providers.primary` -> the id.
+fn capability_of(component: &str) -> Option<String> {
+    component
+        .strip_prefix("capability.")
+        .map(|rest| rest.trim_end_matches(".primary").to_string())
+}
+
 /// The transitions between two snapshots, as events stamped `ts`.
 ///
 /// A component that appears or disappears is a transition too — from/to
@@ -345,6 +352,7 @@ pub fn transitions(
         if from != to {
             events.push(StatusEvent {
                 ts: ts.to_string(),
+                capability: capability_of(component),
                 component: component.clone(),
                 from: from.to_string(),
                 to: to.clone(),
@@ -355,6 +363,7 @@ pub fn transitions(
         if !now.contains_key(component) {
             events.push(StatusEvent {
                 ts: ts.to_string(),
+                capability: capability_of(component),
                 component: component.clone(),
                 from: from.clone(),
                 to: UNKNOWN.to_string(),

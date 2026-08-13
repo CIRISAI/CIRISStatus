@@ -225,6 +225,11 @@ pub struct StatusEvent {
     pub component: String,
     pub from: String,
     pub to: String,
+    /// Capability id for a capability transition. Promised by the wire contract
+    /// (FSD §4); without it a client has to parse the `capability.` prefix out
+    /// of `component`, which is an undocumented format masquerading as an API.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub capability: Option<String>,
 }
 
 #[derive(Serialize)]

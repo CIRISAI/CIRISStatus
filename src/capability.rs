@@ -169,10 +169,13 @@ pub fn singleton(label: &str, status: &str) -> CapabilityStatus {
 /// headline change.
 pub fn on_fallback(cap: &CapabilityStatus) -> bool {
     cap.status == OPERATIONAL
-        && cap
-            .members
-            .iter()
-            .any(|m| m.role == ROLE_PRIMARY && m.status != OPERATIONAL)
+        && cap.members.iter().any(|m| {
+            // KNOWN unhealthy, not merely not-green. An unmeasured primary is
+            // today's expected state for DeepInfra, and calling that "serving on
+            // a fallback" asserts a routing change — with its cost, latency and
+            // quality implications — on no evidence whatsoever.
+            m.role == ROLE_PRIMARY && m.status != OPERATIONAL && m.status != UNKNOWN
+        })
 }
 
 /// The headline, derived from capabilities rather than from whichever component
@@ -314,6 +317,29 @@ mod tests {
             ]),
         );
         assert_eq!(cap.status, "major_outage");
+    }
+
+    /// (5) An UNMEASURED primary is not a failed one. Reporting fallback use
+    /// here would assert a routing change on no evidence — and it is the baked
+    /// configuration's expected state today.
+    #[test]
+    fn an_unmeasured_primary_is_not_a_fallback_event() {
+        let cap = roll_up(
+            &spec(1),
+            &observed(&[("openrouter", OPERATIONAL), ("groq", OPERATIONAL)]),
+        );
+        assert_eq!(cap.status, OPERATIONAL);
+        assert!(!on_fallback(&cap), "we do not know the primary is down");
+
+        let cap = roll_up(
+            &spec(1),
+            &observed(&[
+                ("deepinfra", OUTAGE),
+                ("openrouter", OPERATIONAL),
+                ("groq", OPERATIONAL),
+            ]),
+        );
+        assert!(on_fallback(&cap), "now we know");
     }
 
     /// Serving on a fallback: no headline change, but it is reported.

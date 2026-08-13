@@ -624,6 +624,14 @@ impl Adapter for StatusAdapter {
                     // On a vantage failure the only thing we learned is that we
                     // went blind: keep every other component at its last known
                     // value rather than asserting outages we cannot support.
+                    let prev_empty = self.state.prev_flat.read().expect("flat lock").is_empty();
+                    // A blind FIRST poll establishes nothing. Seeding the
+                    // baseline from it would leave a map containing only
+                    // `monitor.network=outage`, so the first successful poll
+                    // would emit a network recovery with no matching start plus
+                    // an `unknown` transition for every ordinary component. The
+                    // first poll that can actually SEE is the baseline.
+                    let skip_cycle = agg.vantage_failure && prev_empty;
                     let flat = if agg.vantage_failure {
                         let mut f = self.state.prev_flat.read().expect("flat lock").clone();
                         f.insert("monitor.network".to_string(), "outage".to_string());
@@ -668,7 +676,7 @@ impl Adapter for StatusAdapter {
                             None => false,
                         }
                     };
-                    if persisted {
+                    if persisted && !skip_cycle {
                         *self.state.prev_flat.write().expect("flat lock") = flat;
                     }
 
