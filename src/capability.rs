@@ -49,18 +49,52 @@ pub fn default_specs() -> Vec<CapabilitySpec> {
     }]
 }
 
-/// Is this provider a member of some declared capability, and therefore NOT
-/// part of its router's own health? A pooled member must not degrade the
-/// service that reports it — that service is serving fine on the others.
-///
-/// Membership is the ONLY thing that excludes. Excluding by `kind` (every
-/// `llm`/`search` provider) removed providers from their router's verdict
-/// without giving them a capability to live in, so if every search provider
-/// failed, the proxy, the region, the capabilities and the headline all stayed
-/// green while search was unavailable. Exclusion without representation is a
-/// blind spot: declare a capability, or the provider counts against its router.
-pub fn is_pooled(specs: &[CapabilitySpec], _kind: Option<&str>, id: &str) -> bool {
-    specs.iter().any(|s| s.members.iter().any(|(m, _)| m == id))
+/// Routable classes: a kind whose members a router chooses between. A provider
+/// of one of these is never an indispensable dependency of the thing reporting
+/// it — the router has, by construction, somewhere else to go.
+pub const ROUTABLE_KINDS: &[&str] = &["llm", "search"];
+
+/// How a provider relates to the service that reports it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Relation {
+    /// Declared member of a capability. Excluded from its router's health; its
+    /// failure shows through the capability rollup.
+    Pooled,
+    /// A routable provider belonging to no declared capability: monitored for
+    /// visibility, in nobody's serving path. Excluded from its router's health
+    /// AND from the headline, surfaced as an informational capability so it is
+    /// never silently absent.
+    Informational,
+    /// Nothing else serves this. Its failure IS its router's failure.
+    Indispensable,
+}
+
+/// Classify a provider. The three-way split matters because the two-way one is
+/// wrong in both directions: treating every routable provider as pooled hides
+/// failures nothing represents, and treating undeclared ones as indispensable
+/// propagates a monitored-but-non-serving provider (Together, today) through
+/// its router to the public headline — the exact false impairment this model
+/// exists to remove.
+pub fn relation(specs: &[CapabilitySpec], kind: Option<&str>, id: &str) -> Relation {
+    if specs.iter().any(|s| s.members.iter().any(|(m, _)| m == id)) {
+        Relation::Pooled
+    } else if kind.is_some_and(|k| ROUTABLE_KINDS.contains(&k)) {
+        Relation::Informational
+    } else {
+        Relation::Indispensable
+    }
+}
+
+/// Does this provider stay OUT of its router's own health verdict?
+pub fn is_pooled(specs: &[CapabilitySpec], kind: Option<&str>, id: &str) -> bool {
+    !matches!(relation(specs, kind, id), Relation::Indispensable)
+}
+
+/// An informational capability: visible, never headline-moving.
+pub fn informational(id: &str, status: &str) -> CapabilityStatus {
+    let mut cap = singleton(id, status);
+    cap.informational = true;
+    cap
 }
 
 /// Roll a spec up against what was actually observed.
@@ -107,6 +141,7 @@ pub fn roll_up(spec: &CapabilitySpec, observed: &BTreeMap<String, String>) -> Ca
     CapabilityStatus {
         label: spec.label.clone(),
         status: status.to_string(),
+        informational: false,
         min_available: spec.min_available.max(1),
         available,
         members,
@@ -119,6 +154,7 @@ pub fn singleton(label: &str, status: &str) -> CapabilityStatus {
     CapabilityStatus {
         label: label.to_string(),
         status: status.to_string(),
+        informational: false,
         min_available: 1,
         available: usize::from(status == OPERATIONAL),
         members: vec![CapabilityMember {
@@ -142,8 +178,11 @@ pub fn on_fallback(cap: &CapabilityStatus) -> bool {
 /// The headline, derived from capabilities rather than from whichever component
 /// happens to be unhappiest.
 pub fn overall(caps: &BTreeMap<String, CapabilityStatus>) -> &'static str {
+    // Informational capabilities are reported and never counted: a provider in
+    // nobody's serving path cannot impair service by definition.
     let considered: Vec<&str> = caps
         .values()
+        .filter(|c| !c.informational)
         .map(|c| c.status.as_str())
         .filter(|s| *s != UNKNOWN)
         .collect();
@@ -292,19 +331,62 @@ mod tests {
         assert!(on_fallback(&cap), "the primary is down; say so");
     }
 
+    /// The three-way split. Two-way is wrong in BOTH directions.
     #[test]
-    fn only_declared_members_are_excluded_from_their_router() {
+    fn providers_are_pooled_informational_or_indispensable() {
         let specs = default_specs();
-        assert!(is_pooled(&specs, Some("llm"), "groq"));
-        assert!(is_pooled(&specs, None, "deepinfra"), "declared, so pooled");
-        // NOT declared in any capability: it counts against its router, because
-        // otherwise nothing anywhere would report its failure.
-        assert!(!is_pooled(&specs, Some("search"), "brave"));
-        assert!(
-            !is_pooled(&specs, Some("llm"), "together"),
-            "monitored, not in the chain"
+        // In the serving chain → its capability represents it.
+        assert_eq!(relation(&specs, Some("llm"), "groq"), Relation::Pooled);
+        // Monitored, routable, in no declared chain → informational. Treating
+        // it as indispensable propagated Together's dip to the headline.
+        assert_eq!(
+            relation(&specs, Some("llm"), "together"),
+            Relation::Informational
         );
-        // The router's OWN dependencies are not pooled — nothing else serves them.
+        assert_eq!(
+            relation(&specs, Some("search"), "brave"),
+            Relation::Informational
+        );
+        // Nothing else serves billing → its failure is the router's.
+        assert_eq!(
+            relation(&specs, Some("internal"), "billing"),
+            Relation::Indispensable
+        );
+        assert_eq!(
+            relation(&specs, None, "postgresql"),
+            Relation::Indispensable
+        );
+    }
+
+    /// Informational capabilities are visible but cannot move the headline.
+    #[test]
+    fn an_informational_capability_never_moves_the_headline() {
+        let mut caps = BTreeMap::new();
+        caps.insert(
+            "provider.together".to_string(),
+            informational("together", OUTAGE),
+        );
+        assert_eq!(overall(&caps), OPERATIONAL, "nothing was impaired");
+        assert!(caps["provider.together"].informational);
+
+        // A real capability in the same map still counts.
+        caps.insert("region.us".to_string(), singleton("region.us", OUTAGE));
+        assert_eq!(overall(&caps), "partial_outage");
+    }
+
+    #[test]
+    fn only_indispensable_providers_count_against_their_router() {
+        let specs = default_specs();
+        assert!(is_pooled(&specs, Some("llm"), "groq"), "declared member");
+        assert!(is_pooled(&specs, None, "deepinfra"), "declared member");
+        // Routable but undeclared: out of the router's verdict, and surfaced as
+        // an informational capability so it is never silently absent.
+        assert!(is_pooled(&specs, Some("search"), "brave"));
+        assert!(
+            is_pooled(&specs, Some("llm"), "together"),
+            "monitored, in nobody's serving path"
+        );
+        // Nothing else serves these, so their failure is the router's.
         assert!(!is_pooled(&specs, Some("internal"), "billing"));
         assert!(!is_pooled(&specs, None, "postgresql"));
     }

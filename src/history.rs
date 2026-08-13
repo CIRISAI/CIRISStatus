@@ -548,32 +548,42 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
             },
         ));
     }
-    rows.extend(observations);
 
     // Every probe failed at the transport layer. Unrelated third parties on
     // three continents do not fail in the same second; our network does. Record
     // that, and record NOTHING about the components we could not see — writing
     // them all down as outages is how a monitor's own flicker became four days
     // of everyone else's downtime (FSD §3.3 / D3).
-    if crate::probe::is_vantage_failure(attempted, transport_failures) {
+    let blind = crate::probe::is_vantage_failure(attempted, transport_failures);
+    if !blind {
+        rows.extend(observations);
+    } else {
         tracing::warn!(
             attempted,
             "all probes failed at transport — recording monitor.network, not a global outage"
         );
         rows.clear();
-        rows.push((
-            "monitor".into(),
-            "network".into(),
-            "global".into(),
-            Probe {
-                status: OUTAGE,
-                latency_ms: None,
-                message: Some("all probes failed at transport".into()),
-                transport_error: true,
-                upstream_status: None,
-            },
-        ));
     }
+    // Recorded on EVERY poll, healthy or not. Writing it only on failure would
+    // make it 0% uptime by construction — present exactly on the polls that
+    // failed, absent on every one that worked — and drag the daily mean, which
+    // is the identical defect this poller already fixed once for `service` rows.
+    rows.push((
+        "monitor".into(),
+        "network".into(),
+        "global".into(),
+        Probe {
+            status: if blind {
+                OUTAGE
+            } else {
+                crate::model::OPERATIONAL
+            },
+            latency_ms: None,
+            message: blind.then(|| "all probes failed at transport".to_string()),
+            transport_error: blind,
+            upstream_status: None,
+        },
+    ));
 
     if let Ok(conn) = db.lock() {
         for (service, provider, region, p) in &rows {

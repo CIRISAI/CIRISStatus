@@ -189,6 +189,10 @@ pub struct CapabilityMember {
 pub struct CapabilityStatus {
     pub label: String,
     pub status: String,
+    /// Reported, but never counted toward the headline: a provider in nobody's
+    /// serving path cannot impair service.
+    #[serde(default)]
+    pub informational: bool,
     pub min_available: usize,
     pub available: usize,
     pub members: Vec<CapabilityMember>,

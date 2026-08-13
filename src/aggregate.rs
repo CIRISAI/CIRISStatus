@@ -15,11 +15,16 @@ use crate::config::Config;
 use crate::model::*;
 use crate::probe::*;
 
-/// Statuses come off the wire owned; the summary field wants a &'static str.
+/// Statuses come off the wire owned; the summary field wants a `&'static str`.
+///
+/// The Statuspage spellings MUST normalise here, not fall through to
+/// operational: `severity()` ranks `major_outage` as an outage, so the fold
+/// picks it as the worst status and then this function turned it green — the
+/// dependency failure was ranked correctly and reported as health.
 fn leak_status(s: &str) -> &'static str {
     match s {
-        DEGRADED => DEGRADED,
-        OUTAGE => OUTAGE,
+        DEGRADED | "degraded_performance" => DEGRADED,
+        OUTAGE | "partial_outage" | "major_outage" => OUTAGE,
         UNKNOWN => UNKNOWN,
         _ => OPERATIONAL,
     }
@@ -485,6 +490,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
     // ── Local providers (this service's own deps), if configured ──
     if let Some(dsn) = &cfg.database_url {
         let p = check_postgres_tcp(dsn).await;
+        count(&p);
         database.insert(
             "lens.postgresql".into(),
             detail(p.status, p.latency_ms, "cirislens".into()),
@@ -492,6 +498,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
     }
     if let Some(g) = &cfg.grafana_url {
         let p = check_grafana(client, g).await;
+        count(&p);
         internal.insert(
             "lens.grafana".into(),
             detail(p.status, p.latency_ms, "cirislens".into()),
@@ -509,6 +516,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
             ext.authenticated,
         )
         .await;
+        count(&p);
         internal.insert(
             ext.display.to_string(),
             detail(p.status, p.latency_ms, format!("direct.{}", ext.key)),
@@ -524,6 +532,29 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
     for spec in specs {
         capabilities.insert(spec.id.clone(), capability::roll_up(spec, &observed));
     }
+    // Anything routable but undeclared is REPRESENTED, not merely excluded:
+    // a visible capability that cannot move the headline. Without this, taking
+    // a provider out of its router's verdict would make its failure invisible
+    // everywhere — exclusion without representation.
+    for (id, d) in llm.iter().chain(internal.iter()) {
+        if capabilities
+            .values()
+            .any(|c| c.members.iter().any(|m| &m.id == id))
+        {
+            continue;
+        }
+        if matches!(
+            capability::relation(specs, None, id),
+            capability::Relation::Informational
+        ) || llm.contains_key(id)
+        {
+            capabilities.insert(
+                format!("provider.{id}"),
+                capability::informational(id, &d.status),
+            );
+        }
+    }
+
     // Regions and infrastructure are singletons — no pooling across regions
     // (FSD §2.1: a regional outage is a regional outage).
     for (key, r) in &regions {
@@ -661,16 +692,30 @@ mod tests {
         );
     }
 
-    /// A provider that is monitored but belongs to NO capability counts against
-    /// its router — otherwise nothing anywhere would report its failure.
+    /// A monitored-but-non-serving provider must NOT degrade its router: it is
+    /// in nobody's call path, so its failure impairs nothing. Together is
+    /// exactly this — four days of amber came from treating it otherwise.
     #[test]
-    fn an_undeclared_provider_still_counts_against_its_router() {
+    fn a_monitored_non_serving_provider_does_not_degrade_its_router() {
         let specs = crate::capability::default_specs();
         let providers = [up("together", Some("llm"), OUTAGE)];
         assert_eq!(
             service_status_excluding_pools(OPERATIONAL, &providers, &specs),
+            OPERATIONAL,
+            "routable, undeclared: informational, not indispensable"
+        );
+    }
+
+    /// But an undeclared provider of a NON-routable kind has no alternative by
+    /// definition, so its failure is its router's.
+    #[test]
+    fn an_undeclared_non_routable_dependency_still_degrades_its_router() {
+        let specs = crate::capability::default_specs();
+        let providers = [up("postgresql", None, OUTAGE)];
+        assert_eq!(
+            service_status_excluding_pools(OPERATIONAL, &providers, &specs),
             OUTAGE,
-            "not in any pool, so its failure is somebody's"
+            "nothing else serves it"
         );
     }
 
