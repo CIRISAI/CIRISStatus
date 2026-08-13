@@ -17,7 +17,7 @@ floats, nothing cycles.
    3 |# #  GGGGG |                 runs 6-10 (newest last)
    4 | #         |
    5 |        ## |   P persist     letter on the far edge …
-   6 | b##G#  # #|                 … dots on the near one
+   6 | b##G#  # #|                 … runs on the near one
    8 | G#b#G  #  |
   10 |###        |   E edge
   11 |#    GGRGG |                 a failure in the older five
@@ -25,13 +25,20 @@ floats, nothing cycles.
   18 | GGGGY    #|                 newest run in progress
   20 | #         |   A agent
   21 |# #  GGG.. |                 a young repo: only three runs
-  25 |Y Y Y Y Y Y|   overall status
-  28 | GG     ## |   B billing     US EU
-  33 |##   YY    |   P proxy
-  38 | GG     # #|   D database
-  43 |#    GG Y  |   L providers   US EU | GLOBAL
-  48 | GG G    # |   I infra
+  25 |       Y   |   region header: column 3 = three dots
+  26 |     Y Y   |                 column 2 = two dots
+  27 |   Y Y Y   |                 column 1 = one dot
+  28 |        ## |   B billing
+  30 |   G G  ## |                 dots in the fixed centre columns …
+  33 |##         |   P proxy
+  35 |## Y Y     |                 … so they line up under the header
+  38 |        ## |   D database
+  40 |   G G  # #|
+  43 |#    G G Y |   L providers
+  48 |   G G G   |   I infra
      +-----------+
+
+     x=      3 5 7   = US, EU, GLOBAL
 ```
 
 Every row is a 3×5 letter with its status as single-pixel dots beside it. Ten
@@ -60,12 +67,21 @@ to its letter instead of floating above dead space.
 | cancelled / skipped | grey (deliberately *not* red — superseded PR pushes cancel runs constantly) |
 | no data yet | near-black |
 
-**Divider (row 25)** — a dotted line carrying the aggregate `status`:
-green, amber, or red (`partial_outage` and `major_outage` both read red).
+**Region header (rows 25–27)** — one column per block, its **height counting the
+column**: one dot for the first, two for the second, three for the third, so
+there is no legend to memorise. Each column is lit in that block's worst-of
+rollup colour, so the header is also a per-region summary — strictly more than
+the dotted divider it replaced, in the same space.
 
-**Services (rows 26–50)** — B/P/D/L/I: billing, proxy, database, LLM providers,
-infrastructure. One dot per region, centred on the letter's middle row, sorted
-**west → east** (US left of EU, like a map), then a gap and one dot for GLOBAL — whatever belongs to no region. Adding
+Known limit: three header rows can count to three. A fourth or fifth block would
+pack into adjacent columns but their heights would both cap at three and the
+count would start lying. Three blocks (US, EU, GLOBAL) is what exists today.
+
+**Services (rows 28–52)** — B/P/D/L/I: billing, proxy, database, LLM providers,
+infrastructure. One dot per block, centred on the letter's middle row, in the
+**fixed centre columns 3/5/7** — the only columns never covered by a glyph,
+which is what lets them line up under the header. Sorted **west → east** (US
+left of EU, like a map), with GLOBAL one column further along — whatever belongs to no region. Adding
 a region adds a dot, no code change. Each dot is the **worst** status among that
 block's components, so a single sick provider cannot hide behind healthy
 siblings. Green operational, amber degraded, red outage, dim blue unknown.
