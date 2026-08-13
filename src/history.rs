@@ -14,6 +14,11 @@ use crate::probe::{check_grafana, check_postgres_tcp, fetch_service_status, Prob
 
 pub type Db = Arc<Mutex<Connection>>;
 
+/// Rows recorded for ATTRIBUTION, never for arithmetic: one per reporting
+/// region for a provider that several regions can see. Excluded from every
+/// uptime rollup — they are extra views of one component, not extra components.
+pub const OBSERVATION_SERVICE: &str = "observation";
+
 pub fn init(path: &str) -> Result<Db> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
@@ -249,12 +254,18 @@ pub fn query_capability_sli(
         .map(|_| "?")
         .collect::<Vec<_>>()
         .join(",");
+    let obs = OBSERVATION_SERVICE;
     let sql = format!(
         "SELECT day, AVG(CASE WHEN available >= ?1 THEN 100.0 ELSE 0.0 END) AS sli FROM (
              SELECT date(ts) AS day, ts,
-                    SUM(CASE WHEN status = 'operational' THEN 1 ELSE 0 END) AS available
+                    -- DISTINCT: a provider several regions report is still ONE
+                    -- member. Counting rows let `available` exceed the member
+                    -- count and satisfy a threshold that was never met.
+                    COUNT(DISTINCT CASE WHEN status = 'operational'
+                                        THEN provider_name END) AS available
              FROM status_checks
              WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND service_name <> '{obs}'
                AND provider_name IN ({placeholders})
              GROUP BY ts)
          GROUP BY day"
@@ -317,23 +328,32 @@ fn record(conn: &Connection, ts: &str, service: &str, provider: &str, region: &s
 pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut rows: Vec<(String, String, String, Probe)> = Vec::new();
+    // EVERY probe counts toward the vantage verdict, local ones included:
+    // counting only the regional requests meant three failed regional probes
+    // could declare a monitor-network failure and clear a local row that had
+    // just succeeded — proving the network worked.
     let (mut attempted, mut transport_failures) = (0usize, 0usize);
+    // Cross-region providers, merged worst-wins into ONE row per cycle.
+    let mut cross_region: BTreeMap<String, (String, Option<i64>)> = BTreeMap::new();
+    // The same providers as each region actually saw them — kept for
+    // attribution, excluded from every rollup.
+    let mut observations: Vec<(String, String, String, Probe)> = Vec::new();
 
     if let Some(dsn) = &cfg.database_url {
-        rows.push((
-            "cirislens".into(),
-            "postgresql".into(),
-            "global".into(),
-            check_postgres_tcp(dsn).await,
-        ));
+        rows.push(("cirislens".into(), "postgresql".into(), "global".into(), {
+            let p = check_postgres_tcp(dsn).await;
+            attempted += 1;
+            transport_failures += usize::from(p.transport_error);
+            p
+        }));
     }
     if let Some(g) = &cfg.grafana_url {
-        rows.push((
-            "cirislens".into(),
-            "grafana".into(),
-            "global".into(),
-            check_grafana(client, g).await,
-        ));
+        rows.push(("cirislens".into(), "grafana".into(), "global".into(), {
+            let p = check_grafana(client, g).await;
+            attempted += 1;
+            transport_failures += usize::from(p.transport_error);
+            p
+        }));
     }
 
     for region in &cfg.regions {
@@ -383,32 +403,76 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
                 probe,
             ));
             for p in providers {
-                // LLM providers are cross-region → record under "global".
-                // Trust the upstream's own `type` first; the id list only
-                // covers an upstream that doesn't declare one.
+                // Cross-region providers are reported by EVERY region's proxy,
+                // so they need care in two directions.
                 let is_llm = p.kind.as_deref() == Some("llm")
                     || (p.kind.is_none()
                         && matches!(p.id.as_str(), "openrouter" | "groq" | "together" | "openai"));
-                let reg = if is_llm {
-                    "global".to_string()
+                if is_llm {
+                    // One canonical row per provider per cycle, worst-wins.
+                    // Writing one per reporting region — all labelled `global` —
+                    // duplicated the provider at the same timestamp, which
+                    // double-counts it in the daily mean and, worse, lets a
+                    // capability's `available` count exceed its member count and
+                    // satisfy a threshold that was never met.
+                    cross_region
+                        .entry(p.id.clone())
+                        .and_modify(|(st, lat)| {
+                            if crate::model::severity(&p.status) > crate::model::severity(st) {
+                                *st = p.status.clone();
+                                *lat = p.latency_ms;
+                            }
+                        })
+                        .or_insert((p.status.clone(), p.latency_ms));
+                    // AND keep this region's own view, under a service name the
+                    // rollups ignore. Agreement across regions implicates the
+                    // provider; disagreement implicates the path or our vantage.
+                    // Merging destroyed that signal — this is where it lives now.
+                    observations.push((
+                        OBSERVATION_SERVICE.to_string(),
+                        p.id,
+                        region.key.to_string(),
+                        Probe {
+                            status: leak(p.status),
+                            latency_ms: p.latency_ms,
+                            message: None,
+                            transport_error: false,
+                            upstream_status: None,
+                        },
+                    ));
                 } else {
-                    region.key.to_string()
-                };
-                rows.push((
-                    "cirisproxy".into(),
-                    p.id,
-                    reg,
-                    Probe {
-                        status: leak(p.status),
-                        latency_ms: p.latency_ms,
-                        message: None,
-                        transport_error: false,
-                        upstream_status: None,
-                    },
-                ));
+                    rows.push((
+                        "cirisproxy".into(),
+                        p.id,
+                        region.key.to_string(),
+                        Probe {
+                            status: leak(p.status),
+                            latency_ms: p.latency_ms,
+                            message: None,
+                            transport_error: false,
+                            upstream_status: None,
+                        },
+                    ));
+                }
             }
         }
     }
+
+    for (id, (status, latency_ms)) in cross_region {
+        rows.push((
+            "cirisproxy".into(),
+            id,
+            "global".into(),
+            Probe {
+                status: leak(status),
+                latency_ms,
+                message: None,
+                transport_error: false,
+                upstream_status: None,
+            },
+        ));
+    }
+    rows.extend(observations);
 
     // Every probe failed at the transport layer. Unrelated third parties on
     // three continents do not fail in the same second; our network does. Record
@@ -488,7 +552,8 @@ pub fn query_history(
                        PARTITION BY region, service_name, provider_name ORDER BY ts
                    ) AS prev
             FROM status_checks
-            WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)",
+            WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)
+              AND service_name <> 'observation'",
     );
     if region.is_some() {
         sql.push_str(" AND region = ?2");
@@ -570,12 +635,18 @@ pub fn query_history(
         }
         // Service availability is the WORST capability, not the mean of
         // components: a fabric is as available as the thing it can least do.
+        // The worst CAPABILITY, and nothing else. Folding in the component mean
+        // let a degraded non-capability component drag service uptime below
+        // 100% on a day when every capability was fully available — which is
+        // precisely the component-versus-service conflation this field exists
+        // to end. `overall` is the fallback only when no capability was
+        // measured at all.
         let service_uptime_pct = capabilities
             .values()
             .map(|c| c.sli_pct)
             .fold(f64::INFINITY, f64::min);
         let service_uptime_pct = if service_uptime_pct.is_finite() {
-            service_uptime_pct.min(overall)
+            service_uptime_pct
         } else {
             overall
         };
@@ -1154,6 +1225,72 @@ mod event_tests {
             sli.get(&today).copied(),
             Some(50.0),
             "half the samples had both"
+        );
+    }
+
+    /// A provider several regions report is still ONE member. Counting rows
+    /// instead of distinct providers let `available` exceed the member count
+    /// and satisfy a threshold that was never met.
+    #[test]
+    fn duplicate_reports_of_one_provider_cannot_satisfy_a_threshold() {
+        let path = repair_tests::tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai_providers".into(),
+            label: "AI".into(),
+            members: vec![("groq".into(), false), ("openrouter".into(), false)],
+            min_available: 2,
+        };
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            let ts = format!("{today}T00:00:00Z");
+            // groq reported healthy TWICE (once per region), openrouter down.
+            repair_tests::insert(&conn, &ts, "cirisproxy", "groq", "operational");
+            repair_tests::insert(&conn, &ts, "cirisproxy", "groq", "operational");
+            repair_tests::insert(&conn, &ts, "cirisproxy", "openrouter", "outage");
+        }
+        let sli = query_capability_sli(&init(&path).unwrap(), 2, &spec).unwrap();
+        assert_eq!(
+            sli.get(&today).copied(),
+            Some(0.0),
+            "one distinct provider available, threshold is two"
+        );
+    }
+
+    /// Attribution rows are extra VIEWS of one component, not extra components,
+    /// so they must not enter any rollup.
+    #[test]
+    fn observation_rows_are_excluded_from_the_rollup() {
+        let path = repair_tests::tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            let ts = format!("{today}T00:00:00Z");
+            repair_tests::insert(&conn, &ts, "cirisproxy", "groq", "operational");
+            // EU saw it fail; US did not. Kept for attribution, ignored by math.
+            repair_tests::insert(&conn, &ts, OBSERVATION_SERVICE, "groq", "outage");
+        }
+        let db = init(&path).unwrap();
+        let days = query_history(&db, 2, None, &[]).unwrap();
+        let day = days.iter().find(|d| d.date == today).expect("today");
+        assert_eq!(
+            day.overall_uptime_pct, 100.0,
+            "an attribution row must not count as an outage"
+        );
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai".into(),
+            label: "AI".into(),
+            members: vec![("groq".into(), false)],
+            min_available: 1,
+        };
+        assert_eq!(
+            query_capability_sli(&db, 2, &spec)
+                .unwrap()
+                .get(&today)
+                .copied(),
+            Some(100.0)
         );
     }
 

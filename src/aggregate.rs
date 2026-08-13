@@ -278,17 +278,21 @@ pub fn flatten(agg: &AggregatedStatus) -> BTreeMap<String, String> {
     // latency and quality changes nothing else on the board would explain.
     for (id, cap) in &agg.capabilities {
         out.insert(format!("capability.{id}"), cap.status.clone());
-        if cap
+        // Derived from the PRIMARY MEMBER, never from the capability: with a
+        // threshold above one, losing a FALLBACK degrades the capability while
+        // the primary is perfectly healthy, and inheriting that status emits a
+        // primary failure that never happened — plus a false recovery later.
+        if let Some(primary) = cap
             .members
             .iter()
-            .any(|m| m.role == crate::model::ROLE_PRIMARY)
+            .find(|m| m.role == crate::model::ROLE_PRIMARY)
         {
             out.insert(
                 format!("capability.{id}.primary"),
                 if capability::on_fallback(cap) {
                     "serving_on_fallback".to_string()
                 } else {
-                    cap.status.clone()
+                    primary.status.clone()
                 },
             );
         }
@@ -368,11 +372,21 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
         if let Some(url) = &region.billing_url {
             let (probe, body) = fetch_service_status(client, url, region.latency_baseline_ms).await;
             count(&probe);
+            // Same fold as the proxy: billing's dependencies are things NOTHING
+            // else serves, so an outage in one is an outage in billing. Taking
+            // only the transport verdict here would leave the service, its
+            // region and the headline green while authentication is unusable.
+            let billing_status = match &body {
+                Some(b) => {
+                    service_status_excluding_pools(probe.status, &upstream_providers(b), specs)
+                }
+                None => probe.status,
+            };
             services.insert(
                 "billing".into(),
                 ServiceSummary {
                     name: "Billing & Authentication".into(),
-                    status: probe.status.to_string(),
+                    status: billing_status.to_string(),
                     latency_ms: probe.latency_ms,
                     upstream_status: probe.upstream_status.clone(),
                 },
@@ -622,14 +636,27 @@ mod tests {
     fn a_degraded_pool_member_does_not_degrade_its_router() {
         let specs = crate::capability::default_specs();
         let providers = [
-            up("together", Some("llm"), DEGRADED),
-            up("groq", Some("llm"), OPERATIONAL),
+            up("groq", Some("llm"), DEGRADED),
+            up("openrouter", Some("llm"), OPERATIONAL),
             up("billing", Some("internal"), OPERATIONAL),
         ];
         assert_eq!(
             service_status_excluding_pools(OPERATIONAL, &providers, &specs),
             OPERATIONAL,
-            "the proxy is serving fine on the other providers"
+            "the proxy is serving fine on the other members of the chain"
+        );
+    }
+
+    /// A provider that is monitored but belongs to NO capability counts against
+    /// its router — otherwise nothing anywhere would report its failure.
+    #[test]
+    fn an_undeclared_provider_still_counts_against_its_router() {
+        let specs = crate::capability::default_specs();
+        let providers = [up("together", Some("llm"), OUTAGE)];
+        assert_eq!(
+            service_status_excluding_pools(OPERATIONAL, &providers, &specs),
+            OUTAGE,
+            "not in any pool, so its failure is somebody's"
         );
     }
 
@@ -898,6 +925,50 @@ mod transition_tests {
             "the primary transition is recorded, and NOTHING else moves"
         );
         assert_eq!(events[0].to, "serving_on_fallback");
+    }
+
+    /// (4) With a threshold above one, losing a FALLBACK degrades the
+    /// capability while the primary is perfectly healthy. Deriving the primary
+    /// component from the capability emitted a primary failure that never
+    /// happened — and a matching false recovery.
+    #[test]
+    fn a_fallback_failure_is_not_reported_as_a_primary_failure() {
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai_providers".into(),
+            label: "AI providers".into(),
+            members: vec![
+                ("deepinfra".into(), true),
+                ("groq".into(), false),
+                ("openrouter".into(), false),
+            ],
+            min_available: 2,
+        };
+        let obs = |groq: &str| -> BTreeMap<String, String> {
+            [
+                ("deepinfra".to_string(), OPERATIONAL.to_string()),
+                ("groq".to_string(), groq.to_string()),
+                ("openrouter".to_string(), OUTAGE.to_string()),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let before = crate::capability::roll_up(&spec, &obs(OPERATIONAL));
+        let after = crate::capability::roll_up(&spec, &obs(OUTAGE));
+        assert_eq!(before.status, OPERATIONAL);
+        assert_eq!(after.status, DEGRADED, "one member left, threshold is two");
+
+        let mut a = snap(OPERATIONAL, OPERATIONAL, OPERATIONAL);
+        a.capabilities.insert("ai_providers".into(), before);
+        let mut b = snap(OPERATIONAL, OPERATIONAL, OPERATIONAL);
+        b.capabilities.insert("ai_providers".into(), after);
+
+        let events = transitions(&flatten(&a), &flatten(&b), "t");
+        let subjects: Vec<_> = events.iter().map(|e| e.component.as_str()).collect();
+        assert_eq!(
+            subjects,
+            ["capability.ai_providers"],
+            "the capability moved; the primary did not, and must not say it did"
+        );
     }
 
     #[test]

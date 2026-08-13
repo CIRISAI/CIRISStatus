@@ -36,22 +36,31 @@ pub fn default_specs() -> Vec<CapabilitySpec> {
     vec![CapabilitySpec {
         id: "ai_providers".into(),
         label: "AI providers".into(),
+        // The DEFAULT ROUTING CHAIN, not the monitored set. Together is
+        // monitored but is not in it, and counting it as an available fallback
+        // would let `ai_providers` read operational with every serving provider
+        // down — the exact confusion this whole model exists to remove.
         members: vec![
             ("deepinfra".into(), true),
             ("openrouter".into(), false),
             ("groq".into(), false),
-            ("together".into(), false),
         ],
         min_available: 1,
     }]
 }
 
-/// Is this provider a member of some pool, and therefore NOT part of its
-/// router's own health? A slow pool member must not degrade the service that
-/// reports it — that service is serving fine on the other members.
-pub fn is_pooled(specs: &[CapabilitySpec], kind: Option<&str>, id: &str) -> bool {
-    matches!(kind, Some("llm") | Some("search"))
-        || specs.iter().any(|s| s.members.iter().any(|(m, _)| m == id))
+/// Is this provider a member of some declared capability, and therefore NOT
+/// part of its router's own health? A pooled member must not degrade the
+/// service that reports it — that service is serving fine on the others.
+///
+/// Membership is the ONLY thing that excludes. Excluding by `kind` (every
+/// `llm`/`search` provider) removed providers from their router's verdict
+/// without giving them a capability to live in, so if every search provider
+/// failed, the proxy, the region, the capabilities and the headline all stayed
+/// green while search was unavailable. Exclusion without representation is a
+/// blind spot: declare a capability, or the provider counts against its router.
+pub fn is_pooled(specs: &[CapabilitySpec], _kind: Option<&str>, id: &str) -> bool {
+    specs.iter().any(|s| s.members.iter().any(|(m, _)| m == id))
 }
 
 /// Roll a spec up against what was actually observed.
@@ -256,14 +265,41 @@ mod tests {
     }
 
     #[test]
-    fn pool_membership_excludes_a_provider_from_its_router() {
+    fn only_declared_members_are_excluded_from_their_router() {
         let specs = default_specs();
         assert!(is_pooled(&specs, Some("llm"), "groq"));
         assert!(is_pooled(&specs, None, "deepinfra"), "declared, so pooled");
-        assert!(is_pooled(&specs, Some("search"), "brave"));
+        // NOT declared in any capability: it counts against its router, because
+        // otherwise nothing anywhere would report its failure.
+        assert!(!is_pooled(&specs, Some("search"), "brave"));
+        assert!(
+            !is_pooled(&specs, Some("llm"), "together"),
+            "monitored, not in the chain"
+        );
         // The router's OWN dependencies are not pooled — nothing else serves them.
         assert!(!is_pooled(&specs, Some("internal"), "billing"));
         assert!(!is_pooled(&specs, None, "postgresql"));
+    }
+
+    /// (1) The pool describes what SERVES. A healthy provider outside the
+    /// routing chain must not satisfy the threshold.
+    #[test]
+    fn a_provider_outside_the_chain_cannot_satisfy_the_threshold() {
+        let spec = &default_specs()[0];
+        assert!(
+            !spec.members.iter().any(|(m, _)| m == "together"),
+            "together is monitored but not in the default chain"
+        );
+        let cap = roll_up(
+            spec,
+            &observed(&[
+                ("deepinfra", OUTAGE),
+                ("openrouter", OUTAGE),
+                ("groq", OUTAGE),
+                ("together", OPERATIONAL),
+            ]),
+        );
+        assert_eq!(cap.status, "major_outage", "no usable default route");
     }
 
     #[test]
