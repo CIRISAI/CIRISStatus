@@ -11,21 +11,26 @@ floats, nothing cycles.
 
 ```
      +-----------+
-   0 |# #  GGGGG |   V verify      runs 1-5  (oldest first)
-   2 |# #  GGGGG |                 runs 6-10 (newest last)
+   0 |# #        |   V verify
+   1 |# #  GGGGG |                 runs 1-5  (oldest first)
+   2 |# #        |
+   3 |# #  GGGGG |                 runs 6-10 (newest last)
    4 | #         |
-   5 | b##G#  ## |   P persist     letter on the far edge …
-   7 | G#b#G  ## |                 … dots on the near one
-  10 |###  GGRGG |   E edge        a failure in the older five
-  15 | GGGGG   ##|   S server
-  17 | GGGGY   # |                 newest run in progress
-  20 | #   GGG.. |   A agent       a young repo: only three runs
+   5 |        ## |   P persist     letter on the far edge …
+   6 | b##G#  # #|                 … dots on the near one
+   8 | G#b#G  #  |
+  10 |###        |   E edge
+  11 |#    GGRGG |                 a failure in the older five
+  15 |         ##|   S server
+  18 | GGGGY    #|                 newest run in progress
+  20 | #         |   A agent
+  21 |# #  GGG.. |                 a young repo: only three runs
   25 |Y Y Y Y Y Y|   overall status
-  26 | GG     ## |   B billing     US EU
-  31 |##   YY    |   P proxy
-  36 | GG     ## |   D database
-  41 |#    GG Y  |   L providers   US EU | GLOBAL
-  46 | GG G   ###|   I infra
+  28 | GG     ## |   B billing     US EU
+  33 |##   YY    |   P proxy
+  38 | GG     # #|   D database
+  43 |#    GG Y  |   L providers   US EU | GLOBAL
+  48 | GG G    # |   I infra
      +-----------+
 ```
 
@@ -41,9 +46,10 @@ west-to-east region order never flip.
 
 **Repos (rows 0–24)** — V/P/E/S/A, the substrate in dependency order: verify →
 persist → edge → server → agent. Each row carries that repo's ten most recent
-GitHub Actions runs as **two rows of five dots** — the older five on the band's
-first row, the newer five two rows below, with a blank row between so they
-cannot fuse.
+GitHub Actions runs as **two rows of five dots** — the older five, then the
+newer five — on rows 2 and 4 of the letter's five, with a blank row between so
+they cannot fuse. Centring them against the glyph keeps the pair optically tied
+to its letter instead of floating above dead space.
 
 | Run | Colour |
 |---|---|
@@ -58,8 +64,8 @@ cannot fuse.
 green, amber, or red (`partial_outage` and `major_outage` both read red).
 
 **Services (rows 26–50)** — B/P/D/L/I: billing, proxy, database, LLM providers,
-infrastructure. One dot per region sorted **west → east** (US left of EU, like a
-map), then a gap and one dot for GLOBAL — whatever belongs to no region. Adding
+infrastructure. One dot per region, centred on the letter's middle row, sorted
+**west → east** (US left of EU, like a map), then a gap and one dot for GLOBAL — whatever belongs to no region. Adding
 a region adds a dot, no code change. Each dot is the **worst** status among that
 block's components, so a single sick provider cannot hide behind healthy
 siblings. Green operational, amber degraded, red outage, dim blue unknown.

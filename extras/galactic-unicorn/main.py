@@ -133,7 +133,13 @@ CI_BANDS = 5
 RUNS = 10
 
 RUNS_PER_ROW = 5                # 10 runs as 2 rows of 5 — what makes 10 rows fit
-RUN_ROWS = (0, 2)               # a blank row between them so they cannot fuse
+# Rows 2 and 4 of the letter's 5, with a blank row between them so they cannot
+# fuse. Sitting at the top of the band left the dots optically adrift from the
+# letter, with dead space under them; this centres the pair against the glyph.
+RUN_ROWS = (1, 3)
+# A service row carries one dot, so centre it on the letter's middle row rather
+# than parking it on top with four empty rows beneath.
+HEALTH_DOT_ROW = LETTER_H // 2  # 2
 
 # Bands alternate sides: even rows letter-left, odd rows letter-right. With
 # 5-row letters stacked flush there is no blank row between bands, so two
@@ -531,7 +537,7 @@ def draw_health():
             x = dot_x + b + (1 if b == last else 0)
             if x >= limit:
                 continue
-            vpixel(x, y, PEN_UNKNOWN if blue
+            vpixel(x, y + HEALTH_DOT_ROW, PEN_UNKNOWN if blue
                    else PENS.get(worst_status(cells), PEN_UNKNOWN))
 
 
