@@ -110,19 +110,27 @@ fn purge_failure_only_service_rows(conn: &Connection) {
 
 /// Trim samples older than the queryable window.
 fn prune_beyond_retention(conn: &Connection) {
+    for table in ["status_checks", "status_events"] {
+        prune_table(conn, table);
+    }
+}
+
+fn prune_table(conn: &Connection, table: &str) {
     match conn.execute(
-        "DELETE FROM status_checks WHERE ts < datetime('now', ?1)",
+        // Compare against a cutoff in OUR stored format, not `datetime()`'s.
+        &format!("DELETE FROM {table} WHERE ts < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)"),
         rusqlite::params![format!("-{RETENTION_DAYS} days")],
     ) {
         Ok(n) if n > 0 => {
             tracing::info!(
                 rows = n,
+                table,
                 days = RETENTION_DAYS,
-                "history: pruned old samples"
+                "history: pruned old rows"
             )
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "history: retention prune failed"),
+        Err(e) => tracing::warn!(error = %e, table, "history: retention prune failed"),
     }
 }
 
@@ -219,7 +227,8 @@ pub fn query_events(db: &Db, days: i64, limit: i64) -> Result<Vec<StatusEvent>> 
     let conn = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
     let mut stmt = conn.prepare(
         "SELECT ts, component, from_status, to_status FROM status_events
-         WHERE ts >= datetime('now', ?1) ORDER BY ts DESC, id DESC LIMIT ?2",
+         WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)
+         ORDER BY ts DESC, id DESC LIMIT ?2",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![format!("-{days} days"), limit], |r| {
@@ -376,7 +385,7 @@ pub fn query_history(db: &Db, days: i64, region: Option<&str>) -> Result<Vec<His
                        PARTITION BY region, service_name, provider_name ORDER BY ts
                    ) AS prev
             FROM status_checks
-            WHERE ts >= datetime('now', ?1)",
+            WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)",
     );
     if region.is_some() {
         sql.push_str(" AND region = ?2");
@@ -858,6 +867,69 @@ mod event_tests {
             "retention prunes the events table too"
         );
         assert!(got.iter().all(|e| e.to == "degraded"));
+    }
+
+    /// The window must be compared in the format we STORE. `datetime('now',…)`
+    /// yields `2026-08-12 21:07:28` while rows read `2026-08-12T00:00:00Z`, and
+    /// `T` sorts after a space — so every event on the cutoff DATE compared
+    /// greater and a 1-day window returned events up to ~40 hours old.
+    #[test]
+    fn the_day_window_does_not_leak_older_events() {
+        let path = repair_tests::tmp_db();
+        let db = init(&path).unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::hours(30))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let recent = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        record_events(
+            &db,
+            &[
+                StatusEvent {
+                    ts: old,
+                    component: "too.old".into(),
+                    from: "operational".into(),
+                    to: "degraded".into(),
+                },
+                StatusEvent {
+                    ts: recent,
+                    component: "in.window".into(),
+                    from: "operational".into(),
+                    to: "degraded".into(),
+                },
+            ],
+        );
+        let got = query_events(&db, 1, 100).unwrap();
+        let names: Vec<_> = got.iter().map(|e| e.component.as_str()).collect();
+        assert_eq!(names, ["in.window"], "a 30h-old event is not within 1 day");
+    }
+
+    /// Retention must DELETE from the events table, not merely be filtered out
+    /// of a query window — otherwise the table grows without bound and the
+    /// documented 400-day store is a fiction.
+    #[test]
+    fn retention_deletes_events_from_the_table_itself() {
+        let path = repair_tests::tmp_db();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO status_events (ts, component, from_status, to_status)
+                 VALUES ('2020-01-01T00:00:00Z', 'ancient.thing', 'operational', 'outage')",
+                [],
+            )
+            .unwrap();
+        }
+        let db = init(&path).unwrap();
+        let conn = db.lock().unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM status_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "the row must be gone from the table, not just the window"
+        );
     }
 
     #[test]
