@@ -11,36 +11,34 @@ floats, nothing cycles.
 
 ```
      +-----------+
-   0 |# #        |   V — CIRISVerify: a 3x5 letter …
-   1 |# #      GG|      … and a state pip on the right
-   2 |# #      GG|
-   3 |# #      GG|
+   0 |# #        |   V — CIRISVerify, a 3x5 letter …
+   1 |# #        |
+   2 |# #        |
+   3 |# #        |
    4 | #         |
-   5 |           |
-   6 |GGGGGGGGGG |   … then all 10 runs, oldest left, newest right
-   7 |GGGGGGGGGG |
-   8 |##         |   P — CIRISPersist
-  ...
-  16 |###        |   E — CIRISEdge
-  22 |GGRGGGGGGG |      a failure three runs back, visible at a glance
-  24 | ##        |   S — CIRISServer
-  30 |GGGGGGGGGY |      newest run in progress (pulsing amber)
-  32 | #         |   A — CIRISAgent
-  38 |GGG....... |      a young repo draws a short centipede
-  40 |Y Y Y Y Y Y|   overall status
-  42 |GGG GGG    |   health: billing      US | EU | GLOBAL
-  44 |YYY YYY    |   health: proxy
-  46 |GGG GGG    |   health: databases
-  48 |GGG GGG GGY|   health: providers
-  50 |GGG GGG GGG|   health: infrastructure
+   5 |GGGGGGGGGG |   … with all 10 runs beneath it, oldest left, newest right
+   6 |GGGGGGGGGG |
+   7 |##         |   P — CIRISPersist
+  12 |b##G#G#b#G |      queued / cancelled churn
+  14 |###        |   E — CIRISEdge
+  19 |GGRGGGGGGG |      a failure three runs back
+  21 | ##        |   S — CIRISServer
+  26 |GGGGGGGGGY |      newest run in progress (pulsing amber)
+  28 | #         |   A — CIRISAgent
+  33 |GGG....... |      a young repo draws a short centipede
+  35 |Y Y Y Y Y Y|   overall status
+  37 |GGG GGG    |   health: billing          US | EU | GLOBAL
+  40 |YYY YYY    |   health: proxy
+  43 |GGG GGG    |   health: databases
+  46 |GGG GGG GGY|   health: providers
+  49 |GGG GGG GGG|   health: infrastructure
      +-----------+
 ```
 
-**Centipedes (rows 0–39)** — one band per repo, all five visible at once. The
+**Centipedes (rows 0–34)** — one band per repo, all five visible at once. The
 repos are the substrate in dependency order: verify → persist → edge → server →
-agent. Each band is a 3×5 letter, a state pip to its right (that repo's worst
-run in the window, so a failure registers without reading the bar), and the ten
-most recent GitHub Actions runs beneath.
+agent. Each band is a 3×5 letter with that repo's ten most recent GitHub Actions
+runs as a full-width bar directly beneath it.
 
 | Run | Colour |
 |---|---|
@@ -51,12 +49,15 @@ most recent GitHub Actions runs beneath.
 | cancelled / skipped | grey (deliberately *not* red — superseded PR pushes cancel runs constantly) |
 | no data yet | near-black |
 
-**Divider (row 40)** — a dotted line carrying the aggregate `status`:
+**Divider (row 35)** — a dotted line carrying the aggregate `status`:
 green, amber, or red (`partial_outage` and `major_outage` both read red).
 
-**Health grid (rows 42–51)** — completely static. Three column blocks sorted
-**west → east** — US, EU, then GLOBAL for what belongs to no region — and five
-rows, top to bottom: billing, proxy, databases, providers, infrastructure.
+**Health grid (rows 37–50)** — completely static, with a blank row between
+categories: without it, adjacent rows of the same colour fuse into one tall
+block and the five categories read as an arbitrary stack of boxes. Three column
+blocks sorted **west → east** — US, EU, then GLOBAL for what belongs to no
+region — and five rows, top to bottom: billing, proxy, databases, providers,
+infrastructure.
 Adding a region re-widths the blocks with no code change. Green operational,
 amber degraded, red outage, dim blue unknown; where a row has several components
 in one block they share it as sub-cells.

@@ -7,15 +7,15 @@ viewer coordinates — `vpixel`/`vrect` rotate into panel space on the way out.
 Getting this backwards is what made the first version unreadable: five 1px-tall
 rows and a letter drawn sideways.
 
-  vy  0-39   CENTIPEDES - one band per repo, five of them, no cycling:
+  vy  0-34   CENTIPEDES - one band per repo, five of them, no cycling:
              a 3x5 letter naming the repo (V/P/E/S/A = verify, persist, edge,
-             server, agent), a state pip on the right of the letter line, then
-             all 10 CI runs as a full-width bar directly beneath — oldest at
-             the left, newest at the right.
-  vy  40     divider, lit in the colour of the OVERALL status
-  vy  42-51  HEALTH GRID - static. Three column blocks ordered west to east:
-             US, EU, then GLOBAL for what belongs to no region. Rows are, top
-             to bottom: billing, proxy, databases, providers, infrastructure.
+             server, agent) with all 10 CI runs as a full-width bar directly
+             beneath it — oldest at the left, newest at the right.
+  vy  35     divider, lit in the colour of the OVERALL status
+  vy  37-50  HEALTH GRID - static, one blank row between categories so they
+             cannot fuse. Three column blocks ordered west to east: US, EU,
+             then GLOBAL for what belongs to no region. Rows are, top to
+             bottom: billing, proxy, databases, providers, infrastructure.
 
 Run colours    green success | red failure | pulsing amber in-progress |
                dim blue queued | grey cancelled
@@ -121,13 +121,17 @@ def vpixel(x, y, pen):
 LETTER_W = 3
 LETTER_H = 5
 RUNS_H = 2                      # run bar height
-BAND_H = LETTER_H + 1 + RUNS_H  # 8 rows per repo
+BAND_H = LETTER_H + RUNS_H      # 7 rows per repo: the bar sits under its letter
 CI_BANDS = 5
 RUNS = 10
 
-DIVIDER_Y = CI_BANDS * BAND_H   # 40
-HEALTH_Y0 = DIVIDER_Y + 2       # 42
+DIVIDER_Y = CI_BANDS * BAND_H   # 35
+HEALTH_Y0 = DIVIDER_Y + 2       # 37
 HEALTH_ROW_H = 2
+# One blank row between health rows. Without it, adjacent rows of the same
+# colour fuse into a single tall block and the five categories read as a random
+# stack of boxes — you cannot see where billing ends and proxy begins.
+HEALTH_PITCH = HEALTH_ROW_H + 1
 HEALTH_ROWS = 5                 # billing, proxy, db, providers, infra
 
 PEN_BLACK = graphics.create_pen(0, 0, 0)
@@ -144,10 +148,8 @@ PENS = {
     'failure': graphics.create_pen(200, 0, 0),
     'queued': graphics.create_pen(0, 40, 120),
     'cancelled': graphics.create_pen(45, 45, 45),
-    # Run cells build their own pulsing amber per frame; this static one is for
-    # anything needing the colour without animating (the per-repo pip). Without
-    # it `PENS.get('in_progress')` fell through to unknown-blue, reporting no
-    # data on a repo that was simply building.
+    # Run cells build their own pulsing amber per frame; this static one is the
+    # fallback for anything needing the colour without animating.
     'in_progress': graphics.create_pen(200, 140, 0),
 }
 PEN_UNKNOWN = PENS['unknown']
@@ -187,10 +189,6 @@ FONT_3X5 = {
     'Z': (0b111, 0b001, 0b010, 0b100, 0b111),
     '?': (0b110, 0b001, 0b010, 0b000, 0b010),
 }
-
-# Worst-first ranking for a repo's pip: one failure in the window outranks
-# anything in flight, and `cancelled` never counts as bad.
-RUN_RANK = {'failure': 3, 'in_progress': 2, 'queued': 1, 'success': 0, 'cancelled': 0}
 
 # Region ordering, west to east, so US sits left of EU like a map. Unknown
 # regions sort after the known ones, alphabetically — a new region just appears.
@@ -446,16 +444,6 @@ def draw_letter(x, y, ch, pen):
                 vpixel(x + dx, y + dy, pen)
 
 
-def repo_state(runs):
-    """The one state that describes a repo's window — worst wins."""
-    worst, rank = None, -1
-    for s in runs:
-        r = RUN_RANK.get(s, 0)
-        if r > rank:
-            worst, rank = s, r
-    return worst
-
-
 def pulse_pen(phase):
     """Amber, breathing — what makes in-progress unmistakable next to queued."""
     v = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(phase))
@@ -478,15 +466,7 @@ def draw_centipedes(phase):
         draw_letter(0, top, repo_letter(name),
                     PEN_UNKNOWN if blue else PEN_LETTER)
 
-        # State pip on the right of the letter line: the repo's worst run in the
-        # window, so a failure is visible without reading the bar.
-        state = repo_state(runs)
-        if state and not blue:
-            vrect(VW - 2, top + 1, 2, 3, PENS.get(state, PEN_UNKNOWN))
-        elif blue:
-            vpixel(VW - 1, top + 2, PEN_UNKNOWN)
-
-        runs_y = top + LETTER_H + 1
+        runs_y = top + LETTER_H
         for i in range(RUNS):
             if i < len(runs):
                 pen = PEN_UNKNOWN if blue else (
@@ -509,7 +489,7 @@ def draw_health():
     blue = stale()
     spans = block_spans(len(blocks))
     for row in range(HEALTH_ROWS):
-        y = HEALTH_Y0 + row * HEALTH_ROW_H
+        y = HEALTH_Y0 + row * HEALTH_PITCH
         for b, (bx, bw) in enumerate(spans):
             cells = grid.get((row, b), [])
             if not cells:
