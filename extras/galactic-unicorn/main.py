@@ -3,10 +3,19 @@ CIRIS status board - Pimoroni Galactic Unicorn (53x11)
 
 Two sections, fixed positions, nothing floats:
 
-  rows 0-4   CENTIPEDES - the substrate's last 10 CI runs, one row per repo,
-             oldest run at the left, newest at the leading edge. A 2px tag on
-             the far left identifies the repo by hue.
-  row  5     divider, lit in the colour of the OVERALL status
+  rows 0-4   CENTIPEDE - ONE repo's last 10 CI runs as chunky 4x5 blocks,
+             oldest at the left, newest at the leading edge. A 3x5 letter names
+             the repo (V/P/E/S/A = verify, persist, edge, server, agent) with a
+             1px separator. Cycles through the repos every few seconds.
+
+             Five rows of 1px each would fit all five repos at once, but a
+             letter needs 5 rows of height — so the board shows one repo large
+             and legible instead of five rows you cannot tell apart.
+
+  row  5     divider: five pips on the left, one per repo, coloured by that
+             repo's worst run in the window (the current repo's pip is bright,
+             so you can see all five at a glance and which one is on screen);
+             then a dotted line in the colour of the OVERALL status.
   rows 6-10  HEALTH GRID - static. Regions are column blocks ordered west to
              east (US left of EU, like a map), then a GLOBAL block for things
              that belong to no region. A tick gutter on the far left says which
@@ -20,7 +29,7 @@ Health colours green operational | amber degraded | red outage | dim blue unknow
 Only in-progress CI cells animate. The health grid never moves.
 
 Flash: copy to the Pico W as main.py alongside a secrets.py with WIFI_SSID /
-WIFI_PASSWORD. Buttons: A = refresh now, LUX +/- = brightness.
+WIFI_PASSWORD. Buttons: A = refresh now, B = next repo, LUX +/- = brightness.
 """
 
 import network
@@ -66,16 +75,20 @@ HEIGHT = GalacticUnicorn.HEIGHT  # 11
 
 # ── Layout ───────────────────────────────────────────────────────────────────
 CI_ROW0 = 0
-CI_ROWS = 5           # one per repo
+CI_ROWS = 5           # band height — also the height of a letter
 DIVIDER_ROW = 5
 HEALTH_ROW0 = 6
 HEALTH_ROWS = 5
 
-TAG_W = 2             # repo hue tag on each centipede
-CI_X0 = TAG_W + 2     # 2px gap after the tag
+LETTER_W = 3          # 3x5 glyph, the smallest that stays legible
+SEP_X = LETTER_W      # 1px separator column right after the letter
+CI_X0 = LETTER_W + 1  # exactly "letter + separator", nothing wasted
 RUNS = 10
 CELL_W = 4            # 10 cells of 4px + 9 gaps = 49px: x=4..52, flush right
 CELL_GAP = 1
+
+MAX_REPOS = 5         # as many pips as fit in the letter+separator width
+CYCLE_MS = 4000       # dwell per repo
 
 GUTTER_W = 5          # up to 5 ticks
 GRID_X0 = GUTTER_W + 1
@@ -95,21 +108,65 @@ PENS = {
     'failure': graphics.create_pen(200, 0, 0),
     'queued': graphics.create_pen(0, 40, 120),
     'cancelled': graphics.create_pen(45, 45, 45),
-    # in_progress is drawn with a pulse, built per frame
+    # Run cells build their own pulsing amber per frame; this static one is for
+    # anything that needs an in-progress colour without animating — the repo
+    # pips. Without it `PENS.get('in_progress')` fell through to unknown, and a
+    # building repo's pip rendered blue as if we had no data on it.
+    'in_progress': graphics.create_pen(200, 140, 0),
 }
 PEN_UNKNOWN = PENS['unknown']
 PEN_TICK = graphics.create_pen(40, 40, 40)
 PEN_EMPTY = graphics.create_pen(6, 6, 6)   # a cell that exists but has no data
 
-# Repo tag hues — deliberately not status colours, so the left edge never reads
-# as health. Same order as the centipede rows.
-REPO_TAGS = [
-    graphics.create_pen(0, 70, 70),     # teal
-    graphics.create_pen(70, 0, 70),     # magenta
-    graphics.create_pen(60, 60, 60),    # white
-    graphics.create_pen(80, 40, 0),     # amber-brown
-    graphics.create_pen(40, 0, 80),     # violet
-]
+PEN_LETTER = graphics.create_pen(120, 120, 120)
+PEN_SEP = graphics.create_pen(25, 25, 25)
+
+# Dim twins of the run colours, for the pips of repos that are not on screen.
+PIPS_DIM = {
+    'success': graphics.create_pen(0, 45, 0),
+    'failure': graphics.create_pen(60, 0, 0),
+    'in_progress': graphics.create_pen(55, 38, 0),
+    'queued': graphics.create_pen(0, 12, 35),
+    'cancelled': graphics.create_pen(18, 18, 18),
+}
+
+# A 3x5 uppercase font: one entry per letter, five rows of three bits, MSB left.
+# Hand-rolled because PicoGraphics' smallest bitmap font is 6px tall and the CI
+# band is 5 — and because the whole alphabet is here, so a repo renamed in
+# `status.ci.repos` still gets a correct initial instead of a placeholder.
+FONT_3X5 = {
+    'A': (0b010, 0b101, 0b111, 0b101, 0b101),
+    'B': (0b110, 0b101, 0b110, 0b101, 0b110),
+    'C': (0b011, 0b100, 0b100, 0b100, 0b011),
+    'D': (0b110, 0b101, 0b101, 0b101, 0b110),
+    'E': (0b111, 0b100, 0b110, 0b100, 0b111),
+    'F': (0b111, 0b100, 0b110, 0b100, 0b100),
+    'G': (0b011, 0b100, 0b101, 0b101, 0b011),
+    'H': (0b101, 0b101, 0b111, 0b101, 0b101),
+    'I': (0b111, 0b010, 0b010, 0b010, 0b111),
+    'J': (0b001, 0b001, 0b001, 0b101, 0b010),
+    'K': (0b101, 0b101, 0b110, 0b101, 0b101),
+    'L': (0b100, 0b100, 0b100, 0b100, 0b111),
+    'M': (0b101, 0b111, 0b111, 0b101, 0b101),
+    'N': (0b101, 0b111, 0b111, 0b111, 0b101),
+    'O': (0b010, 0b101, 0b101, 0b101, 0b010),
+    'P': (0b110, 0b101, 0b110, 0b100, 0b100),
+    'Q': (0b010, 0b101, 0b101, 0b111, 0b011),
+    'R': (0b110, 0b101, 0b110, 0b101, 0b101),
+    'S': (0b011, 0b100, 0b010, 0b001, 0b110),
+    'T': (0b111, 0b010, 0b010, 0b010, 0b010),
+    'U': (0b101, 0b101, 0b101, 0b101, 0b011),
+    'V': (0b101, 0b101, 0b101, 0b101, 0b010),
+    'W': (0b101, 0b101, 0b111, 0b111, 0b101),
+    'X': (0b101, 0b101, 0b010, 0b101, 0b101),
+    'Y': (0b101, 0b101, 0b010, 0b010, 0b010),
+    'Z': (0b111, 0b001, 0b010, 0b100, 0b111),
+    '?': (0b110, 0b001, 0b010, 0b000, 0b010),
+}
+
+# Worst-first ranking for a repo's pip: one failure in the window outranks
+# anything in flight, and `cancelled` never counts as bad.
+RUN_RANK = {'failure': 3, 'in_progress': 2, 'queued': 1, 'success': 0, 'cancelled': 0}
 
 # Region ordering, west to east, so US sits left of EU like a map. Unknown
 # regions sort after the known ones, alphabetically — a new region just appears.
@@ -130,6 +187,7 @@ regions = []      # ordered [{'key','name','services':{...}}]
 grid = {}         # (row_index, block_index) -> [status, ...]
 blocks = []       # ordered block keys: region keys, then 'global'
 centipedes = []   # [(repo, [run_state, ...])]
+ci_index = 0      # which repo the band is showing right now
 
 last_status_ok_ms = None
 last_ci_ok_ms = None
@@ -259,7 +317,7 @@ def parse_status(data):
 def parse_ci(data):
     global centipedes
     out = []
-    for entry in (data.get('repos') or [])[:CI_ROWS]:
+    for entry in (data.get('repos') or [])[:MAX_REPOS]:
         out.append((entry.get('repo', '?'), entry.get('runs') or []))
     centipedes = out
 
@@ -364,31 +422,80 @@ def pulse_pen(phase):
     return graphics.create_pen(int(210 * v), int(140 * v), 0)
 
 
-def draw_centipedes(phase):
+def repo_letter(name):
+    """`CIRISVerify` -> `V`. The CIRIS prefix is on every repo, so it carries no
+    information; the letter after it is what tells them apart."""
+    n = name.upper()
+    if n.startswith('CIRIS'):
+        n = n[5:]
+    return n[0] if n else '?'
+
+
+def draw_letter(x, y, ch, pen):
+    graphics.set_pen(pen)
+    rows = FONT_3X5.get(ch, FONT_3X5['?'])
+    for dy, bits in enumerate(rows):
+        for dx in range(LETTER_W):
+            if bits & (1 << (LETTER_W - 1 - dx)):
+                graphics.pixel(x + dx, y + dy)
+
+
+def repo_state(runs):
+    """The one state that describes a repo's window — worst wins."""
+    worst, rank = None, -1
+    for s in runs:
+        r = RUN_RANK.get(s, 0)
+        if r > rank:
+            worst, rank = s, r
+    return worst
+
+
+def draw_ci_band(phase):
+    """One repo, drawn large: letter, separator, ten 4x5 run blocks."""
     blue = ci_stale()
     pulse = pulse_pen(phase)
-    for row in range(CI_ROWS):
-        y = CI_ROW0 + row
-        if row < len(centipedes):
-            bar(0, y, TAG_W, REPO_TAGS[row % len(REPO_TAGS)])
-            runs = centipedes[row][1]
+
+    runs = []
+    letter = '?'
+    if centipedes:
+        name, runs = centipedes[ci_index % len(centipedes)]
+        letter = repo_letter(name)
+
+    draw_letter(0, CI_ROW0, letter, PEN_UNKNOWN if blue else PEN_LETTER)
+    graphics.set_pen(PEN_SEP)
+    for y in range(CI_ROW0, CI_ROW0 + CI_ROWS):
+        graphics.pixel(SEP_X, y)
+
+    for i in range(RUNS):
+        x = CI_X0 + i * (CELL_W + CELL_GAP)
+        if i < len(runs):
+            pen = PEN_UNKNOWN if blue else (
+                pulse if runs[i] == 'in_progress' else PENS.get(runs[i], PEN_UNKNOWN)
+            )
         else:
-            runs = []
-        for i in range(RUNS):
-            x = CI_X0 + i * (CELL_W + CELL_GAP)
-            if i < len(runs) and not blue:
-                state = runs[i]
-                pen = pulse if state == 'in_progress' else PENS.get(state, PEN_UNKNOWN)
-            else:
-                pen = PEN_UNKNOWN if (blue and i < len(runs)) else PEN_EMPTY
-            bar(x, y, CELL_W, pen)
+            pen = PEN_EMPTY          # a young repo draws a short centipede
+        graphics.set_pen(pen)
+        graphics.rectangle(x, CI_ROW0, CELL_W, CI_ROWS)
 
 
 def draw_divider():
-    """The separator carries the overall status — one glance, whole system."""
+    """Pips for every repo on the left, then the overall status as a dotted
+    line — so the cycling band never costs you sight of the other repos."""
+    blue = ci_stale()
+    for i in range(min(len(centipedes), MAX_REPOS)):
+        state = repo_state(centipedes[i][1])
+        if blue or state is None:
+            pen = PEN_UNKNOWN if blue else PEN_EMPTY
+        elif i == ci_index % max(1, len(centipedes)):
+            pen = PENS.get(state, PEN_UNKNOWN)          # current repo: bright
+        else:
+            pen = PIPS_DIM.get(state, PEN_EMPTY)
+        graphics.set_pen(pen)
+        graphics.pixel(i, DIVIDER_ROW)
+
     pen = PEN_UNKNOWN if stale() else PENS.get(overall, PEN_UNKNOWN)
     graphics.set_pen(pen)
-    for x in range(0, WIDTH, 2):
+    for x in range(GRID_X0, WIDTH, 2):
         graphics.pixel(x, DIVIDER_ROW)
 
 
@@ -426,7 +533,7 @@ def draw_health():
 def draw(phase):
     graphics.set_pen(PEN_BLACK)
     graphics.clear()
-    draw_centipedes(phase)
+    draw_ci_band(phase)
     draw_divider()
     draw_health()
     gu.update(graphics)
@@ -461,9 +568,11 @@ def main():
         splash(PENS['outage'])
         return
 
+    global ci_index
+
     refresh_status()
     refresh_ci()
-    last_status = last_ci = time.ticks_ms()
+    last_status = last_ci = last_cycle = time.ticks_ms()
 
     phase = 0.0
     while True:
@@ -475,6 +584,11 @@ def main():
             refresh_status()
             refresh_ci()
             last_status = last_ci = time.ticks_ms()
+        # B steps the band on demand, so you never have to wait out the cycle.
+        if gu.is_pressed(GalacticUnicorn.SWITCH_B) and centipedes:
+            ci_index = (ci_index + 1) % len(centipedes)
+            last_cycle = time.ticks_ms()
+            time.sleep_ms(150)      # crude debounce; the loop is 20 FPS
 
         now = time.ticks_ms()
         if time.ticks_diff(now, last_status) > STATUS_REFRESH_MS:
@@ -483,6 +597,9 @@ def main():
         if time.ticks_diff(now, last_ci) > CI_REFRESH_MS:
             refresh_ci()
             last_ci = now
+        if centipedes and time.ticks_diff(now, last_cycle) > CYCLE_MS:
+            ci_index = (ci_index + 1) % len(centipedes)
+            last_cycle = now
 
         phase += 0.16          # ~1.2s breath at 20 FPS
         draw(phase)
