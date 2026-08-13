@@ -215,8 +215,20 @@ pub(crate) fn fold_proxy(
     internal: &mut BTreeMap<String, ProviderDetail>,
     region_key: &str,
     body: &Value,
+    specs: &[capability::CapabilitySpec],
+    informational: &mut std::collections::BTreeSet<String>,
 ) {
     for p in upstream_providers(body) {
+        // Recorded HERE because this is the only place the upstream's `kind` is
+        // still in hand. A search provider excluded from its router by kind but
+        // represented by no capability is invisible when it fails — the hole
+        // this set exists to close.
+        if matches!(
+            capability::relation(specs, p.kind.as_deref(), &p.id),
+            capability::Relation::Informational
+        ) {
+            informational.insert(p.id.clone());
+        }
         let d = detail(&p.status, p.latency_ms, format!("cirisproxy.{region_key}"));
         if is_shared_llm(&p) {
             merge_worst(llm, p.id, d);
@@ -386,6 +398,8 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
             transport_failures += 1;
         }
     };
+    // Providers the fold classified as routable-but-undeclared.
+    let mut informational_ids: std::collections::BTreeSet<String> = Default::default();
     let mut regions: BTreeMap<String, RegionStatus> = BTreeMap::new();
     let mut infrastructure: BTreeMap<String, InfrastructureStatus> = BTreeMap::new();
     let mut llm: BTreeMap<String, ProviderDetail> = BTreeMap::new();
@@ -448,7 +462,14 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
                 },
             );
             if let Some(b) = &body {
-                fold_proxy(&mut llm, &mut internal, region.key, b);
+                fold_proxy(
+                    &mut llm,
+                    &mut internal,
+                    region.key,
+                    b,
+                    specs,
+                    &mut informational_ids,
+                );
             }
         }
 
@@ -546,22 +567,13 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
     // a provider out of its router's verdict would make its failure invisible
     // everywhere — exclusion without representation.
     for (id, d) in llm.iter().chain(internal.iter()) {
-        if capabilities
-            .values()
-            .any(|c| c.members.iter().any(|m| &m.id == id))
-        {
+        if !informational_ids.contains(id) {
             continue;
         }
-        if matches!(
-            capability::relation(specs, None, id),
-            capability::Relation::Informational
-        ) || llm.contains_key(id)
-        {
-            capabilities.insert(
-                format!("provider.{id}"),
-                capability::informational(id, &d.status),
-            );
-        }
+        capabilities.insert(
+            format!("provider.{id}"),
+            capability::informational(id, &d.status),
+        );
     }
 
     // Regions and infrastructure are singletons — no pooling across regions
@@ -795,8 +807,30 @@ mod tests {
     fn live_proxy_payload_surfaces_the_cause_of_degraded() {
         let mut llm = BTreeMap::new();
         let mut internal = BTreeMap::new();
-        fold_proxy(&mut llm, &mut internal, "us", &proxy_body(177, 177));
-        fold_proxy(&mut llm, &mut internal, "eu", &proxy_body(509, 624));
+        let specs = crate::capability::default_specs();
+        let mut info = std::collections::BTreeSet::new();
+        fold_proxy(
+            &mut llm,
+            &mut internal,
+            "us",
+            &proxy_body(177, 177),
+            &specs,
+            &mut info,
+        );
+        fold_proxy(
+            &mut llm,
+            &mut internal,
+            "eu",
+            &proxy_body(509, 624),
+            &specs,
+            &mut info,
+        );
+        // Together and Brave are routable but in no declared chain: recorded as
+        // informational so their failures are represented somewhere, rather than
+        // excluded from their router and then invisible.
+        assert!(info.contains("together") && info.contains("brave"));
+        assert!(!info.contains("groq"), "declared member, not informational");
+        assert!(!info.contains("billing"), "nothing else serves it");
 
         // Every LLM provider is visible, bare-keyed, one row per provider.
         assert_eq!(
