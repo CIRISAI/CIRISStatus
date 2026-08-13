@@ -1,35 +1,31 @@
 """
-CIRIS status board - Pimoroni Galactic Unicorn (53x11)
+CIRIS status board - Pimoroni Galactic Unicorn, mounted PORTRAIT
 
-Two sections, fixed positions, nothing floats:
+The panel is 53x11 in hardware. Mounted on its end (USB/power at the bottom)
+you get an 11-wide, 53-tall board, and everything here is written in those
+viewer coordinates — `vpixel`/`vrect` rotate into panel space on the way out.
+Getting this backwards is what made the first version unreadable: five 1px-tall
+rows and a letter drawn sideways.
 
-  rows 0-4   CENTIPEDE - ONE repo's last 10 CI runs as chunky 4x5 blocks,
-             oldest at the left, newest at the leading edge. A 3x5 letter names
-             the repo (V/P/E/S/A = verify, persist, edge, server, agent) with a
-             1px separator. Cycles through the repos every few seconds.
+  vy  0-39   CENTIPEDES - one band per repo, five of them, no cycling:
+             a 3x5 letter naming the repo (V/P/E/S/A = verify, persist, edge,
+             server, agent), a state pip on the right of the letter line, then
+             all 10 CI runs as a full-width bar directly beneath — oldest at
+             the left, newest at the right.
+  vy  40     divider, lit in the colour of the OVERALL status
+  vy  42-51  HEALTH GRID - static. Three column blocks ordered west to east:
+             US, EU, then GLOBAL for what belongs to no region. Rows are, top
+             to bottom: billing, proxy, databases, providers, infrastructure.
 
-             Five rows of 1px each would fit all five repos at once, but a
-             letter needs 5 rows of height — so the board shows one repo large
-             and legible instead of five rows you cannot tell apart.
-
-  row  5     divider: five pips on the left, one per repo, coloured by that
-             repo's worst run in the window (the current repo's pip is bright,
-             so you can see all five at a glance and which one is on screen);
-             then a dotted line in the colour of the OVERALL status.
-  rows 6-10  HEALTH GRID - static. Regions are column blocks ordered west to
-             east (US left of EU, like a map), then a GLOBAL block for things
-             that belong to no region. A tick gutter on the far left says which
-             row is which: 1 tick = billing, 2 = proxy, 3 = database,
-             4 = providers, 5 = infrastructure.
-
-Run colours   green success | red failure | pulsing amber in-progress |
-              dim blue queued | grey cancelled
+Run colours    green success | red failure | pulsing amber in-progress |
+               dim blue queued | grey cancelled
 Health colours green operational | amber degraded | red outage | dim blue unknown
 
 Only in-progress CI cells animate. The health grid never moves.
 
 Flash: copy to the Pico W as main.py alongside a secrets.py with WIFI_SSID /
-WIFI_PASSWORD. Buttons: A = refresh now, B = next repo, LUX +/- = brightness.
+WIFI_PASSWORD. Buttons: A = refresh now, C = flip orientation 180 (persisted),
+LUX +/- = brightness.
 """
 
 import network
@@ -64,38 +60,78 @@ STALE_AFTER_MS = 3 * STATUS_REFRESH_MS
 BRIGHTNESS = 0.5
 
 # =============================================================================
-# DISPLAY
+# DISPLAY + ORIENTATION
 # =============================================================================
 
 gu = GalacticUnicorn()
 graphics = PicoGraphics(DISPLAY_GALACTIC_UNICORN)
 
-WIDTH = GalacticUnicorn.WIDTH    # 53
-HEIGHT = GalacticUnicorn.HEIGHT  # 11
+PANEL_W = GalacticUnicorn.WIDTH    # 53 — the long axis, horizontal in hardware
+PANEL_H = GalacticUnicorn.HEIGHT   # 11
+VW, VH = PANEL_H, PANEL_W          # 11 x 53 as the board is actually mounted
 
-# ── Layout ───────────────────────────────────────────────────────────────────
-CI_ROW0 = 0
-CI_ROWS = 5           # band height — also the height of a letter
-DIVIDER_ROW = 5
-HEALTH_ROW0 = 6
-HEALTH_ROWS = 5
+ORIENT_FILE = 'orientation.txt'
 
-LETTER_W = 3          # 3x5 glyph, the smallest that stays legible
-SEP_X = LETTER_W      # 1px separator column right after the letter
-CI_X0 = LETTER_W + 1  # exactly "letter + separator", nothing wasted
+
+def load_orientation():
+    """`True` rotates clockwise, `False` counter-clockwise.
+
+    The default is CCW: the Pico's USB sits at the panel's left end in native
+    landscape, so standing the board up with the connector at the BOTTOM is a
+    counter-clockwise rotation. (Assuming otherwise is what put the first
+    portrait build upside down.) Persisted, so a flip survives a power cycle and
+    a board mounted the other way up is fixed with button C, not a reflash.
+    """
+    try:
+        with open(ORIENT_FILE) as f:
+            return f.read().strip() == 'cw'
+    except OSError:
+        return False
+
+
+def save_orientation(cw):
+    try:
+        with open(ORIENT_FILE, 'w') as f:
+            f.write('cw' if cw else 'ccw')
+    except OSError:
+        pass
+
+
+rotate_cw = load_orientation()
+
+
+def vrect(x, y, w, h, pen):
+    """Draw a rect in VIEWER coordinates. Rotation maps rectangles to
+    rectangles, so this stays one native call rather than a pixel loop."""
+    if w <= 0 or h <= 0:
+        return
+    graphics.set_pen(pen)
+    if rotate_cw:
+        # viewer down = panel +x, viewer right = panel -y
+        graphics.rectangle(y, PANEL_H - x - w, h, w)
+    else:
+        graphics.rectangle(PANEL_W - y - h, x, h, w)
+
+
+def vpixel(x, y, pen):
+    vrect(x, y, 1, 1, pen)
+
+
+# ── Layout, in viewer coordinates ────────────────────────────────────────────
+LETTER_W = 3
+LETTER_H = 5
+RUNS_H = 2                      # run bar height
+BAND_H = LETTER_H + 1 + RUNS_H  # 8 rows per repo
+CI_BANDS = 5
 RUNS = 10
-CELL_W = 4            # 10 cells of 4px + 9 gaps = 49px: x=4..52, flush right
-CELL_GAP = 1
 
-MAX_REPOS = 5         # as many pips as fit in the letter+separator width
-CYCLE_MS = 4000       # dwell per repo
-
-GUTTER_W = 5          # up to 5 ticks
-GRID_X0 = GUTTER_W + 1
+DIVIDER_Y = CI_BANDS * BAND_H   # 40
+HEALTH_Y0 = DIVIDER_Y + 2       # 42
+HEALTH_ROW_H = 2
+HEALTH_ROWS = 5                 # billing, proxy, db, providers, infra
 
 PEN_BLACK = graphics.create_pen(0, 0, 0)
 
-# Health / run status colours.
 PENS = {
     'operational': graphics.create_pen(0, 170, 0),
     'degraded': graphics.create_pen(190, 130, 0),
@@ -109,31 +145,19 @@ PENS = {
     'queued': graphics.create_pen(0, 40, 120),
     'cancelled': graphics.create_pen(45, 45, 45),
     # Run cells build their own pulsing amber per frame; this static one is for
-    # anything that needs an in-progress colour without animating — the repo
-    # pips. Without it `PENS.get('in_progress')` fell through to unknown, and a
-    # building repo's pip rendered blue as if we had no data on it.
+    # anything needing the colour without animating (the per-repo pip). Without
+    # it `PENS.get('in_progress')` fell through to unknown-blue, reporting no
+    # data on a repo that was simply building.
     'in_progress': graphics.create_pen(200, 140, 0),
 }
 PEN_UNKNOWN = PENS['unknown']
-PEN_TICK = graphics.create_pen(40, 40, 40)
-PEN_EMPTY = graphics.create_pen(6, 6, 6)   # a cell that exists but has no data
+PEN_EMPTY = graphics.create_pen(6, 6, 6)     # a cell that exists but has no data
+PEN_LETTER = graphics.create_pen(150, 150, 150)
 
-PEN_LETTER = graphics.create_pen(120, 120, 120)
-PEN_SEP = graphics.create_pen(25, 25, 25)
-
-# Dim twins of the run colours, for the pips of repos that are not on screen.
-PIPS_DIM = {
-    'success': graphics.create_pen(0, 45, 0),
-    'failure': graphics.create_pen(60, 0, 0),
-    'in_progress': graphics.create_pen(55, 38, 0),
-    'queued': graphics.create_pen(0, 12, 35),
-    'cancelled': graphics.create_pen(18, 18, 18),
-}
-
-# A 3x5 uppercase font: one entry per letter, five rows of three bits, MSB left.
-# Hand-rolled because PicoGraphics' smallest bitmap font is 6px tall and the CI
-# band is 5 — and because the whole alphabet is here, so a repo renamed in
-# `status.ci.repos` still gets a correct initial instead of a placeholder.
+# A 3x5 uppercase font: five rows of three bits, MSB leftmost. Hand-rolled
+# because PicoGraphics' smallest bitmap font is 6px tall. Covers A-Z, not just
+# the five initials we ship, so a repo added to `status.ci.repos` still gets a
+# correct letter instead of a placeholder.
 FONT_3X5 = {
     'A': (0b010, 0b101, 0b111, 0b101, 0b101),
     'B': (0b110, 0b101, 0b110, 0b101, 0b110),
@@ -187,7 +211,6 @@ regions = []      # ordered [{'key','name','services':{...}}]
 grid = {}         # (row_index, block_index) -> [status, ...]
 blocks = []       # ordered block keys: region keys, then 'global'
 centipedes = []   # [(repo, [run_state, ...])]
-ci_index = 0      # which repo the band is showing right now
 
 last_status_ok_ms = None
 last_ci_ok_ms = None
@@ -220,16 +243,15 @@ def ci_stale():
 # =============================================================================
 
 def block_spans(n):
-    """Split the grid area into n column blocks, 1px apart, remainder spread
-    across the leftmost blocks so the row always reaches the right edge."""
+    """Split the width into n column blocks 1px apart, remainder to the
+    leftmost, so the row always reaches the right edge."""
     if n <= 0:
         return []
-    span = WIDTH - GRID_X0
-    inner = span - (n - 1)
-    if inner < n:            # more blocks than pixels; degrade to 1px each
-        return [(GRID_X0 + i, 1) for i in range(min(n, span))]
+    inner = VW - (n - 1)
+    if inner < n:
+        return [(i, 1) for i in range(min(n, VW))]
     w, extra = inner // n, inner % n
-    out, x = [], GRID_X0
+    out, x = [], 0
     for i in range(n):
         bw = w + (1 if i < extra else 0)
         out.append((x, bw))
@@ -282,7 +304,6 @@ def parse_status(data):
         b = idx.get(block, idx['global'])
         g.setdefault((row, b), []).append(status)
 
-    # Rows 0/1 — the regional services.
     for r in regions:
         svcs = r['services']
         for row, name in ((0, 'billing'), (1, 'proxy')):
@@ -301,7 +322,6 @@ def parse_status(data):
     for name in sorted((data.get('llm_providers') or {}).keys()):
         put(3, 'global', _status_of(data['llm_providers'][name]))
 
-    # Row 4 — infrastructure under the region it hosts, plus global auth.
     by_name = {}
     for r in regions:
         by_name[r['name']] = r['key']
@@ -317,7 +337,7 @@ def parse_status(data):
 def parse_ci(data):
     global centipedes
     out = []
-    for entry in (data.get('repos') or [])[:MAX_REPOS]:
+    for entry in (data.get('repos') or [])[:CI_BANDS]:
         out.append((entry.get('repo', '?'), entry.get('runs') or []))
     centipedes = out
 
@@ -409,19 +429,6 @@ def refresh_ci():
 # RENDER
 # =============================================================================
 
-def bar(x, y, w, pen):
-    if w <= 0:
-        return
-    graphics.set_pen(pen)
-    graphics.rectangle(x, y, w, 1)
-
-
-def pulse_pen(phase):
-    """Amber, breathing — what makes in-progress unmistakable next to queued."""
-    v = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(phase))
-    return graphics.create_pen(int(210 * v), int(140 * v), 0)
-
-
 def repo_letter(name):
     """`CIRISVerify` -> `V`. The CIRIS prefix is on every repo, so it carries no
     information; the letter after it is what tells them apart."""
@@ -432,12 +439,11 @@ def repo_letter(name):
 
 
 def draw_letter(x, y, ch, pen):
-    graphics.set_pen(pen)
     rows = FONT_3X5.get(ch, FONT_3X5['?'])
     for dy, bits in enumerate(rows):
         for dx in range(LETTER_W):
             if bits & (1 << (LETTER_W - 1 - dx)):
-                graphics.pixel(x + dx, y + dy)
+                vpixel(x + dx, y + dy, pen)
 
 
 def repo_state(runs):
@@ -450,101 +456,100 @@ def repo_state(runs):
     return worst
 
 
-def draw_ci_band(phase):
-    """One repo, drawn large: letter, separator, ten 4x5 run blocks."""
+def pulse_pen(phase):
+    """Amber, breathing — what makes in-progress unmistakable next to queued."""
+    v = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(phase))
+    return graphics.create_pen(int(210 * v), int(140 * v), 0)
+
+
+def draw_centipedes(phase):
+    """One band per repo: letter + state pip, then the 10-run bar beneath."""
     blue = ci_stale()
     pulse = pulse_pen(phase)
+    cell_w = VW // RUNS          # 1px per run at 11 wide
 
-    runs = []
-    letter = '?'
-    if centipedes:
-        name, runs = centipedes[ci_index % len(centipedes)]
-        letter = repo_letter(name)
-
-    draw_letter(0, CI_ROW0, letter, PEN_UNKNOWN if blue else PEN_LETTER)
-    graphics.set_pen(PEN_SEP)
-    for y in range(CI_ROW0, CI_ROW0 + CI_ROWS):
-        graphics.pixel(SEP_X, y)
-
-    for i in range(RUNS):
-        x = CI_X0 + i * (CELL_W + CELL_GAP)
-        if i < len(runs):
-            pen = PEN_UNKNOWN if blue else (
-                pulse if runs[i] == 'in_progress' else PENS.get(runs[i], PEN_UNKNOWN)
-            )
+    for band in range(CI_BANDS):
+        top = band * BAND_H
+        if band < len(centipedes):
+            name, runs = centipedes[band]
         else:
-            pen = PEN_EMPTY          # a young repo draws a short centipede
-        graphics.set_pen(pen)
-        graphics.rectangle(x, CI_ROW0, CELL_W, CI_ROWS)
+            name, runs = '?', []
+
+        draw_letter(0, top, repo_letter(name),
+                    PEN_UNKNOWN if blue else PEN_LETTER)
+
+        # State pip on the right of the letter line: the repo's worst run in the
+        # window, so a failure is visible without reading the bar.
+        state = repo_state(runs)
+        if state and not blue:
+            vrect(VW - 2, top + 1, 2, 3, PENS.get(state, PEN_UNKNOWN))
+        elif blue:
+            vpixel(VW - 1, top + 2, PEN_UNKNOWN)
+
+        runs_y = top + LETTER_H + 1
+        for i in range(RUNS):
+            if i < len(runs):
+                pen = PEN_UNKNOWN if blue else (
+                    pulse if runs[i] == 'in_progress'
+                    else PENS.get(runs[i], PEN_UNKNOWN)
+                )
+            else:
+                pen = PEN_EMPTY          # a young repo draws a short centipede
+            vrect(i * cell_w, runs_y, cell_w, RUNS_H, pen)
 
 
 def draw_divider():
-    """Pips for every repo on the left, then the overall status as a dotted
-    line — so the cycling band never costs you sight of the other repos."""
-    blue = ci_stale()
-    for i in range(min(len(centipedes), MAX_REPOS)):
-        state = repo_state(centipedes[i][1])
-        if blue or state is None:
-            pen = PEN_UNKNOWN if blue else PEN_EMPTY
-        elif i == ci_index % max(1, len(centipedes)):
-            pen = PENS.get(state, PEN_UNKNOWN)          # current repo: bright
-        else:
-            pen = PIPS_DIM.get(state, PEN_EMPTY)
-        graphics.set_pen(pen)
-        graphics.pixel(i, DIVIDER_ROW)
-
+    """The separator carries the overall status — one glance, whole system."""
     pen = PEN_UNKNOWN if stale() else PENS.get(overall, PEN_UNKNOWN)
-    graphics.set_pen(pen)
-    for x in range(GRID_X0, WIDTH, 2):
-        graphics.pixel(x, DIVIDER_ROW)
+    for x in range(0, VW, 2):
+        vpixel(x, DIVIDER_Y, pen)
 
 
 def draw_health():
     blue = stale()
     spans = block_spans(len(blocks))
     for row in range(HEALTH_ROWS):
-        y = HEALTH_ROW0 + row
-
-        # Tick gutter: this row's index, countable at a glance.
-        graphics.set_pen(PEN_TICK)
-        for t in range(row + 1):
-            graphics.pixel(t, y)
-
+        y = HEALTH_Y0 + row * HEALTH_ROW_H
         for b, (bx, bw) in enumerate(spans):
             cells = grid.get((row, b), [])
             if not cells:
                 continue
             n = len(cells)
-            # Sub-cells share the block, 1px apart when there is room.
-            gap = 1 if n > 1 and bw >= 2 * n else 0
-            inner = bw - gap * (n - 1)
-            w = inner // n
-            if w < 1:
-                w, gap = 1, 0
-            extra = inner - w * n if w >= 1 else 0
+            w = max(1, bw // n)
+            extra = bw - w * n
             x = bx
             for i, status in enumerate(cells):
                 cw = w + (1 if i < extra else 0)
-                pen = PEN_UNKNOWN if blue else PENS.get(status, PEN_UNKNOWN)
-                bar(x, y, cw, pen)
-                x += cw + gap
+                if x + cw > bx + bw:
+                    cw = bx + bw - x
+                if cw <= 0:
+                    break
+                vrect(x, y, cw, HEALTH_ROW_H,
+                      PEN_UNKNOWN if blue else PENS.get(status, PEN_UNKNOWN))
+                x += cw
 
 
 def draw(phase):
     graphics.set_pen(PEN_BLACK)
     graphics.clear()
-    draw_ci_band(phase)
+    draw_centipedes(phase)
     draw_divider()
     draw_health()
     gu.update(graphics)
 
 
+# An arrow pointing UP in viewer coordinates: if it points any other way, the
+# orientation constant is wrong — press C to flip it.
+ARROW = (0b00100, 0b01110, 0b11111, 0b00100, 0b00100, 0b00100)
+
+
 def splash(pen):
     graphics.set_pen(PEN_BLACK)
     graphics.clear()
-    graphics.set_pen(pen)
-    for x in range(10, WIDTH - 10):
-        graphics.pixel(x, HEIGHT // 2)
+    for dy, bits in enumerate(ARROW):
+        for dx in range(5):
+            if bits & (1 << (4 - dx)):
+                vpixel(3 + dx, 4 + dy, pen)
     gu.update(graphics)
 
 
@@ -553,10 +558,13 @@ def splash(pen):
 # =============================================================================
 
 def main():
+    global rotate_cw
+
     log("=" * 46)
-    log("CIRIS status board  %dx%d" % (WIDTH, HEIGHT))
-    log("  rows 0-4 CI centipedes   row 5 overall   rows 6-10 health")
-    log("  ticks: 1=billing 2=proxy 3=database 4=providers 5=infra")
+    log("CIRIS status board  %dx%d viewer (%dx%d panel, rot=%s)"
+        % (VW, VH, PANEL_W, PANEL_H, 'cw' if rotate_cw else 'ccw'))
+    log("  bands: V=verify P=persist E=edge S=server A=agent")
+    log("  health rows: billing, proxy, database, providers, infra")
     log("  %s" % STATUS_URL)
     log("  %s" % CI_URL)
     log("=" * 46)
@@ -568,11 +576,9 @@ def main():
         splash(PENS['outage'])
         return
 
-    global ci_index
-
     refresh_status()
     refresh_ci()
-    last_status = last_ci = last_cycle = time.ticks_ms()
+    last_status = last_ci = time.ticks_ms()
 
     phase = 0.0
     while True:
@@ -584,11 +590,13 @@ def main():
             refresh_status()
             refresh_ci()
             last_status = last_ci = time.ticks_ms()
-        # B steps the band on demand, so you never have to wait out the cycle.
-        if gu.is_pressed(GalacticUnicorn.SWITCH_B) and centipedes:
-            ci_index = (ci_index + 1) % len(centipedes)
-            last_cycle = time.ticks_ms()
-            time.sleep_ms(150)      # crude debounce; the loop is 20 FPS
+        # C flips the board 180 and remembers it — so a board mounted the other
+        # way up is fixed by pressing a button, not by reflashing.
+        if gu.is_pressed(GalacticUnicorn.SWITCH_C):
+            rotate_cw = not rotate_cw
+            save_orientation(rotate_cw)
+            log("orientation: %s" % ('cw' if rotate_cw else 'ccw'))
+            time.sleep_ms(300)
 
         now = time.ticks_ms()
         if time.ticks_diff(now, last_status) > STATUS_REFRESH_MS:
@@ -597,9 +605,6 @@ def main():
         if time.ticks_diff(now, last_ci) > CI_REFRESH_MS:
             refresh_ci()
             last_ci = now
-        if centipedes and time.ticks_diff(now, last_cycle) > CYCLE_MS:
-            ci_index = (ci_index + 1) % len(centipedes)
-            last_cycle = now
 
         phase += 0.16          # ~1.2s breath at 20 FPS
         draw(phase)
