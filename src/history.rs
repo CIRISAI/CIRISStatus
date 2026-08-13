@@ -9,10 +9,15 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::config::Config;
-use crate::model::{HistoryDay, HistoryRegion, ServiceUptime, StatusEvent};
+use crate::model::{CapabilitySli, HistoryDay, HistoryRegion, ServiceUptime, StatusEvent, OUTAGE};
 use crate::probe::{check_grafana, check_postgres_tcp, fetch_service_status, Probe};
 
 pub type Db = Arc<Mutex<Connection>>;
+
+/// Rows recorded for ATTRIBUTION, never for arithmetic: one per reporting
+/// region for a provider that several regions can see. Excluded from every
+/// uptime rollup — they are extra views of one component, not extra components.
+pub const OBSERVATION_SERVICE: &str = "observation";
 
 pub fn init(path: &str) -> Result<Db> {
     let conn = Connection::open(path)?;
@@ -37,10 +42,13 @@ pub fn init(path: &str) -> Result<Db> {
             ts        TEXT NOT NULL,
             component TEXT NOT NULL,
             from_status TEXT NOT NULL,
-            to_status TEXT NOT NULL
+            to_status TEXT NOT NULL,
+            capability TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_status_events_ts ON status_events(ts);",
     )?;
+    // Additive column on an existing table; harmless when it already exists.
+    let _ = conn.execute("ALTER TABLE status_events ADD COLUMN capability TEXT", []);
     normalize_legacy_provider_names(&conn);
     purge_unmonitored_brave_rows(&conn);
     refile_legacy_llm_rows(&conn);
@@ -218,20 +226,165 @@ pub fn record_events(db: &Db, events: &[StatusEvent]) -> Result<usize> {
     let tx = guard.transaction()?;
     for e in events {
         tx.execute(
-            "INSERT INTO status_events (ts, component, from_status, to_status)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![e.ts, e.component, e.from, e.to],
+            "INSERT INTO status_events (ts, component, from_status, to_status, capability)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![e.ts, e.component, e.from, e.to, e.capability],
         )?;
     }
     tx.commit()?;
     Ok(events.len())
 }
 
+/// A capability's availability per day, computed by EXACT overlap.
+///
+/// Every row in a poll cycle shares one timestamp, so "were enough members up
+/// AT THE SAME INSTANT" is a `GROUP BY ts` — we hold the raw samples, so we
+/// measure the overlap instead of bounding it. A consumer working from daily
+/// rollups can only say "capability uptime is at least the best member's";
+/// this says what it was (FSD §2.4).
+pub fn query_capability_sli(
+    db: &Db,
+    days: i64,
+    spec: &crate::capability::CapabilitySpec,
+) -> Result<BTreeMap<String, f64>> {
+    if spec.members.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let conn = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
+    let placeholders = spec
+        .members
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let obs = OBSERVATION_SERVICE;
+    let sql = format!(
+        "SELECT day, AVG(CASE WHEN available >= ?1 THEN 100.0 ELSE 0.0 END) AS sli FROM (
+             SELECT date(ts) AS day, ts,
+                    -- DISTINCT: a provider several regions report is still ONE
+                    -- member. Counting rows let `available` exceed the member
+                    -- count and satisfy a threshold that was never met.
+                    COUNT(DISTINCT CASE WHEN status = 'operational'
+                                        THEN provider_name END) AS available
+             FROM status_checks
+             WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND service_name <> '{obs}'
+               AND provider_name IN ({placeholders})
+             GROUP BY ts)
+         GROUP BY day"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(spec.min_available.max(1) as i64),
+        Box::new(format!("-{days} days")),
+    ];
+    for (id, _) in &spec.members {
+        params.push(Box::new(id.clone()));
+    }
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt
+        .query_map(refs.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().collect())
+}
+
+/// `/api/v1/status/vantage` — where the vantages disagreed.
+///
+/// Every region's proxy reports the same external providers, so we hold several
+/// independent views of one component. Agreement implicates the component;
+/// disagreement implicates the path. This is the query that answers "is it them
+/// or is it us" from our own data, without asking a vendor status page that
+/// half of them do not publish.
+pub fn query_vantage(db: &Db, days: i64) -> Result<Vec<crate::model::VantageRow>> {
+    let conn = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
+    let since = format!("-{days} days");
+
+    let mut stmt = conn.prepare(
+        "SELECT day, provider_name, COUNT(*) AS samples,
+                SUM(CASE WHEN distinct_statuses > 1 THEN 1 ELSE 0 END) AS disagreements
+         FROM (
+            SELECT date(ts) AS day, ts, provider_name,
+                   COUNT(DISTINCT status) AS distinct_statuses
+            FROM status_checks
+            WHERE service_name = ?1
+              AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+            GROUP BY ts, provider_name)
+         GROUP BY day, provider_name
+         ORDER BY day DESC, provider_name",
+    )?;
+    let base = stmt
+        .query_map(rusqlite::params![OBSERVATION_SERVICE, since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Only instants where the vantages DISAGREED. Counting every
+    // non-operational sample meant a universally-agreed outage reported one
+    // "dissent" per observer per sample — swamping the samples that actually
+    // differed, which are the only ones that localise a fault to a path.
+    let mut dissent = conn.prepare(
+        "SELECT c.day, c.provider_name, c.region, COUNT(*)
+         FROM (
+            SELECT date(ts) AS day, ts, provider_name, region, status
+            FROM status_checks
+            WHERE service_name = ?1
+              AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)) AS c
+         JOIN (
+            SELECT ts, provider_name
+            FROM status_checks
+            WHERE service_name = ?1
+              AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+            GROUP BY ts, provider_name
+            HAVING COUNT(DISTINCT status) > 1) AS d
+           ON d.ts = c.ts AND d.provider_name = c.provider_name
+         WHERE c.status <> 'operational'
+         GROUP BY c.day, c.provider_name, c.region",
+    )?;
+    let mut by_key: BTreeMap<(String, String), BTreeMap<String, i64>> = BTreeMap::new();
+    for row in dissent.query_map(rusqlite::params![OBSERVATION_SERVICE, since], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })? {
+        let (day, component, region, bad) = row?;
+        by_key
+            .entry((day, component))
+            .or_default()
+            .insert(region, bad);
+    }
+
+    Ok(base
+        .into_iter()
+        .map(
+            |(date, component, samples, disagreements)| crate::model::VantageRow {
+                dissent_by_vantage: by_key
+                    .get(&(date.clone(), component.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
+                date,
+                component,
+                samples,
+                disagreements,
+            },
+        )
+        .collect())
+}
+
 /// `/api/v1/status/events` — transitions newest-first within the window.
 pub fn query_events(db: &Db, days: i64, limit: i64) -> Result<Vec<StatusEvent>> {
     let conn = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT ts, component, from_status, to_status FROM status_events
+        "SELECT ts, component, from_status, to_status, capability FROM status_events
          WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)
          ORDER BY ts DESC, id DESC LIMIT ?2",
     )?;
@@ -242,6 +395,7 @@ pub fn query_events(db: &Db, days: i64, limit: i64) -> Result<Vec<StatusEvent>> 
                 component: r.get(1)?,
                 from: r.get(2)?,
                 to: r.get(3)?,
+                capability: r.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -268,27 +422,39 @@ fn record(conn: &Connection, ts: &str, service: &str, provider: &str, region: &s
 pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut rows: Vec<(String, String, String, Probe)> = Vec::new();
+    // EVERY probe counts toward the vantage verdict, local ones included:
+    // counting only the regional requests meant three failed regional probes
+    // could declare a monitor-network failure and clear a local row that had
+    // just succeeded — proving the network worked.
+    let (mut attempted, mut transport_failures) = (0usize, 0usize);
+    // Cross-region providers, merged worst-wins into ONE row per cycle.
+    let mut cross_region: BTreeMap<String, (String, Option<i64>)> = BTreeMap::new();
+    // The same providers as each region actually saw them — kept for
+    // attribution, excluded from every rollup.
+    let mut observations: Vec<(String, String, String, Probe)> = Vec::new();
 
     if let Some(dsn) = &cfg.database_url {
-        rows.push((
-            "cirislens".into(),
-            "postgresql".into(),
-            "global".into(),
-            check_postgres_tcp(dsn).await,
-        ));
+        rows.push(("cirislens".into(), "postgresql".into(), "global".into(), {
+            let p = check_postgres_tcp(dsn).await;
+            attempted += 1;
+            transport_failures += usize::from(p.transport_error);
+            p
+        }));
     }
     if let Some(g) = &cfg.grafana_url {
-        rows.push((
-            "cirislens".into(),
-            "grafana".into(),
-            "global".into(),
-            check_grafana(client, g).await,
-        ));
+        rows.push(("cirislens".into(), "grafana".into(), "global".into(), {
+            let p = check_grafana(client, g).await;
+            attempted += 1;
+            transport_failures += usize::from(p.transport_error);
+            p
+        }));
     }
 
     for region in &cfg.regions {
         if let Some(url) = &region.billing_url {
-            let (probe, body) = fetch_service_status(client, url).await;
+            let (probe, body) = fetch_service_status(client, url, region.latency_baseline_ms).await;
+            attempted += 1;
+            transport_failures += usize::from(probe.transport_error);
             let providers = body
                 .as_ref()
                 .map(crate::aggregate::upstream_providers)
@@ -310,12 +476,16 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
                         status: leak(p.status),
                         latency_ms: p.latency_ms,
                         message: None,
+                        transport_error: false,
+                        upstream_status: None,
                     },
                 ));
             }
         }
         if let Some(url) = &region.proxy_url {
-            let (probe, body) = fetch_service_status(client, url).await;
+            let (probe, body) = fetch_service_status(client, url, region.latency_baseline_ms).await;
+            attempted += 1;
+            transport_failures += usize::from(probe.transport_error);
             let providers = body
                 .as_ref()
                 .map(crate::aggregate::upstream_providers)
@@ -327,30 +497,111 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
                 probe,
             ));
             for p in providers {
-                // LLM providers are cross-region → record under "global".
-                // Trust the upstream's own `type` first; the id list only
-                // covers an upstream that doesn't declare one.
+                // Cross-region providers are reported by EVERY region's proxy,
+                // so they need care in two directions.
                 let is_llm = p.kind.as_deref() == Some("llm")
                     || (p.kind.is_none()
                         && matches!(p.id.as_str(), "openrouter" | "groq" | "together" | "openai"));
-                let reg = if is_llm {
-                    "global".to_string()
+                if is_llm {
+                    // One canonical row per provider per cycle, worst-wins.
+                    // Writing one per reporting region — all labelled `global` —
+                    // duplicated the provider at the same timestamp, which
+                    // double-counts it in the daily mean and, worse, lets a
+                    // capability's `available` count exceed its member count and
+                    // satisfy a threshold that was never met.
+                    cross_region
+                        .entry(p.id.clone())
+                        .and_modify(|(st, lat)| {
+                            if crate::model::severity(&p.status) > crate::model::severity(st) {
+                                *st = p.status.clone();
+                                *lat = p.latency_ms;
+                            }
+                        })
+                        .or_insert((p.status.clone(), p.latency_ms));
+                    // AND keep this region's own view, under a service name the
+                    // rollups ignore. Agreement across regions implicates the
+                    // provider; disagreement implicates the path or our vantage.
+                    // Merging destroyed that signal — this is where it lives now.
+                    observations.push((
+                        OBSERVATION_SERVICE.to_string(),
+                        p.id,
+                        region.key.to_string(),
+                        Probe {
+                            status: leak(p.status),
+                            latency_ms: p.latency_ms,
+                            message: None,
+                            transport_error: false,
+                            upstream_status: None,
+                        },
+                    ));
                 } else {
-                    region.key.to_string()
-                };
-                rows.push((
-                    "cirisproxy".into(),
-                    p.id,
-                    reg,
-                    Probe {
-                        status: leak(p.status),
-                        latency_ms: p.latency_ms,
-                        message: None,
-                    },
-                ));
+                    rows.push((
+                        "cirisproxy".into(),
+                        p.id,
+                        region.key.to_string(),
+                        Probe {
+                            status: leak(p.status),
+                            latency_ms: p.latency_ms,
+                            message: None,
+                            transport_error: false,
+                            upstream_status: None,
+                        },
+                    ));
+                }
             }
         }
     }
+
+    for (id, (status, latency_ms)) in cross_region {
+        rows.push((
+            "cirisproxy".into(),
+            id,
+            "global".into(),
+            Probe {
+                status: leak(status),
+                latency_ms,
+                message: None,
+                transport_error: false,
+                upstream_status: None,
+            },
+        ));
+    }
+
+    // Every probe failed at the transport layer. Unrelated third parties on
+    // three continents do not fail in the same second; our network does. Record
+    // that, and record NOTHING about the components we could not see — writing
+    // them all down as outages is how a monitor's own flicker became four days
+    // of everyone else's downtime (FSD §3.3 / D3).
+    let blind = crate::probe::is_vantage_failure(attempted, transport_failures);
+    if !blind {
+        rows.extend(observations);
+    } else {
+        tracing::warn!(
+            attempted,
+            "all probes failed at transport — recording monitor.network, not a global outage"
+        );
+        rows.clear();
+    }
+    // Recorded on EVERY poll, healthy or not. Writing it only on failure would
+    // make it 0% uptime by construction — present exactly on the polls that
+    // failed, absent on every one that worked — and drag the daily mean, which
+    // is the identical defect this poller already fixed once for `service` rows.
+    rows.push((
+        "monitor".into(),
+        "network".into(),
+        "global".into(),
+        Probe {
+            status: if blind {
+                OUTAGE
+            } else {
+                crate::model::OPERATIONAL
+            },
+            latency_ms: None,
+            message: blind.then(|| "all probes failed at transport".to_string()),
+            transport_error: blind,
+            upstream_status: None,
+        },
+    ));
 
     if let Ok(conn) = db.lock() {
         for (service, provider, region, p) in &rows {
@@ -363,14 +614,33 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
 // Map the three known values to statics (anything else → "operational").
 fn leak(s: String) -> &'static str {
     match s.as_str() {
-        "degraded" => "degraded",
-        "outage" => "outage",
+        // The Statuspage spellings normalise here too. Passing them through to
+        // `operational` inflated provider uptime and every capability SLI while
+        // the live response correctly showed the member unhealthy — the same
+        // alias hole as the live fold, one write later.
+        "degraded" | "degraded_performance" => "degraded",
+        "outage" | "partial_outage" | "major_outage" => "outage",
         _ => "operational",
     }
 }
 
 /// `/api/v1/status/history` rollup: daily uptime per region/service/provider.
-pub fn query_history(db: &Db, days: i64, region: Option<&str>) -> Result<Vec<HistoryDay>> {
+pub fn query_history(
+    db: &Db,
+    days: i64,
+    region: Option<&str>,
+    specs: &[crate::capability::CapabilitySpec],
+) -> Result<Vec<HistoryDay>> {
+    // Capability SLIs are computed per spec across the whole window, then
+    // attached per day.
+    let mut sli_by_spec: Vec<(&crate::capability::CapabilitySpec, BTreeMap<String, f64>)> =
+        Vec::new();
+    for spec in specs {
+        match query_capability_sli(db, days, spec) {
+            Ok(m) => sli_by_spec.push((spec, m)),
+            Err(e) => tracing::warn!(error = %e, id = %spec.id, "capability SLI query failed"),
+        }
+    }
     let conn = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
     let since = format!("-{days} days");
     // `outages` counts INCIDENTS, not polls: a row is an incident only when the
@@ -390,7 +660,8 @@ pub fn query_history(db: &Db, days: i64, region: Option<&str>) -> Result<Vec<His
                        PARTITION BY region, service_name, provider_name ORDER BY ts
                    ) AS prev
             FROM status_checks
-            WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)",
+            WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)
+              AND service_name <> 'observation'",
     );
     if region.is_some() {
         sql.push_str(" AND region = ?2");
@@ -457,12 +728,69 @@ pub fn query_history(db: &Db, days: i64, region: Option<&str>) -> Result<Vec<His
         } else {
             mean_uptime(flat.values())
         };
+        let mut capabilities: BTreeMap<String, CapabilitySli> = BTreeMap::new();
+        for (spec, by_day) in &sli_by_spec {
+            if let Some(pct) = by_day.get(&date) {
+                capabilities.insert(
+                    spec.id.clone(),
+                    CapabilitySli {
+                        sli_pct: round1(*pct),
+                        min_available: spec.min_available.max(1),
+                        members: spec.members.iter().map(|(m, _)| m.clone()).collect(),
+                    },
+                );
+            }
+        }
+        // Service availability is the WORST capability, not the mean of
+        // components: a fabric is as available as the thing it can least do.
+        // The worst CAPABILITY, and nothing else. Folding in the component mean
+        // let a degraded non-capability component drag service uptime below
+        // 100% on a day when every capability was fully available — which is
+        // precisely the component-versus-service conflation this field exists
+        // to end. `overall` is the fallback only when no capability was
+        // measured at all.
+        // Pools contribute their SLI; everything else that is not a pool member
+        // contributes its own series, because a region or an infrastructure host
+        // has no alternative — it IS a capability of one. Without these, a day
+        // with a regional outage could report 100% service uptime while its own
+        // `status` said otherwise.
+        let pool_members: std::collections::BTreeSet<&str> = sli_by_spec
+            .iter()
+            .flat_map(|(spec, _)| spec.members.iter().map(|(m, _)| m.as_str()))
+            .collect();
+        let singleton_worst = flat
+            .iter()
+            .filter(|(key, _)| {
+                let provider = key.rsplit('.').next().unwrap_or("");
+                // Pool members are represented by their capability; informational
+                // providers are in nobody's serving path; `monitor.network` is
+                // about US, not about the fabric we report on.
+                !pool_members.contains(provider)
+                    && provider != "network"
+                    && !key.starts_with("global.observation")
+            })
+            .map(|(_, u)| u.uptime_pct)
+            .fold(f64::INFINITY, f64::min);
+
+        let service_uptime_pct = capabilities
+            .values()
+            .map(|c| c.sli_pct)
+            .chain(std::iter::once(singleton_worst).filter(|v| v.is_finite()))
+            .fold(f64::INFINITY, f64::min);
+        let service_uptime_pct = if service_uptime_pct.is_finite() {
+            service_uptime_pct
+        } else {
+            overall
+        };
+
         out.push(HistoryDay {
             date,
             regions,
             services: flat,
             overall_uptime_pct: overall,
             uptime_pct: overall,
+            capabilities,
+            service_uptime_pct: round1(service_uptime_pct),
             status: crate::model::day_status(overall),
         });
     }
@@ -496,7 +824,23 @@ mod repair_tests {
         dir.join("status.db").to_string_lossy().into_owned()
     }
 
-    fn insert(conn: &Connection, ts: &str, service: &str, provider: &str, status: &str) {
+    pub(super) fn insert_region(
+        conn: &Connection,
+        ts: &str,
+        service: &str,
+        provider: &str,
+        region: &str,
+        status: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO status_checks (ts, service_name, provider_name, region, status, latency_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 10)",
+            rusqlite::params![ts, service, provider, region, status],
+        )
+        .unwrap();
+    }
+
+    pub(super) fn insert(conn: &Connection, ts: &str, service: &str, provider: &str, status: &str) {
         conn.execute(
             "INSERT INTO status_checks (ts, service_name, provider_name, region, status, latency_ms)
              VALUES (?1, ?2, ?3, 'us', ?4, 10)",
@@ -544,7 +888,7 @@ mod repair_tests {
             }
         }
         let db = init(&path).unwrap();
-        let days = query_history(&db, 2, None).unwrap();
+        let days = query_history(&db, 2, None, &[]).unwrap();
         let day = days.iter().find(|d| d.date == today).expect("today");
         let row = day.services.values().next().expect("one series");
         assert_eq!(row.outage_count, 2, "two incidents, not six outage samples");
@@ -683,7 +1027,7 @@ mod repair_tests {
             );
         }
         let db = init(&path).unwrap();
-        let days = query_history(&db, 2, None).unwrap();
+        let days = query_history(&db, 2, None, &[]).unwrap();
         let day = days.iter().find(|d| d.date == today).expect("today");
         assert_eq!(day.uptime_pct, day.overall_uptime_pct);
         assert_eq!(day.status, "operational");
@@ -815,7 +1159,7 @@ mod repair_tests {
             }
         }
         let db = init(&path).unwrap();
-        let days = query_history(&db, 365, None).unwrap();
+        let days = query_history(&db, 365, None, &[]).unwrap();
         for day in &days {
             assert_eq!(
                 day.overall_uptime_pct,
@@ -852,12 +1196,14 @@ mod event_tests {
                         component: "eu.proxy".into(),
                         from: "operational".into(),
                         to: "degraded".into(),
+                        capability: None,
                     },
                     StatusEvent {
                         ts: now.clone(),
                         component: "llm.together".into(),
                         from: "operational".into(),
                         to: "degraded".into(),
+                        capability: None,
                     },
                 ],
             );
@@ -903,12 +1249,14 @@ mod event_tests {
                     component: "too.old".into(),
                     from: "operational".into(),
                     to: "degraded".into(),
+                    capability: None,
                 },
                 StatusEvent {
                     ts: recent,
                     component: "in.window".into(),
                     from: "operational".into(),
                     to: "degraded".into(),
+                    capability: None,
                 },
             ],
         );
@@ -944,6 +1292,263 @@ mod event_tests {
         );
     }
 
+    /// FSD §2.4 — the whole point of holding raw samples. Two members whose
+    /// downtime does NOT overlap means the capability was never actually down,
+    /// and we can say so exactly. A consumer working from daily rollups can
+    /// only bound this ("at least the best member's uptime"); we measure it.
+    #[test]
+    fn capability_sli_measures_overlap_not_a_bound() {
+        let path = repair_tests::tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai_providers".into(),
+            label: "AI".into(),
+            members: vec![("groq".into(), false), ("together".into(), false)],
+            min_available: 1,
+        };
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            // Four sample instants. Each member is down for one of them, but
+            // never the same one: the capability was continuously available.
+            let plan = [
+                ("00:00:00", "operational", "operational"),
+                ("00:01:00", "outage", "operational"),
+                ("00:02:00", "operational", "outage"),
+                ("00:03:00", "operational", "operational"),
+            ];
+            for (t, groq, together) in plan {
+                let ts = format!("{today}T{t}Z");
+                repair_tests::insert(&conn, &ts, "cirisproxy", "groq", groq);
+                repair_tests::insert(&conn, &ts, "cirisproxy", "together", together);
+            }
+        }
+        let db = init(&path).unwrap();
+        let sli = query_capability_sli(&db, 2, &spec).unwrap();
+        assert_eq!(
+            sli.get(&today).copied(),
+            Some(100.0),
+            "each member was down 25% of the day, but never at the same time"
+        );
+
+        // Now make them fail together for one instant: exactly 75%.
+        {
+            let db2 = init(&path).unwrap();
+            let conn = db2.lock().unwrap();
+            let ts = format!("{today}T00:01:00Z");
+            conn.execute(
+                "UPDATE status_checks SET status='outage'
+                 WHERE ts=?1 AND provider_name='together'",
+                rusqlite::params![ts],
+            )
+            .unwrap();
+        }
+        let sli = query_capability_sli(&init(&path).unwrap(), 2, &spec).unwrap();
+        assert_eq!(
+            sli.get(&today).copied(),
+            Some(75.0),
+            "one instant of overlap out of four is exactly 25% unavailable"
+        );
+    }
+
+    /// A threshold above 1 means "serving, but the margin is gone" is visible
+    /// in the history too, not just live.
+    #[test]
+    fn capability_sli_honours_the_availability_threshold() {
+        let path = repair_tests::tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai_providers".into(),
+            label: "AI".into(),
+            members: vec![("groq".into(), false), ("together".into(), false)],
+            min_available: 2,
+        };
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            for (t, together) in [("00:00:00", "operational"), ("00:01:00", "outage")] {
+                let ts = format!("{today}T{t}Z");
+                repair_tests::insert(&conn, &ts, "cirisproxy", "groq", "operational");
+                repair_tests::insert(&conn, &ts, "cirisproxy", "together", together);
+            }
+        }
+        let sli = query_capability_sli(&init(&path).unwrap(), 2, &spec).unwrap();
+        assert_eq!(
+            sli.get(&today).copied(),
+            Some(50.0),
+            "half the samples had both"
+        );
+    }
+
+    /// A provider several regions report is still ONE member. Counting rows
+    /// instead of distinct providers let `available` exceed the member count
+    /// and satisfy a threshold that was never met.
+    #[test]
+    fn duplicate_reports_of_one_provider_cannot_satisfy_a_threshold() {
+        let path = repair_tests::tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai_providers".into(),
+            label: "AI".into(),
+            members: vec![("groq".into(), false), ("openrouter".into(), false)],
+            min_available: 2,
+        };
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            let ts = format!("{today}T00:00:00Z");
+            // groq reported healthy TWICE (once per region), openrouter down.
+            repair_tests::insert(&conn, &ts, "cirisproxy", "groq", "operational");
+            repair_tests::insert(&conn, &ts, "cirisproxy", "groq", "operational");
+            repair_tests::insert(&conn, &ts, "cirisproxy", "openrouter", "outage");
+        }
+        let sli = query_capability_sli(&init(&path).unwrap(), 2, &spec).unwrap();
+        assert_eq!(
+            sli.get(&today).copied(),
+            Some(0.0),
+            "one distinct provider available, threshold is two"
+        );
+    }
+
+    /// Attribution rows are extra VIEWS of one component, not extra components,
+    /// so they must not enter any rollup.
+    #[test]
+    fn observation_rows_are_excluded_from_the_rollup() {
+        let path = repair_tests::tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            let ts = format!("{today}T00:00:00Z");
+            repair_tests::insert(&conn, &ts, "cirisproxy", "groq", "operational");
+            // EU saw it fail; US did not. Kept for attribution, ignored by math.
+            repair_tests::insert(&conn, &ts, OBSERVATION_SERVICE, "groq", "outage");
+        }
+        let db = init(&path).unwrap();
+        let days = query_history(&db, 2, None, &[]).unwrap();
+        let day = days.iter().find(|d| d.date == today).expect("today");
+        assert_eq!(
+            day.overall_uptime_pct, 100.0,
+            "an attribution row must not count as an outage"
+        );
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai".into(),
+            label: "AI".into(),
+            members: vec![("groq".into(), false)],
+            min_available: 1,
+        };
+        assert_eq!(
+            query_capability_sli(&db, 2, &spec)
+                .unwrap()
+                .get(&today)
+                .copied(),
+            Some(100.0)
+        );
+    }
+
+    /// The question a single-vantage monitor cannot answer: is the provider
+    /// down, or is my route to it? Two vantages, one disagreeing, names which.
+    #[test]
+    fn vantage_disagreement_names_the_dissenting_observer() {
+        let path = repair_tests::tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            // Instant 1: both vantages agree it is fine.
+            let ts = format!("{today}T00:00:00Z");
+            repair_tests::insert_region(
+                &conn,
+                &ts,
+                OBSERVATION_SERVICE,
+                "groq",
+                "us",
+                "operational",
+            );
+            repair_tests::insert_region(
+                &conn,
+                &ts,
+                OBSERVATION_SERVICE,
+                "groq",
+                "eu",
+                "operational",
+            );
+            // Instant 2: only EU cannot reach it — a path problem, not groq's.
+            let ts = format!("{today}T00:01:00Z");
+            repair_tests::insert_region(
+                &conn,
+                &ts,
+                OBSERVATION_SERVICE,
+                "groq",
+                "us",
+                "operational",
+            );
+            repair_tests::insert_region(&conn, &ts, OBSERVATION_SERVICE, "groq", "eu", "outage");
+            // Instant 3: BOTH see it down — that one is groq.
+            let ts = format!("{today}T00:02:00Z");
+            repair_tests::insert_region(&conn, &ts, OBSERVATION_SERVICE, "groq", "us", "outage");
+            repair_tests::insert_region(&conn, &ts, OBSERVATION_SERVICE, "groq", "eu", "outage");
+        }
+        let rows = query_vantage(&init(&path).unwrap(), 2).unwrap();
+        let row = rows.iter().find(|r| r.component == "groq").expect("groq");
+        assert_eq!(row.samples, 3);
+        assert_eq!(
+            row.disagreements, 1,
+            "exactly one instant where they differed"
+        );
+        // ONLY the disagreement instant counts. EU dissented once; US never did.
+        // The instant where BOTH saw an outage is agreement — it says the
+        // provider was down, not that either observer's path was.
+        assert_eq!(row.dissent_by_vantage.get("eu").copied(), Some(1));
+        assert_eq!(
+            row.dissent_by_vantage.get("us").copied(),
+            None,
+            "a universally-agreed outage is not dissent"
+        );
+    }
+
+    /// A region outage must show in service uptime. Populating `capabilities`
+    /// only from declared pools let a day with a regional outage publish 100%
+    /// service uptime while its own `status` said degraded.
+    #[test]
+    fn a_regional_outage_lowers_service_uptime() {
+        let path = repair_tests::tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            for (t, billing) in [("00:00:00", "outage"), ("00:01:00", "operational")] {
+                let ts = format!("{today}T{t}Z");
+                repair_tests::insert_region(&conn, &ts, "cirisbilling", "service", "eu", billing);
+                repair_tests::insert_region(
+                    &conn,
+                    &ts,
+                    "cirisproxy",
+                    "groq",
+                    "global",
+                    "operational",
+                );
+            }
+        }
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai_providers".into(),
+            label: "AI".into(),
+            members: vec![("groq".into(), false)],
+            min_available: 1,
+        };
+        let db = init(&path).unwrap();
+        let days = query_history(&db, 2, None, std::slice::from_ref(&spec)).unwrap();
+        let day = days.iter().find(|d| d.date == today).expect("today");
+        assert_eq!(
+            day.capabilities["ai_providers"].sli_pct, 100.0,
+            "the pool was fine throughout"
+        );
+        assert_eq!(
+            day.service_uptime_pct, 50.0,
+            "but EU billing was down half the samples, and nothing else serves it"
+        );
+    }
+
     #[test]
     fn empty_event_list_is_a_noop() {
         let path = repair_tests::tmp_db();
@@ -964,6 +1569,7 @@ mod event_tests {
             component: c.into(),
             from: "operational".into(),
             to: "degraded".into(),
+            capability: None,
         };
         assert_eq!(record_events(&db, &[ev("a"), ev("b")]).unwrap(), 2);
 

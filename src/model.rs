@@ -18,8 +18,10 @@ pub const UNKNOWN: &str = "unknown";
 /// never invents an outage).
 pub fn severity(status: &str) -> i8 {
     match status {
-        DEGRADED => 1,
-        OUTAGE => 2,
+        // Aliases accepted on the way in, so an upstream speaking Statuspage's
+        // vocabulary ranks the same as one speaking ours.
+        DEGRADED | "degraded_performance" => 1,
+        OUTAGE | "partial_outage" | "major_outage" => 2,
         _ => 0,
     }
 }
@@ -57,6 +59,21 @@ mod tests {
         assert_eq!(age_seconds("not a timestamp", now), 0);
     }
 
+    /// The capability rollup emits `major_outage`, and `severity` used to rank
+    /// every unrecognised word 0 — so a pool with EVERY member down counted as
+    /// zero outages and the headline published `operational`. The one failure
+    /// the rollup exists to surface was the one it could not.
+    #[test]
+    fn outage_shaped_words_all_rank_as_outages() {
+        assert_eq!(severity("major_outage"), 2);
+        assert_eq!(severity("partial_outage"), 2);
+        assert_eq!(severity(OUTAGE), 2);
+        assert_eq!(severity("degraded_performance"), 1);
+        assert_eq!(severity(DEGRADED), 1);
+        assert_eq!(severity(OPERATIONAL), 0);
+        assert_eq!(severity(UNKNOWN), 0);
+    }
+
     #[test]
     fn worst_picks_most_severe() {
         assert_eq!(
@@ -91,8 +108,16 @@ pub struct ServiceStatus {
 #[derive(Serialize, Clone)]
 pub struct ServiceSummary {
     pub name: String,
+    /// OUR verdict: the transport probe folded with the upstream's non-pooled
+    /// dependencies. A slow member of a redundant pool does not appear here —
+    /// the router is serving fine on the others (FSD §3.1).
     pub status: String,
     pub latency_ms: Option<i64>,
+    /// What the service said about ITSELF, preserved rather than overwritten.
+    /// It folds pooled providers into its own verdict; we do not, but we also
+    /// do not get to silently discard its opinion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -120,6 +145,15 @@ pub struct ProviderDetail {
 #[derive(Serialize, Clone)]
 pub struct AggregatedStatus {
     pub status: String,
+    /// Statuspage v2 severity for `status`.
+    pub indicator: &'static str,
+    /// Capability rollups (FSD §2.2) — what the headline is derived from.
+    pub capabilities: BTreeMap<String, CapabilityStatus>,
+    /// True when every probe this cycle failed at the transport layer, which
+    /// indicts our own network rather than the world (FSD §3.3). `status` is
+    /// then `unknown`: we cannot see, and saying so beats reporting a global
+    /// outage we have no evidence for.
+    pub vantage_failure: bool,
     pub timestamp: String,
     /// Age of this snapshot when served. A cached snapshot that says nothing
     /// about its own age can be served as current forever by a stalled loop.
@@ -136,6 +170,51 @@ pub struct AggregatedStatus {
     pub internal_providers: BTreeMap<String, ProviderDetail>,
 }
 
+// ── Capabilities (FSD/CAPABILITY_MONITORING.md §2) ───────────────────────────
+/// One member of a capability, and the role it plays in the call path.
+#[derive(Serialize, Clone, PartialEq, Debug)]
+pub struct CapabilityMember {
+    pub id: String,
+    /// `primary` | `fallback`. Serving on a fallback is not an outage, but it is
+    /// a fact worth surfacing: it precedes cost, latency and quality changes
+    /// that nothing else on the board would explain.
+    pub role: &'static str,
+    /// `unknown` when the member is declared but never reported — silence is
+    /// not health.
+    pub status: String,
+}
+
+/// A thing the fabric can do, and how many members must be up for it to work.
+#[derive(Serialize, Clone, Debug)]
+pub struct CapabilityStatus {
+    pub label: String,
+    pub status: String,
+    /// Reported, but never counted toward the headline: a provider in nobody's
+    /// serving path cannot impair service.
+    #[serde(default)]
+    pub informational: bool,
+    pub min_available: usize,
+    pub available: usize,
+    pub members: Vec<CapabilityMember>,
+}
+
+pub const ROLE_PRIMARY: &str = "primary";
+pub const ROLE_FALLBACK: &str = "fallback";
+
+/// Statuspage v2 severity words, so our top line and the vendor feeds we consume
+/// speak one language. Component strings keep their current vocabulary — see
+/// FSD §4 for why renaming them out from under two live consumers is a bad
+/// trade for interop we can get additively.
+pub fn indicator_for(status: &str) -> &'static str {
+    match status {
+        OPERATIONAL => "none",
+        DEGRADED => "minor",
+        "partial_outage" => "major",
+        "major_outage" | OUTAGE => "critical",
+        _ => "none",
+    }
+}
+
 // ── /api/v1/status/events ────────────────────────────────────────────────────
 /// One observed transition of one component. The thing a daily uptime rollup
 /// cannot tell you: that `eu.proxy` was `degraded` for ninety seconds at 14:03.
@@ -146,6 +225,11 @@ pub struct StatusEvent {
     pub component: String,
     pub from: String,
     pub to: String,
+    /// Capability id for a capability transition. Promised by the wire contract
+    /// (FSD §4); without it a client has to parse the `capability.` prefix out
+    /// of `component`, which is an undocumented format masquerading as an API.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub capability: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -190,6 +274,31 @@ pub struct LiveDelta {
     pub overall: Option<String>,
 }
 
+// ── /api/v1/status/vantage ───────────────────────────────────────────────────
+/// One component's day, as seen from every vantage that reported it.
+///
+/// Agreement across vantages implicates the component; disagreement implicates
+/// the path between a vantage and it. Without this, a monitor cannot tell
+/// "the provider is down" from "my route to it is", and attributes its own
+/// network to the world.
+#[derive(Serialize, Clone, Debug)]
+pub struct VantageRow {
+    pub date: String,
+    pub component: String,
+    /// Sample instants where at least one vantage reported.
+    pub samples: i64,
+    /// Instants where the vantages did NOT agree.
+    pub disagreements: i64,
+    /// Non-operational samples per vantage — who kept dissenting.
+    pub dissent_by_vantage: BTreeMap<String, i64>,
+}
+
+#[derive(Serialize)]
+pub struct VantageResponse {
+    pub days: i64,
+    pub rows: Vec<VantageRow>,
+}
+
 // ── /api/v1/status/history ───────────────────────────────────────────────────
 #[derive(Serialize, Clone)]
 pub struct ServiceUptime {
@@ -219,6 +328,12 @@ pub struct HistoryDay {
     pub overall_uptime_pct: f64,
     /// Alias of `overall_uptime_pct`.
     pub uptime_pct: f64,
+    /// Per-capability SLI for the day, computed by EXACT overlap (FSD §2.4).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub capabilities: BTreeMap<String, CapabilitySli>,
+    /// The worst capability's SLI — service availability, as opposed to the
+    /// component mean `uptime_pct` keeps reporting.
+    pub service_uptime_pct: f64,
     /// The day as one word: `operational` ≥ 99.9%, `degraded` ≥ 95%, else
     /// `outage`. Derived here so every consumer draws the same conclusion from
     /// the same number.
@@ -233,6 +348,14 @@ pub fn age_seconds(timestamp: &str, now: chrono::DateTime<chrono::Utc>) -> i64 {
         Ok(t) => (now.naive_utc() - t).num_seconds().max(0),
         Err(_) => 0,
     }
+}
+
+/// A capability's measured availability over a day.
+#[derive(Serialize, Clone, Debug)]
+pub struct CapabilitySli {
+    pub sli_pct: f64,
+    pub min_available: usize,
+    pub members: Vec<String>,
 }
 
 /// Bucket a day's uptime percentage into the status vocabulary.

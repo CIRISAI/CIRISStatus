@@ -143,6 +143,11 @@ async fn api_status(State(st): State<AppState>) -> impl IntoResponse {
                 );
                 agg.stale = true;
                 agg.status = crate::model::UNKNOWN.to_string();
+                // The indicator describes `status`; leaving the old one made the
+                // response say "unknown" and "critical" at once, so a client
+                // reading the Statuspage field kept showing a verdict we had
+                // just withdrawn.
+                agg.indicator = crate::model::indicator_for(&agg.status);
             }
             Json(agg)
         }
@@ -222,7 +227,7 @@ async fn history(State(st): State<AppState>, Query(q): Query<HistoryParams>) -> 
             .into_response();
         }
     };
-    match history::query_history(&db, days, region.as_deref()) {
+    match history::query_history(&db, days, region.as_deref(), &st.cfg().capabilities) {
         Ok(hist) => Json(HistoryResponse {
             days,
             region,
@@ -250,6 +255,37 @@ async fn scoring(State(st): State<AppState>) -> impl IntoResponse {
 /// the cache so a microcontroller gets one small, instant response.
 async fn ci(State(st): State<AppState>) -> impl IntoResponse {
     Json(st.ci.snapshot())
+}
+
+/// `GET /api/v1/status/vantage` — where independent vantages disagreed about
+/// the same component. Agreement implicates the component; disagreement
+/// implicates the path between a vantage and it.
+async fn vantage(State(st): State<AppState>, Query(q): Query<EventParams>) -> Response {
+    let days = q.days.unwrap_or(7);
+    if !(1..=365).contains(&days) {
+        return bad("Days must be between 1 and 365");
+    }
+    let db = match st.db.read().expect("db lock").clone() {
+        Some(db) => db,
+        None => {
+            return Json(crate::model::VantageResponse {
+                days,
+                rows: Vec::new(),
+            })
+            .into_response()
+        }
+    };
+    match history::query_vantage(&db, days) {
+        Ok(rows) => Json(crate::model::VantageResponse { days, rows }).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "vantage query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "detail": "Failed to fetch vantage data" })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// `GET /api/v1/status/live` (and `/api/v1/scoring/live`) — SSE live-push of
@@ -495,6 +531,7 @@ impl Adapter for StatusAdapter {
             .route("/api/v1/status", get(api_status))
             .route("/api/v1/status/history", get(history))
             .route("/api/v1/status/events", get(events))
+            .route("/api/v1/status/vantage", get(vantage))
             .route("/api/v1/history", get(history))
             .route("/api/v1/scoring", get(scoring))
             .route("/api/v1/ci", get(ci))
@@ -566,12 +603,42 @@ impl Adapter for StatusAdapter {
 
                     // ── Flow B: probe-derived signed health:liveness emit. ──
                     let agg = aggregate::aggregated_status(&cfg, &self.state.client).await;
-                    self.emit_liveness(ctx, &agg).await;
+                    // A vantage failure means we could not SEE, so the snapshot
+                    // is full of synthetic outages we have no evidence for.
+                    // Marking its headline `unknown` was not enough: it was
+                    // still flattened into outage transitions, signed as
+                    // liveness evidence, installed as the baseline and served.
+                    // The only honest handling is to record that WE went blind
+                    // and otherwise change nothing.
+                    if !agg.vantage_failure {
+                        self.emit_liveness(ctx, &agg).await;
+                    } else {
+                        tracing::warn!(
+                            "vantage failure — not attesting, not installing this snapshot"
+                        );
+                    }
 
                     // ── Transitions: diff this snapshot against the last, and
                     // record what changed. This is the only place a transient
                     // becomes durable — the daily rollup cannot hold it. ──
-                    let flat = aggregate::flatten(&agg);
+                    // On a vantage failure the only thing we learned is that we
+                    // went blind: keep every other component at its last known
+                    // value rather than asserting outages we cannot support.
+                    let prev_empty = self.state.prev_flat.read().expect("flat lock").is_empty();
+                    // A blind FIRST poll establishes nothing. Seeding the
+                    // baseline from it would leave a map containing only
+                    // `monitor.network=outage`, so the first successful poll
+                    // would emit a network recovery with no matching start plus
+                    // an `unknown` transition for every ordinary component. The
+                    // first poll that can actually SEE is the baseline.
+                    let skip_cycle = agg.vantage_failure && prev_empty;
+                    let flat = if agg.vantage_failure {
+                        let mut f = self.state.prev_flat.read().expect("flat lock").clone();
+                        f.insert("monitor.network".to_string(), "outage".to_string());
+                        f
+                    } else {
+                        aggregate::flatten(&agg)
+                    };
                     let events = {
                         let prev = self.state.prev_flat.read().expect("flat lock").clone();
                         // The first cycle after boot has no previous snapshot;
@@ -609,12 +676,16 @@ impl Adapter for StatusAdapter {
                             None => false,
                         }
                     };
-                    if persisted {
+                    if persisted && !skip_cycle {
                         *self.state.prev_flat.write().expect("flat lock") = flat;
                     }
 
-                    // Serve what we just recorded.
-                    *self.state.status.write().expect("status lock") = Some(agg.clone());
+                    // Serve what we just recorded — unless we could not see, in
+                    // which case the previous snapshot stands and ages into
+                    // `stale` on its own.
+                    if !agg.vantage_failure {
+                        *self.state.status.write().expect("status lock") = Some(agg.clone());
+                    }
 
                     // ── Flow A: rebuild the public roster from the OWN corpus. ──
                     self.refresh_roster(ctx).await;

@@ -10,9 +10,25 @@ use chrono::Utc;
 use reqwest::Client;
 use serde_json::Value;
 
+use crate::capability;
 use crate::config::Config;
 use crate::model::*;
 use crate::probe::*;
+
+/// Statuses come off the wire owned; the summary field wants a `&'static str`.
+///
+/// The Statuspage spellings MUST normalise here, not fall through to
+/// operational: `severity()` ranks `major_outage` as an outage, so the fold
+/// picks it as the worst status and then this function turned it green — the
+/// dependency failure was ranked correctly and reported as health.
+fn leak_status(s: &str) -> &'static str {
+    match s {
+        DEGRADED | "degraded_performance" => DEGRADED,
+        OUTAGE | "partial_outage" | "major_outage" => OUTAGE,
+        UNKNOWN => UNKNOWN,
+        _ => OPERATIONAL,
+    }
+}
 
 fn now_z() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -172,14 +188,47 @@ fn is_shared_search(p: &Upstream) -> bool {
         || (p.kind.is_none() && matches!(p.id.as_str(), "exa" | "brave"))
 }
 
+/// A router's OWN health: its transport probe folded with the dependencies
+/// nothing else can serve. Pooled members are excluded — the router is serving
+/// fine on the others, and inheriting their unhappiness is what walked one slow
+/// provider to the public headline (FSD §3.1 / D1).
+pub fn service_status_excluding_pools(
+    transport: &'static str,
+    providers: &[Upstream],
+    specs: &[capability::CapabilitySpec],
+) -> &'static str {
+    let mut status = transport;
+    for p in providers {
+        if capability::is_pooled(specs, p.kind.as_deref(), &p.id) {
+            continue;
+        }
+        if severity(&p.status) > severity(status) {
+            status = leak_status(&p.status);
+        }
+    }
+    status
+}
+
 /// Fold one region's CIRISProxy `/v1/status` into the LLM + internal buckets.
 pub(crate) fn fold_proxy(
     llm: &mut BTreeMap<String, ProviderDetail>,
     internal: &mut BTreeMap<String, ProviderDetail>,
     region_key: &str,
     body: &Value,
+    specs: &[capability::CapabilitySpec],
+    informational: &mut std::collections::BTreeSet<String>,
 ) {
     for p in upstream_providers(body) {
+        // Recorded HERE because this is the only place the upstream's `kind` is
+        // still in hand. A search provider excluded from its router by kind but
+        // represented by no capability is invisible when it fails — the hole
+        // this set exists to close.
+        if matches!(
+            capability::relation(specs, p.kind.as_deref(), &p.id),
+            capability::Relation::Informational
+        ) {
+            informational.insert(p.id.clone());
+        }
         let d = detail(&p.status, p.latency_ms, format!("cirisproxy.{region_key}"));
         if is_shared_llm(&p) {
             merge_worst(llm, p.id, d);
@@ -239,6 +288,46 @@ pub fn flatten(agg: &AggregatedStatus) -> BTreeMap<String, String> {
     for (name, i) in &agg.infrastructure {
         out.insert(format!("infra.{name}"), i.status.clone());
     }
+    // Capabilities are transition subjects in their own right: "the AI pool
+    // went degraded" is the event a reader wants, not five provider rows they
+    // have to correlate. And serving on a fallback gets its own component, so
+    // it is recorded WITHOUT moving the headline (FSD §2.3) — it precedes cost,
+    // latency and quality changes nothing else on the board would explain.
+    // Always present, so a recovery is a transition rather than a component
+    // silently reappearing.
+    out.insert(
+        "monitor.network".to_string(),
+        if agg.vantage_failure {
+            OUTAGE.to_string()
+        } else {
+            OPERATIONAL.to_string()
+        },
+    );
+    for (id, cap) in &agg.capabilities {
+        out.insert(format!("capability.{id}"), cap.status.clone());
+        // Derived from the PRIMARY MEMBER, never from the capability: with a
+        // threshold above one, losing a FALLBACK degrades the capability while
+        // the primary is perfectly healthy, and inheriting that status emits a
+        // primary failure that never happened — plus a false recovery later.
+        // Only a POOL can serve on a fallback. Every region and infra entry is a
+        // singleton whose sole member carries the primary role, so emitting a
+        // `.primary` component for them recorded two transitions for one event.
+        if let Some(primary) = cap
+            .members
+            .iter()
+            .find(|m| m.role == crate::model::ROLE_PRIMARY)
+            .filter(|_| cap.members.len() > 1)
+        {
+            out.insert(
+                format!("capability.{id}.primary"),
+                if capability::on_fallback(cap) {
+                    "serving_on_fallback".to_string()
+                } else {
+                    primary.status.clone()
+                },
+            );
+        }
+    }
     for (bucket, map) in [
         ("llm", &agg.llm_providers),
         ("auth", &agg.auth_providers),
@@ -250,6 +339,13 @@ pub fn flatten(agg: &AggregatedStatus) -> BTreeMap<String, String> {
         }
     }
     out
+}
+
+/// `capability.ai_providers` / `capability.ai_providers.primary` -> the id.
+fn capability_of(component: &str) -> Option<String> {
+    component
+        .strip_prefix("capability.")
+        .map(|rest| rest.trim_end_matches(".primary").to_string())
 }
 
 /// The transitions between two snapshots, as events stamped `ts`.
@@ -268,6 +364,7 @@ pub fn transitions(
         if from != to {
             events.push(StatusEvent {
                 ts: ts.to_string(),
+                capability: capability_of(component),
                 component: component.clone(),
                 from: from.to_string(),
                 to: to.clone(),
@@ -278,6 +375,7 @@ pub fn transitions(
         if !now.contains_key(component) {
             events.push(StatusEvent {
                 ts: ts.to_string(),
+                capability: capability_of(component),
                 component: component.clone(),
                 from: from.clone(),
                 to: UNKNOWN.to_string(),
@@ -289,6 +387,19 @@ pub fn transitions(
 
 /// `GET /api/v1/status` — the aggregated multi-region status page contract.
 pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatus {
+    let specs = &cfg.capabilities;
+    // Vantage accounting (FSD §3.3): transport failures are OUR network's
+    // problem until proven otherwise; an HTTP status is the upstream's.
+    let mut probes_attempted = 0usize;
+    let mut transport_failures = 0usize;
+    let mut count = |p: &Probe| {
+        probes_attempted += 1;
+        if p.transport_error {
+            transport_failures += 1;
+        }
+    };
+    // Providers the fold classified as routable-but-undeclared.
+    let mut informational_ids: std::collections::BTreeSet<String> = Default::default();
     let mut regions: BTreeMap<String, RegionStatus> = BTreeMap::new();
     let mut infrastructure: BTreeMap<String, InfrastructureStatus> = BTreeMap::new();
     let mut llm: BTreeMap<String, ProviderDetail> = BTreeMap::new();
@@ -301,13 +412,25 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
         let mut services: BTreeMap<String, ServiceSummary> = BTreeMap::new();
 
         if let Some(url) = &region.billing_url {
-            let (probe, body) = fetch_service_status(client, url).await;
+            let (probe, body) = fetch_service_status(client, url, region.latency_baseline_ms).await;
+            count(&probe);
+            // Same fold as the proxy: billing's dependencies are things NOTHING
+            // else serves, so an outage in one is an outage in billing. Taking
+            // only the transport verdict here would leave the service, its
+            // region and the headline green while authentication is unusable.
+            let billing_status = match &body {
+                Some(b) => {
+                    service_status_excluding_pools(probe.status, &upstream_providers(b), specs)
+                }
+                None => probe.status,
+            };
             services.insert(
                 "billing".into(),
                 ServiceSummary {
                     name: "Billing & Authentication".into(),
-                    status: probe.status.to_string(),
+                    status: billing_status.to_string(),
                     latency_ms: probe.latency_ms,
+                    upstream_status: probe.upstream_status.clone(),
                 },
             );
             if let Some(b) = &body {
@@ -316,17 +439,37 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
         }
 
         if let Some(url) = &region.proxy_url {
-            let (probe, body) = fetch_service_status(client, url).await;
+            let (probe, body) = fetch_service_status(client, url, region.latency_baseline_ms).await;
+            count(&probe);
+            // OUR verdict for the router: its own reachability folded with the
+            // dependencies nothing else can serve. A slow member of a redundant
+            // pool is excluded — the proxy is serving fine on the others, and
+            // inheriting its self-report is what walked one slow provider all
+            // the way to the public headline (FSD §3.1 / D1).
+            let svc_status = match &body {
+                Some(b) => {
+                    service_status_excluding_pools(probe.status, &upstream_providers(b), specs)
+                }
+                None => probe.status,
+            };
             services.insert(
                 "proxy".into(),
                 ServiceSummary {
                     name: "LLM Proxy".into(),
-                    status: probe.status.to_string(),
+                    status: svc_status.to_string(),
                     latency_ms: probe.latency_ms,
+                    upstream_status: probe.upstream_status.clone(),
                 },
             );
             if let Some(b) = &body {
-                fold_proxy(&mut llm, &mut internal, region.key, b);
+                fold_proxy(
+                    &mut llm,
+                    &mut internal,
+                    region.key,
+                    b,
+                    specs,
+                    &mut informational_ids,
+                );
             }
         }
 
@@ -344,7 +487,9 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
 
         // Infrastructure host health (Vultr/Hetzner).
         if let Some(url) = &region.infra_url {
-            let p = check_infrastructure(client, url, 1000, false).await;
+            let p =
+                check_infrastructure(client, url, 1000, false, region.latency_baseline_ms).await;
+            count(&p);
             infrastructure.insert(
                 region.infra_provider.to_string(),
                 InfrastructureStatus {
@@ -359,7 +504,8 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
 
     // ── Container registry (GHCR): higher threshold, 401 == up ──
     {
-        let p = check_infrastructure(client, &cfg.ghcr_url, 3000, true).await;
+        let p = check_infrastructure(client, &cfg.ghcr_url, 3000, true, 0).await;
+        count(&p);
         infrastructure.insert(
             "github".into(),
             InfrastructureStatus {
@@ -374,6 +520,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
     // ── Local providers (this service's own deps), if configured ──
     if let Some(dsn) = &cfg.database_url {
         let p = check_postgres_tcp(dsn).await;
+        count(&p);
         database.insert(
             "lens.postgresql".into(),
             detail(p.status, p.latency_ms, "cirislens".into()),
@@ -381,6 +528,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
     }
     if let Some(g) = &cfg.grafana_url {
         let p = check_grafana(client, g).await;
+        count(&p);
         internal.insert(
             "lens.grafana".into(),
             detail(p.status, p.latency_ms, "cirislens".into()),
@@ -398,9 +546,48 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
             ext.authenticated,
         )
         .await;
+        count(&p);
         internal.insert(
             ext.display.to_string(),
             detail(p.status, p.latency_ms, format!("direct.{}", ext.key)),
+        );
+    }
+
+    // ── Capabilities: the headline comes from what the fabric can DO ──
+    let mut observed: BTreeMap<String, String> = BTreeMap::new();
+    for (id, d) in &llm {
+        observed.insert(id.clone(), d.status.clone());
+    }
+    let mut capabilities: BTreeMap<String, crate::model::CapabilityStatus> = BTreeMap::new();
+    for spec in specs {
+        capabilities.insert(spec.id.clone(), capability::roll_up(spec, &observed));
+    }
+    // Anything routable but undeclared is REPRESENTED, not merely excluded:
+    // a visible capability that cannot move the headline. Without this, taking
+    // a provider out of its router's verdict would make its failure invisible
+    // everywhere — exclusion without representation.
+    for (id, d) in llm.iter().chain(internal.iter()) {
+        if !informational_ids.contains(id) {
+            continue;
+        }
+        capabilities.insert(
+            format!("provider.{id}"),
+            capability::informational(id, &d.status),
+        );
+    }
+
+    // Regions and infrastructure are singletons — no pooling across regions
+    // (FSD §2.1: a regional outage is a regional outage).
+    for (key, r) in &regions {
+        capabilities.insert(
+            format!("region.{key}"),
+            capability::singleton(&format!("region.{key}"), &r.status),
+        );
+    }
+    for (name, i) in &infrastructure {
+        capabilities.insert(
+            format!("infra.{name}"),
+            capability::singleton(&format!("infra.{name}"), &i.status),
         );
     }
 
@@ -414,20 +601,22 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
     for i in infrastructure.values() {
         considered.push(&i.status);
     }
-    let outages = considered.iter().filter(|s| **s == OUTAGE).count();
-    let degraded = considered.contains(&DEGRADED);
-    let overall = if outages >= 3 {
-        "major_outage"
-    } else if outages > 0 {
-        "partial_outage"
-    } else if degraded {
-        DEGRADED
-    } else {
-        OPERATIONAL
-    };
+    let _ = &considered; // superseded by the capability rollup below
+    let overall = capability::overall(&capabilities);
+
+    // Every probe failed at the transport layer: that indicts our own network,
+    // not the simultaneous failure of unrelated third parties on three
+    // continents. Below MIN_FOR_VERDICT probes we cannot tell the difference
+    // and do not claim to (FSD §3.3 / D3).
+    let vantage_failure =
+        probes_attempted >= crate::probe::MIN_FOR_VERDICT && transport_failures == probes_attempted;
+    let overall = if vantage_failure { UNKNOWN } else { overall };
 
     AggregatedStatus {
         status: overall.to_string(),
+        indicator: crate::model::indicator_for(overall),
+        capabilities,
+        vantage_failure,
         timestamp: now_z(),
         age_seconds: 0,
         stale: false,
@@ -496,6 +685,87 @@ mod tests {
         assert!(pg.kind.is_none(), "billing declares no type");
     }
 
+    fn up(id: &str, kind: Option<&str>, status: &str) -> Upstream {
+        Upstream {
+            id: id.into(),
+            kind: kind.map(str::to_string),
+            status: status.into(),
+            latency_ms: Some(10),
+        }
+    }
+
+    /// D1, the defect that started this: a pooled provider degrades, and the
+    /// router that merely REPORTS it inherits the unhappiness — which then
+    /// walks through region status to the public headline. Four days of amber
+    /// on ciris.ai for a provider that is not even in the default call path.
+    #[test]
+    fn a_degraded_pool_member_does_not_degrade_its_router() {
+        let specs = crate::capability::default_specs();
+        let providers = [
+            up("groq", Some("llm"), DEGRADED),
+            up("openrouter", Some("llm"), OPERATIONAL),
+            up("billing", Some("internal"), OPERATIONAL),
+        ];
+        assert_eq!(
+            service_status_excluding_pools(OPERATIONAL, &providers, &specs),
+            OPERATIONAL,
+            "the proxy is serving fine on the other members of the chain"
+        );
+    }
+
+    /// A monitored-but-non-serving provider must NOT degrade its router: it is
+    /// in nobody's call path, so its failure impairs nothing. Together is
+    /// exactly this — four days of amber came from treating it otherwise.
+    #[test]
+    fn a_monitored_non_serving_provider_does_not_degrade_its_router() {
+        let specs = crate::capability::default_specs();
+        let providers = [up("together", Some("llm"), OUTAGE)];
+        assert_eq!(
+            service_status_excluding_pools(OPERATIONAL, &providers, &specs),
+            OPERATIONAL,
+            "routable, undeclared: informational, not indispensable"
+        );
+    }
+
+    /// But an undeclared provider of a NON-routable kind has no alternative by
+    /// definition, so its failure is its router's.
+    #[test]
+    fn an_undeclared_non_routable_dependency_still_degrades_its_router() {
+        let specs = crate::capability::default_specs();
+        let providers = [up("postgresql", None, OUTAGE)];
+        assert_eq!(
+            service_status_excluding_pools(OPERATIONAL, &providers, &specs),
+            OUTAGE,
+            "nothing else serves it"
+        );
+    }
+
+    /// But a dependency nothing else can serve DOES degrade it.
+    #[test]
+    fn a_non_pooled_dependency_still_degrades_its_router() {
+        let specs = crate::capability::default_specs();
+        let providers = [
+            up("together", Some("llm"), OUTAGE),
+            up("billing", Some("internal"), OUTAGE),
+        ];
+        assert_eq!(
+            service_status_excluding_pools(OPERATIONAL, &providers, &specs),
+            OUTAGE,
+            "nothing else serves billing"
+        );
+    }
+
+    /// Transport trouble is the router's own, whatever its providers say.
+    #[test]
+    fn transport_health_is_never_masked_by_healthy_providers() {
+        let specs = crate::capability::default_specs();
+        let providers = [up("groq", Some("llm"), OPERATIONAL)];
+        assert_eq!(
+            service_status_excluding_pools(DEGRADED, &providers, &specs),
+            DEGRADED
+        );
+    }
+
     /// An upstream that gives only a display name still gets a usable key.
     #[test]
     fn falls_back_to_slugged_display_name() {
@@ -537,8 +807,30 @@ mod tests {
     fn live_proxy_payload_surfaces_the_cause_of_degraded() {
         let mut llm = BTreeMap::new();
         let mut internal = BTreeMap::new();
-        fold_proxy(&mut llm, &mut internal, "us", &proxy_body(177, 177));
-        fold_proxy(&mut llm, &mut internal, "eu", &proxy_body(509, 624));
+        let specs = crate::capability::default_specs();
+        let mut info = std::collections::BTreeSet::new();
+        fold_proxy(
+            &mut llm,
+            &mut internal,
+            "us",
+            &proxy_body(177, 177),
+            &specs,
+            &mut info,
+        );
+        fold_proxy(
+            &mut llm,
+            &mut internal,
+            "eu",
+            &proxy_body(509, 624),
+            &specs,
+            &mut info,
+        );
+        // Together and Brave are routable but in no declared chain: recorded as
+        // informational so their failures are represented somewhere, rather than
+        // excluded from their router and then invisible.
+        assert!(info.contains("together") && info.contains("brave"));
+        assert!(!info.contains("groq"), "declared member, not informational");
+        assert!(!info.contains("billing"), "nothing else serves it");
 
         // Every LLM provider is visible, bare-keyed, one row per provider.
         assert_eq!(
@@ -632,6 +924,7 @@ mod transition_tests {
                 name: "LLM Proxy".into(),
                 status: proxy_eu.to_string(),
                 latency_ms: Some(10),
+                upstream_status: None,
             },
         );
         regions.insert(
@@ -650,6 +943,9 @@ mod transition_tests {
         AggregatedStatus {
             status: status.to_string(),
             timestamp: "2026-08-13T14:03:00Z".into(),
+            indicator: "none",
+            capabilities: BTreeMap::new(),
+            vantage_failure: false,
             age_seconds: 0,
             stale: false,
             last_incident: None,
@@ -692,6 +988,137 @@ mod transition_tests {
         assert!(back
             .iter()
             .all(|e| e.from == DEGRADED && e.to == OPERATIONAL));
+    }
+
+    /// FSD §2.3: the primary goes down, fallbacks carry the traffic. The
+    /// capability stays operational and the headline does not move — but the
+    /// fact is recorded, because it precedes cost and latency changes that
+    /// nothing else on the board would explain.
+    #[test]
+    fn serving_on_a_fallback_is_an_event_not_an_outage() {
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai_providers".into(),
+            label: "AI providers".into(),
+            members: vec![("deepinfra".into(), true), ("groq".into(), false)],
+            min_available: 1,
+        };
+        let observed = |primary: &str| -> BTreeMap<String, String> {
+            [
+                ("deepinfra".to_string(), primary.to_string()),
+                ("groq".to_string(), OPERATIONAL.to_string()),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let healthy = crate::capability::roll_up(&spec, &observed(OPERATIONAL));
+        let on_fallback = crate::capability::roll_up(&spec, &observed(OUTAGE));
+        assert_eq!(on_fallback.status, OPERATIONAL, "fallbacks are serving");
+
+        let mut a = snap(OPERATIONAL, OPERATIONAL, OPERATIONAL);
+        a.capabilities.insert("ai_providers".into(), healthy);
+        let mut b = snap(OPERATIONAL, OPERATIONAL, OPERATIONAL);
+        b.capabilities.insert("ai_providers".into(), on_fallback);
+
+        let events = transitions(&flatten(&a), &flatten(&b), "t");
+        let subjects: Vec<_> = events.iter().map(|e| e.component.as_str()).collect();
+        assert_eq!(
+            subjects,
+            ["capability.ai_providers.primary"],
+            "the primary transition is recorded, and NOTHING else moves"
+        );
+        assert_eq!(events[0].to, "serving_on_fallback");
+    }
+
+    /// (4) With a threshold above one, losing a FALLBACK degrades the
+    /// capability while the primary is perfectly healthy. Deriving the primary
+    /// component from the capability emitted a primary failure that never
+    /// happened — and a matching false recovery.
+    #[test]
+    fn a_fallback_failure_is_not_reported_as_a_primary_failure() {
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai_providers".into(),
+            label: "AI providers".into(),
+            members: vec![
+                ("deepinfra".into(), true),
+                ("groq".into(), false),
+                ("openrouter".into(), false),
+            ],
+            min_available: 2,
+        };
+        let obs = |groq: &str| -> BTreeMap<String, String> {
+            [
+                ("deepinfra".to_string(), OPERATIONAL.to_string()),
+                ("groq".to_string(), groq.to_string()),
+                ("openrouter".to_string(), OUTAGE.to_string()),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let before = crate::capability::roll_up(&spec, &obs(OPERATIONAL));
+        let after = crate::capability::roll_up(&spec, &obs(OUTAGE));
+        assert_eq!(before.status, OPERATIONAL);
+        assert_eq!(after.status, DEGRADED, "one member left, threshold is two");
+
+        let mut a = snap(OPERATIONAL, OPERATIONAL, OPERATIONAL);
+        a.capabilities.insert("ai_providers".into(), before);
+        let mut b = snap(OPERATIONAL, OPERATIONAL, OPERATIONAL);
+        b.capabilities.insert("ai_providers".into(), after);
+
+        let events = transitions(&flatten(&a), &flatten(&b), "t");
+        let subjects: Vec<_> = events.iter().map(|e| e.component.as_str()).collect();
+        assert_eq!(
+            subjects,
+            ["capability.ai_providers"],
+            "the capability moved; the primary did not, and must not say it did"
+        );
+    }
+
+    /// (10) A singleton cannot serve on a fallback — it has none. Emitting a
+    /// `.primary` component for regions and infrastructure recorded two
+    /// transitions for one event.
+    #[test]
+    fn singletons_do_not_get_a_primary_component() {
+        let mut agg = snap(OPERATIONAL, OPERATIONAL, OPERATIONAL);
+        agg.capabilities.insert(
+            "region.us".into(),
+            crate::capability::singleton("region.us", OPERATIONAL),
+        );
+        let flat = flatten(&agg);
+        assert!(flat.contains_key("capability.region.us"));
+        assert!(
+            !flat.contains_key("capability.region.us.primary"),
+            "no fallback exists, so there is no primary state to report"
+        );
+    }
+
+    /// (3) Going blind is ONE fact. It must not be recorded as every component
+    /// failing at once — that is the monitor reporting its own outage as the
+    /// world's, which is the defect the detection exists to prevent.
+    #[test]
+    fn a_vantage_failure_reports_only_that_we_went_blind() {
+        let healthy = flatten(&snap(OPERATIONAL, OPERATIONAL, OPERATIONAL));
+        assert_eq!(
+            healthy.get("monitor.network").map(String::as_str),
+            Some(OPERATIONAL)
+        );
+
+        // What the lifecycle builds when it cannot see: last known values, plus
+        // the one thing actually learned.
+        let mut blind = healthy.clone();
+        blind.insert("monitor.network".into(), OUTAGE.into());
+
+        let events = transitions(&healthy, &blind, "t");
+        let subjects: Vec<_> = events.iter().map(|e| e.component.as_str()).collect();
+        assert_eq!(
+            subjects,
+            ["monitor.network"],
+            "one event: we went blind. Not an outage per component."
+        );
+
+        // And recovery is a transition, not a component quietly reappearing.
+        let back = transitions(&blind, &healthy, "t");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].to, OPERATIONAL);
     }
 
     #[test]
