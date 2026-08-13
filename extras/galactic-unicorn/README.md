@@ -2,28 +2,48 @@
 
 A physical status board for the CIRIS stack: a [Pimoroni Galactic
 Unicorn](https://shop.pimoroni.com/products/galactic-unicorn) (53×11 RGB matrix
-on a Pico W). Two fixed sections — nothing floats, nothing drifts.
+on a Pico W), **mounted portrait** — stood on its end with the USB/power
+connector at the bottom, giving an 11-wide, 53-tall board.
+
+Everything in `main.py` is written in those viewer coordinates; `vpixel` /
+`vrect` rotate into panel space on the way out. Two fixed sections, nothing
+floats, nothing cycles.
 
 ```
-    x=0  2   4                                            52
- y=0  ▐▐  ████ ████ ████ ████ ████ ████ ████ ████ ████ ████   CIRISVerify
-   1  ▐▐  ████ ████ ████ ████ ████ ████ ████ ████ ████ ████   CIRISPersist
-   2  ▐▐  ████ ████ ████ ████ ████ ████ ████ ████ ████ ████   CIRISEdge
-   3  ▐▐  ████ ████ ████ ████ ████ ████ ████ ████ ████ ████   CIRISServer
-   4  ▐▐  ████ ████ ████ ████ ████ ████ ████ ████ ████ ████   CIRISAgent
-   5  · · · · · · · · · · · · · · · · · · · · · · · · · ·     overall status
-   6  ·     [──── US ────] [──── EU ────] [── GLOBAL ──]       billing
-   7  ··    [────────────] [────────────] [───────────]        proxy
-   8  ···   [────────────] [────────────] [───────────]        databases
-   9  ····  [────────────] [────────────] [──] [──] [──]       providers
-  10  ····· [────────────] [────────────] [──] [──] [──]       infrastructure
+     +-----------+
+   0 |# #  GGGGG |   V verify      runs 1-5  (oldest first)
+   2 |# #  GGGGG |                 runs 6-10 (newest last)
+   4 | #         |
+   5 | b##G#  ## |   P persist     letter on the far edge …
+   7 | G#b#G  ## |                 … dots on the near one
+  10 |###  GGRGG |   E edge        a failure in the older five
+  15 | GGGGG   ##|   S server
+  17 | GGGGY   # |                 newest run in progress
+  20 | #   GGG.. |   A agent       a young repo: only three runs
+  25 |Y Y Y Y Y Y|   overall status
+  26 | GG     ## |   B billing     US EU
+  31 |##   YY    |   P proxy
+  36 | GG     ## |   D database
+  41 |#    GG Y  |   L providers   US EU | GLOBAL
+  46 | GG G   ###|   I infra
+     +-----------+
 ```
 
-**Centipedes (rows 0–4)** — the last 10 GitHub Actions runs per repo, oldest at
-the left, newest at the leading edge. Repos are the substrate in dependency
-order: verify → persist → edge → server → agent. The 2px tag at the far left is
-a fixed per-repo hue (teal, magenta, white, amber, violet) so you can tell rows
-apart without counting.
+Every row is a 3×5 letter with its status as single-pixel dots beside it. Ten
+rows fill the board exactly.
+
+Rows **alternate edges** — letter left, letter right, letter left. Ten 5-row
+letters stacked flush leave no blank row between them, so two neighbours on the
+same edge touch and blur into each other; putting them on opposite edges
+separates them horizontally instead. The whole band mirrors, letter and dots
+together, but the dots always read left to right, so run order and the
+west-to-east region order never flip.
+
+**Repos (rows 0–24)** — V/P/E/S/A, the substrate in dependency order: verify →
+persist → edge → server → agent. Each row carries that repo's ten most recent
+GitHub Actions runs as **two rows of five dots** — the older five on the band's
+first row, the newer five two rows below, with a blank row between so they
+cannot fuse.
 
 | Run | Colour |
 |---|---|
@@ -34,31 +54,30 @@ apart without counting.
 | cancelled / skipped | grey (deliberately *not* red — superseded PR pushes cancel runs constantly) |
 | no data yet | near-black |
 
-**Divider (row 5)** — a dotted line carrying the aggregate `status`. One glance
-gives you the whole system: green, amber, or red (`partial_outage` and
-`major_outage` both read red).
+**Divider (row 25)** — a dotted line carrying the aggregate `status`:
+green, amber, or red (`partial_outage` and `major_outage` both read red).
 
-**Health grid (rows 6–10)** — completely static. Regions are column blocks
-sorted **west → east**, so US sits left of EU like a map; a `GLOBAL` block on
-the right holds everything belonging to no region. Adding a region inserts a
-block and re-widths the row — no code change, no reflash. The tick gutter on the
-far left says which row you're looking at:
+**Services (rows 26–50)** — B/P/D/L/I: billing, proxy, database, LLM providers,
+infrastructure. One dot per region sorted **west → east** (US left of EU, like a
+map), then a gap and one dot for GLOBAL — whatever belongs to no region. Adding
+a region adds a dot, no code change. Each dot is the **worst** status among that
+block's components, so a single sick provider cannot hide behind healthy
+siblings. Green operational, amber degraded, red outage, dim blue unknown.
 
-| Ticks | Row |
-|---|---|
-| `·` | billing (per region) |
-| `··` | proxy (per region) |
-| `···` | databases — `us.postgresql` → US block, unprefixed → GLOBAL |
-| `····` | providers — LLM providers global, `internal_providers` by prefix |
-| `·····` | infrastructure (matched to its region by name) + auth |
-
-Green operational, amber degraded, red outage, dim blue unknown. Where a row has
-several components in one block, they share it as sub-cells.
+`P` appears twice — persist above the divider, proxy below it. The divider and
+the differing dot layouts keep them apart.
 
 **Blue means "we don't know", never "it's fine."** The two feeds go stale
 independently: no successful `/api/v1/status` for 90 s turns the health grid
 blue, and no successful `/api/v1/ci` for 3 minutes turns the centipedes blue,
 each without touching the other.
+
+## Orientation
+
+The default is a counter-clockwise rotation, which is correct when the panel
+stands with its connector at the **bottom**. If yours is mounted the other way
+up, **press button C** — it flips 180° and writes `orientation.txt` to the
+device, so the setting survives a power cycle and nobody has to reflash.
 
 ## Flashing
 
@@ -72,7 +91,8 @@ each without touching the other.
    ```
 3. Copy `main.py` to the device root. It runs at power-on.
 
-Buttons: **A** refreshes both feeds now, **LUX +/−** adjust brightness.
+Buttons: **A** refreshes both feeds, **C** flips orientation, **LUX +/−** adjust
+brightness.
 
 ## What it reads
 
@@ -86,8 +106,8 @@ unauthenticated Actions API allows 60 requests/hour per IP (five repos per
 refresh burns that quickly) and each `actions/runs` response is ~120 KB
 (measured: 124,809 bytes for CIRISServer) — five of those would flatten the
 device's heap. The service polls GitHub on its own cadence with conditional
-requests and serves a ~600-byte projection. See
-`src/ci.rs`; the repos, owner, token and cadence are `status.ci.*` config keys.
+requests and serves a ~600-byte projection. See `src/ci.rs`; the repos, owner,
+token and cadence are `status.ci.*` config keys.
 
 ## History
 
