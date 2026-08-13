@@ -9,7 +9,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::config::Config;
-use crate::model::{HistoryDay, HistoryRegion, ServiceUptime};
+use crate::model::{HistoryDay, HistoryRegion, ServiceUptime, StatusEvent};
 use crate::probe::{check_grafana, check_postgres_tcp, fetch_service_status, Probe};
 
 pub type Db = Arc<Mutex<Connection>>;
@@ -27,7 +27,19 @@ pub fn init(path: &str) -> Result<Db> {
             latency_ms   INTEGER
          );
          CREATE INDEX IF NOT EXISTS idx_status_checks_ts ON status_checks(ts);
-         CREATE INDEX IF NOT EXISTS idx_status_checks_region ON status_checks(region);",
+         CREATE INDEX IF NOT EXISTS idx_status_checks_region ON status_checks(region);
+         -- Transitions, not samples. A daily uptime rollup cannot tell you that
+         -- eu.proxy was degraded for ninety seconds at 14:03 — a 60s blip moves
+         -- a day's mean by 0.07% and is indistinguishable from noise. This is
+         -- where a transient becomes a thing you can point at.
+         CREATE TABLE IF NOT EXISTS status_events (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        TEXT NOT NULL,
+            component TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_status_events_ts ON status_events(ts);",
     )?;
     normalize_legacy_provider_names(&conn);
     purge_unmonitored_brave_rows(&conn);
@@ -98,19 +110,27 @@ fn purge_failure_only_service_rows(conn: &Connection) {
 
 /// Trim samples older than the queryable window.
 fn prune_beyond_retention(conn: &Connection) {
+    for table in ["status_checks", "status_events"] {
+        prune_table(conn, table);
+    }
+}
+
+fn prune_table(conn: &Connection, table: &str) {
     match conn.execute(
-        "DELETE FROM status_checks WHERE ts < datetime('now', ?1)",
+        // Compare against a cutoff in OUR stored format, not `datetime()`'s.
+        &format!("DELETE FROM {table} WHERE ts < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)"),
         rusqlite::params![format!("-{RETENTION_DAYS} days")],
     ) {
         Ok(n) if n > 0 => {
             tracing::info!(
                 rows = n,
+                table,
                 days = RETENTION_DAYS,
-                "history: pruned old samples"
+                "history: pruned old rows"
             )
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "history: retention prune failed"),
+        Err(e) => tracing::warn!(error = %e, table, "history: retention prune failed"),
     }
 }
 
@@ -182,6 +202,50 @@ fn normalize_legacy_provider_names(conn: &Connection) {
             }
         }
     }
+}
+
+/// Append observed transitions, all or nothing.
+///
+/// Transactional and fallible on purpose: the caller advances its baseline only
+/// when this returns `Ok`. Swallowing the error and advancing anyway meant a
+/// failed write lost the transition *permanently* — the component stays in its
+/// new state, so the next cycle sees no diff and there is nothing left to retry.
+pub fn record_events(db: &Db, events: &[StatusEvent]) -> Result<usize> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let mut guard = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
+    let tx = guard.transaction()?;
+    for e in events {
+        tx.execute(
+            "INSERT INTO status_events (ts, component, from_status, to_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![e.ts, e.component, e.from, e.to],
+        )?;
+    }
+    tx.commit()?;
+    Ok(events.len())
+}
+
+/// `/api/v1/status/events` — transitions newest-first within the window.
+pub fn query_events(db: &Db, days: i64, limit: i64) -> Result<Vec<StatusEvent>> {
+    let conn = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
+    let mut stmt = conn.prepare(
+        "SELECT ts, component, from_status, to_status FROM status_events
+         WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)
+         ORDER BY ts DESC, id DESC LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![format!("-{days} days"), limit], |r| {
+            Ok(StatusEvent {
+                ts: r.get(0)?,
+                component: r.get(1)?,
+                from: r.get(2)?,
+                to: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 fn record(conn: &Connection, ts: &str, service: &str, provider: &str, region: &str, p: &Probe) {
@@ -326,7 +390,7 @@ pub fn query_history(db: &Db, days: i64, region: Option<&str>) -> Result<Vec<His
                        PARTITION BY region, service_name, provider_name ORDER BY ts
                    ) AS prev
             FROM status_checks
-            WHERE ts >= datetime('now', ?1)",
+            WHERE ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)",
     );
     if region.is_some() {
         sql.push_str(" AND region = ?2");
@@ -422,7 +486,7 @@ fn round1(v: f64) -> f64 {
 mod repair_tests {
     use super::*;
 
-    fn tmp_db() -> String {
+    pub(super) fn tmp_db() -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::Relaxed);
@@ -760,5 +824,156 @@ mod repair_tests {
                 day = day.date
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    /// Test-only: a write that is expected to succeed. Dropping the `Result`
+    /// would silently ignore exactly the failure this module is about.
+    fn record_events_expect(db: &Db, events: &[StatusEvent]) {
+        let n = record_events(db, events).expect("write must succeed");
+        assert_eq!(n, events.len());
+    }
+
+    #[test]
+    fn events_round_trip_newest_first_and_prune_with_retention() {
+        let path = repair_tests::tmp_db();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        {
+            let db = init(&path).unwrap();
+            record_events_expect(
+                &db,
+                &[
+                    StatusEvent {
+                        ts: now.clone(),
+                        component: "eu.proxy".into(),
+                        from: "operational".into(),
+                        to: "degraded".into(),
+                    },
+                    StatusEvent {
+                        ts: now.clone(),
+                        component: "llm.together".into(),
+                        from: "operational".into(),
+                        to: "degraded".into(),
+                    },
+                ],
+            );
+            // Older than retention: must not survive the next boot.
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO status_events (ts, component, from_status, to_status)
+                 VALUES ('2020-01-01T00:00:00Z', 'ancient.thing', 'operational', 'outage')",
+                [],
+            )
+            .unwrap();
+        }
+        let db = init(&path).unwrap();
+        let got = query_events(&db, 7, 100).unwrap();
+        let names: Vec<_> = got.iter().map(|e| e.component.as_str()).collect();
+        assert!(names.contains(&"eu.proxy") && names.contains(&"llm.together"));
+        assert!(
+            !names.contains(&"ancient.thing"),
+            "retention prunes the events table too"
+        );
+        assert!(got.iter().all(|e| e.to == "degraded"));
+    }
+
+    /// The window must be compared in the format we STORE. `datetime('now',…)`
+    /// yields `2026-08-12 21:07:28` while rows read `2026-08-12T00:00:00Z`, and
+    /// `T` sorts after a space — so every event on the cutoff DATE compared
+    /// greater and a 1-day window returned events up to ~40 hours old.
+    #[test]
+    fn the_day_window_does_not_leak_older_events() {
+        let path = repair_tests::tmp_db();
+        let db = init(&path).unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::hours(30))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let recent = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        record_events_expect(
+            &db,
+            &[
+                StatusEvent {
+                    ts: old,
+                    component: "too.old".into(),
+                    from: "operational".into(),
+                    to: "degraded".into(),
+                },
+                StatusEvent {
+                    ts: recent,
+                    component: "in.window".into(),
+                    from: "operational".into(),
+                    to: "degraded".into(),
+                },
+            ],
+        );
+        let got = query_events(&db, 1, 100).unwrap();
+        let names: Vec<_> = got.iter().map(|e| e.component.as_str()).collect();
+        assert_eq!(names, ["in.window"], "a 30h-old event is not within 1 day");
+    }
+
+    /// Retention must DELETE from the events table, not merely be filtered out
+    /// of a query window — otherwise the table grows without bound and the
+    /// documented 400-day store is a fiction.
+    #[test]
+    fn retention_deletes_events_from_the_table_itself() {
+        let path = repair_tests::tmp_db();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO status_events (ts, component, from_status, to_status)
+                 VALUES ('2020-01-01T00:00:00Z', 'ancient.thing', 'operational', 'outage')",
+                [],
+            )
+            .unwrap();
+        }
+        let db = init(&path).unwrap();
+        let conn = db.lock().unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM status_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "the row must be gone from the table, not just the window"
+        );
+    }
+
+    #[test]
+    fn empty_event_list_is_a_noop() {
+        let path = repair_tests::tmp_db();
+        let db = init(&path).unwrap();
+        assert_eq!(record_events(&db, &[]).unwrap(), 0);
+        assert!(query_events(&db, 7, 100).unwrap().is_empty());
+    }
+
+    /// A failed write must REPORT failure, so the caller can hold its baseline
+    /// and retry. Silently returning `()` meant the transition was lost for
+    /// good: the component stays in its new state, so the next diff is empty.
+    #[test]
+    fn a_failed_write_is_reported_and_writes_nothing() {
+        let path = repair_tests::tmp_db();
+        let db = init(&path).unwrap();
+        let ev = |c: &str| StatusEvent {
+            ts: "2026-08-13T14:03:00Z".into(),
+            component: c.into(),
+            from: "operational".into(),
+            to: "degraded".into(),
+        };
+        assert_eq!(record_events(&db, &[ev("a"), ev("b")]).unwrap(), 2);
+
+        db.lock()
+            .unwrap()
+            .execute("DROP TABLE status_events", [])
+            .unwrap();
+        assert!(
+            record_events(&db, &[ev("c"), ev("d")]).is_err(),
+            "the caller must be able to tell that nothing was persisted"
+        );
     }
 }

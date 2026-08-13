@@ -73,6 +73,14 @@ struct AppState {
     /// Substrate CI snapshot (served by `/api/v1/ci`), refreshed on its own
     /// slower cadence so five GitHub calls don't ride the health poll.
     ci: crate::ci::CiCache,
+    /// The poll loop's latest aggregated snapshot — what `/api/v1/status`
+    /// SERVES. Probing per request meant every viewer sampled the upstreams
+    /// independently, so what a caller saw was never what got recorded: a blip
+    /// the status page rendered existed only in that HTTP response. One
+    /// sampler, one truth, and no probe amplification from page traffic.
+    status: Arc<RwLock<Option<crate::model::AggregatedStatus>>>,
+    /// `component -> status` from the previous cycle, for transition detection.
+    prev_flat: Arc<RwLock<std::collections::BTreeMap<String, String>>>,
     /// Live-push fan-out for roster + health deltas (the "extra website sockets").
     live_tx: broadcast::Sender<LiveDelta>,
 }
@@ -83,6 +91,10 @@ impl AppState {
         self.cfg.read().expect("cfg lock").clone()
     }
 }
+
+/// How many missed poll cycles before a cached snapshot stops being served as
+/// current. Three, to match what the status board uses before it blues out.
+const STALE_AFTER_POLLS: i64 = 3;
 
 fn now_z() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -105,8 +117,75 @@ async fn v1_status(State(st): State<AppState>) -> impl IntoResponse {
     Json(aggregate::service_status(&st.cfg(), &st.client).await)
 }
 
+/// `GET /api/v1/status` — served from the poll loop's snapshot, so a caller sees
+/// exactly what was recorded and attested. Falls back to a live probe only
+/// before the first poll has landed (a freshly booted node still answers).
+///
+/// A cached snapshot is only worth serving while it is fresh. If the lifecycle
+/// stalls — or simply runs long, since the probes are sequential and their
+/// timeouts can exceed the cadence — an old snapshot would otherwise be served
+/// as though it were current, indefinitely and with every appearance of health.
+/// Past `STALE_AFTER_POLLS` cycles the response is marked `stale` and its
+/// overall status becomes `unknown`: we do not know, and saying so is the whole
+/// point of the endpoint.
 async fn api_status(State(st): State<AppState>) -> impl IntoResponse {
-    Json(aggregate::aggregated_status(&st.cfg(), &st.client).await)
+    let cached = st.status.read().expect("status lock").clone();
+    let cfg = st.cfg();
+    match cached {
+        Some(mut agg) => {
+            let max_age = (cfg.poll_seconds as i64) * STALE_AFTER_POLLS;
+            agg.age_seconds = crate::model::age_seconds(&agg.timestamp, chrono::Utc::now());
+            if agg.age_seconds > max_age {
+                tracing::warn!(
+                    age_s = agg.age_seconds,
+                    max_age_s = max_age,
+                    "serving a STALE snapshot — the poll loop has not produced one in time"
+                );
+                agg.stale = true;
+                agg.status = crate::model::UNKNOWN.to_string();
+            }
+            Json(agg)
+        }
+        None => Json(aggregate::aggregated_status(&cfg, &st.client).await),
+    }
+}
+
+#[derive(Deserialize)]
+struct EventParams {
+    days: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// `GET /api/v1/status/events` — observed transitions, newest first. The record
+/// a daily uptime rollup cannot hold: a 60s `degraded` blip moves a day's mean
+/// by 0.07% and reads as noise, but it is a real event with a start and an end.
+async fn events(State(st): State<AppState>, Query(q): Query<EventParams>) -> Response {
+    let days = q.days.unwrap_or(7);
+    if !(1..=365).contains(&days) {
+        return bad("Days must be between 1 and 365");
+    }
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let db = match st.db.read().expect("db lock").clone() {
+        Some(db) => db,
+        None => {
+            return Json(crate::model::EventsResponse {
+                days,
+                events: Vec::new(),
+            })
+            .into_response()
+        }
+    };
+    match history::query_events(&db, days, limit) {
+        Ok(events) => Json(crate::model::EventsResponse { days, events }).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "events query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "detail": "Failed to fetch events" })),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -265,6 +344,8 @@ impl StatusAdapter {
             db: Arc::new(RwLock::new(None)),
             roster: RosterCache::default(),
             ci: crate::ci::CiCache::default(),
+            status: Arc::new(RwLock::new(None)),
+            prev_flat: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             live_tx,
         };
         Ok(StatusAdapter { state })
@@ -413,6 +494,7 @@ impl Adapter for StatusAdapter {
             .route("/api/status", get(api_status))
             .route("/api/v1/status", get(api_status))
             .route("/api/v1/status/history", get(history))
+            .route("/api/v1/status/events", get(events))
             .route("/api/v1/history", get(history))
             .route("/api/v1/scoring", get(scoring))
             .route("/api/v1/ci", get(ci))
@@ -485,6 +567,54 @@ impl Adapter for StatusAdapter {
                     // ── Flow B: probe-derived signed health:liveness emit. ──
                     let agg = aggregate::aggregated_status(&cfg, &self.state.client).await;
                     self.emit_liveness(ctx, &agg).await;
+
+                    // ── Transitions: diff this snapshot against the last, and
+                    // record what changed. This is the only place a transient
+                    // becomes durable — the daily rollup cannot hold it. ──
+                    let flat = aggregate::flatten(&agg);
+                    let events = {
+                        let prev = self.state.prev_flat.read().expect("flat lock").clone();
+                        // The first cycle after boot has no previous snapshot;
+                        // treating it as a diff would log every component as a
+                        // transition from unknown on every restart.
+                        if prev.is_empty() {
+                            Vec::new()
+                        } else {
+                            aggregate::transitions(&prev, &flat, &now_z())
+                        }
+                    };
+                    // The baseline advances ONLY once the transitions are
+                    // durable. If the write fails and we move on, the component
+                    // is already in its new state, so the next cycle sees no
+                    // diff — the transition is lost for good. Holding the old
+                    // baseline means the diff is simply retried next cycle.
+                    let persisted = if events.is_empty() {
+                        true
+                    } else {
+                        for e in &events {
+                            tracing::info!(component = %e.component, from = %e.from, to = %e.to, "status transition");
+                        }
+                        match self.state.db.read().expect("db lock").clone() {
+                            Some(db) => match history::record_events(&db, &events) {
+                                Ok(n) => {
+                                    tracing::debug!(rows = n, "transitions recorded");
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, count = events.len(),
+                                        "transitions NOT recorded — holding the baseline so the diff retries");
+                                    false
+                                }
+                            },
+                            None => false,
+                        }
+                    };
+                    if persisted {
+                        *self.state.prev_flat.write().expect("flat lock") = flat;
+                    }
+
+                    // Serve what we just recorded.
+                    *self.state.status.write().expect("status lock") = Some(agg.clone());
 
                     // ── Flow A: rebuild the public roster from the OWN corpus. ──
                     self.refresh_roster(ctx).await;

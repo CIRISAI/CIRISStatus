@@ -14,7 +14,7 @@ listener) and a background lifecycle (probe → emit signed `health:liveness:v1`
 rebuild the public roster from this node's OWN corpus → cache/history/live push).
 
 The status surface itself is still pure outbound HTTP probes + a SQLite uptime
-history written by the adapter's poll loop. No Grafana, no TimescaleDB, no OAuth,
+history and event log written by the adapter's poll loop. No Grafana, no TimescaleDB, no OAuth,
 no ingest pipeline — those retire with Lens.
 
 > **Zero env (ciris-server 0.5):** ciris-status takes **no environment
@@ -31,7 +31,8 @@ Drop-in for the Lens nginx route (`agents.ciris.ai/lens/api/…` → this servic
 |---|---|
 | `GET /health` | Liveness: `{status:"healthy", timestamp, version}` |
 | `GET /v1/status` | Local providers (postgresql + grafana), live, only if configured |
-| `GET /api/v1/status` | Aggregated multi-region: regions (billing/proxy), infrastructure (Vultr/Hetzner/GHCR), LLM/auth/database/internal provider buckets — all live |
+| `GET /api/v1/status` | Aggregated multi-region: regions (billing/proxy), infrastructure (Vultr/Hetzner/GHCR), LLM/auth/database/internal provider buckets. Served from the poll loop's snapshot (≤ `status.poll_secs` old) so what a caller sees is what was recorded and attested |
+| `GET /api/v1/status/events?days=&limit=` | **Observed transitions**, newest first: `{ts, component, from, to}`. `days` 1–365 (default 7), `limit` ≤ 1000 |
 | `GET /api/v1/status/history?days=&region=` | Daily uptime rollup from SQLite. `days` 1–365 (default 30), `region` ∈ `us\|eu\|global`. Each day carries `date`, `uptime_pct` (and its `overall_uptime_pct` alias), a one-word `status`, and the per-region/service breakdown. `outage_count` counts **incidents**, not samples. |
 | `GET /api/v1/scoring` | **Public scoring roster** (Flow A): opted-in agents `{key_id, capacity_composite, factors?, valid_until}`, consent-gated. Replaces lens-python's scoring feed. Served from cache, populated from this node's OWN corpus by the adapter loop. |
 | `GET /api/v1/ci` | **Substrate build health**: the last 10 GitHub Actions runs per repo (verify → persist → edge → server → agent) as `{repo, runs[]}`, each run one of `success\|failure\|in_progress\|queued\|cancelled`. A ~600-byte projection so a microcontroller can read it in one request; polled server-side with conditional requests (see below). |
@@ -136,6 +137,40 @@ The uptime-history DB path is **not** config — it is derived by convention fro
 the node data dir (`<data_dir>/status.db`). It keeps 400 days (the 365-day
 maximum query window plus slack) and prunes older samples at boot, so an
 append-only table cannot grow without limit on a small node.
+
+### One sampler, one truth
+
+`/api/v1/status` used to probe the upstreams **on every request**. That had two
+consequences worth naming, because both bit us:
+
+- **What was served was never what was recorded.** A caller's request ran its
+  own probe round; the history poller ran a different one 30 seconds later. A
+  transient — say an LLM provider going slow, which degrades both the provider
+  row and the proxy that reports it — could render on the status page and be
+  absent from the history, because the poller's samples straddled it. The
+  physical status board caught exactly this repeatedly, and nothing in the
+  service could corroborate it.
+- **Probe amplification.** Every viewer of the status page triggered real
+  outbound requests to billing, proxy and GHCR, proportional to page traffic.
+
+Now the poll loop is the only sampler. It probes once per cycle, and that single
+snapshot is what gets served, recorded, diffed for transitions, and signed into
+the `health:liveness:v1` attestation. The endpoint is at most `status.poll_secs`
+stale (60s by default); the SSE/WS sockets still push deltas as they happen.
+
+### Transitions, not just averages
+
+A daily uptime rollup cannot express a 90-second blip: it moves the mean by
+0.07% and reads as noise. So each cycle's snapshot is diffed against the
+previous one and every change is appended to `status_events` and served by
+`/api/v1/status/events`:
+
+```json
+{"ts":"2026-08-13T14:03:00Z","component":"eu.proxy","from":"operational","to":"degraded"}
+```
+
+A component that stops being reported transitions to `unknown` rather than
+silently vanishing — losing sight of something must not look like it being fine.
 
 ### Reading the history honestly
 
