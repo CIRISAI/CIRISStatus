@@ -20,6 +20,7 @@
 
 mod adapter;
 mod aggregate;
+mod capability;
 mod ceg;
 mod ci;
 mod config;

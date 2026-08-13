@@ -16,18 +16,48 @@ pub struct Probe {
     pub status: &'static str,
     pub latency_ms: Option<i64>,
     pub message: Option<String>,
+    /// The request never got an answer — connection refused, DNS, timeout. An
+    /// HTTP status, however bad, means the network worked. Distinguishing these
+    /// is what lets the poller tell "the world is down" from "I lost my network"
+    /// (FSD §3.3).
+    pub transport_error: bool,
+    /// What a service said about ITSELF, when it says anything.
+    pub upstream_status: Option<String>,
+}
+
+/// Fewer probes than this and a total failure is indistinguishable from a
+/// genuine multi-target outage, so no vantage verdict is claimed.
+pub const MIN_FOR_VERDICT: usize = 3;
+
+/// Latency verdict, judged on EXCESS over the path's own floor.
+pub fn latency_status(latency_ms: i64, threshold_ms: i64, baseline_ms: i64) -> &'static str {
+    if (latency_ms - baseline_ms).max(0) < threshold_ms {
+        OPERATIONAL
+    } else {
+        DEGRADED
+    }
+}
+
+/// Did every probe this cycle fail at the transport layer? Then the fault is
+/// almost certainly ours: unrelated third parties on three continents do not
+/// fail in the same second. Below [`MIN_FOR_VERDICT`] probes the two cases are
+/// indistinguishable and no verdict is claimed.
+pub fn is_vantage_failure(attempted: usize, transport_failures: usize) -> bool {
+    attempted >= MIN_FOR_VERDICT && transport_failures == attempted
 }
 
 impl Probe {
-    fn ok(latency: i64, threshold: i64) -> Self {
+    /// `latency` is judged on its EXCESS over the path's own floor: a
+    /// transatlantic probe carries ~450-520ms of physics before anything is
+    /// wrong, and judging it against a US-local constant makes EU structurally
+    /// closer to `degraded` for identical health (FSD §3.4 / D4).
+    fn ok(latency: i64, threshold: i64, baseline: i64) -> Self {
         Probe {
-            status: if latency < threshold {
-                OPERATIONAL
-            } else {
-                DEGRADED
-            },
+            status: latency_status(latency, threshold, baseline),
             latency_ms: Some(latency),
             message: None,
+            transport_error: false,
+            upstream_status: None,
         }
     }
     fn down(msg: impl Into<String>) -> Self {
@@ -35,6 +65,17 @@ impl Probe {
             status: OUTAGE,
             latency_ms: None,
             message: Some(msg.into()),
+            transport_error: true,
+            upstream_status: None,
+        }
+    }
+    fn degraded(latency: i64, msg: impl Into<String>) -> Self {
+        Probe {
+            status: DEGRADED,
+            latency_ms: Some(latency),
+            message: Some(msg.into()),
+            transport_error: false,
+            upstream_status: None,
         }
     }
 }
@@ -50,6 +91,7 @@ fn scrub(e: &reqwest::Error) -> &'static str {
 /// Generic HTTP probe: GET `url`, optional headers, optional body-substring
 /// assertion. `< threshold_ms` → operational, else degraded; non-OK code →
 /// degraded `HTTP <code>`; transport error → outage.
+#[allow(clippy::too_many_arguments)]
 pub async fn check_http(
     client: &Client,
     url: &str,
@@ -58,6 +100,7 @@ pub async fn check_http(
     accept_401: bool,
     headers: &[(&str, String)],
     expected_text: Option<&str>,
+    baseline_ms: i64,
 ) -> Probe {
     let start = Instant::now();
     let mut req = client.get(url).timeout(timeout);
@@ -78,19 +121,11 @@ pub async fn check_http(
             };
             let latency = start.elapsed().as_millis() as i64;
             if ok_code && body_ok {
-                Probe::ok(latency, threshold_ms)
+                Probe::ok(latency, threshold_ms, baseline_ms)
             } else if ok_code {
-                Probe {
-                    status: DEGRADED,
-                    latency_ms: Some(latency),
-                    message: Some("unexpected body".into()),
-                }
+                Probe::degraded(latency, "unexpected body")
             } else {
-                Probe {
-                    status: DEGRADED,
-                    latency_ms: Some(latency),
-                    message: Some(format!("HTTP {code}")),
-                }
+                Probe::degraded(latency, format!("HTTP {code}"))
             }
         }
         Err(e) => Probe::down(scrub(&e)),
@@ -100,7 +135,17 @@ pub async fn check_http(
 /// Grafana `/api/health` (threshold 1s).
 pub async fn check_grafana(client: &Client, base: &str) -> Probe {
     let url = format!("{}/api/health", base.trim_end_matches('/'));
-    check_http(client, &url, Duration::from_secs(5), 1000, false, &[], None).await
+    check_http(
+        client,
+        &url,
+        Duration::from_secs(5),
+        1000,
+        false,
+        &[],
+        None,
+        0,
+    )
+    .await
 }
 
 /// Infrastructure host health (Vultr/Hetzner/GHCR). GHCR uses threshold 3s +
@@ -110,6 +155,7 @@ pub async fn check_infrastructure(
     url: &str,
     threshold_ms: i64,
     accept_401: bool,
+    baseline_ms: i64,
 ) -> Probe {
     check_http(
         client,
@@ -119,6 +165,7 @@ pub async fn check_infrastructure(
         accept_401,
         &[],
         None,
+        baseline_ms,
     )
     .await
 }
@@ -150,6 +197,7 @@ pub async fn check_external_provider(
                 false,
                 &headers,
                 expected_text,
+                0,
             )
             .await;
         }
@@ -171,13 +219,9 @@ pub async fn check_reachable(
             let code = resp.status().as_u16();
             let latency = start.elapsed().as_millis() as i64;
             if code < 500 {
-                Probe::ok(latency, threshold_ms)
+                Probe::ok(latency, threshold_ms, 0)
             } else {
-                Probe {
-                    status: DEGRADED,
-                    latency_ms: Some(latency),
-                    message: Some(format!("HTTP {code}")),
-                }
+                Probe::degraded(latency, format!("HTTP {code}"))
             }
         }
         Err(e) => Probe::down(scrub(&e)),
@@ -187,7 +231,11 @@ pub async fn check_reachable(
 /// Fetch a regional service's own `/v1/status`. Returns the derived component
 /// status plus the parsed body (for upstream provider categorization). The
 /// component status prefers the upstream's self-reported `status` on 200.
-pub async fn fetch_service_status(client: &Client, base: &str) -> (Probe, Option<Value>) {
+pub async fn fetch_service_status(
+    client: &Client,
+    base: &str,
+    baseline_ms: i64,
+) -> (Probe, Option<Value>) {
     let url = format!("{}/v1/status", base.trim_end_matches('/'));
     let start = Instant::now();
     match client
@@ -205,29 +253,18 @@ pub async fn fetch_service_status(client: &Client, base: &str) -> (Probe, Option
                     .as_ref()
                     .and_then(|b| b.get("status"))
                     .and_then(Value::as_str);
-                let status = match upstream {
-                    Some(OPERATIONAL) => OPERATIONAL,
-                    Some(DEGRADED) => DEGRADED,
-                    Some(OUTAGE) => OUTAGE,
-                    _ => OPERATIONAL,
-                };
-                (
-                    Probe {
-                        status,
-                        latency_ms: Some(latency),
-                        message: None,
-                    },
-                    body,
-                )
+                // The upstream's own verdict is KEPT, not adopted: it folds
+                // pooled providers into it, we do not (FSD §3.1). Our verdict
+                // starts from transport health.
+                let upstream_status = upstream.map(str::to_string);
+                let mut probe = Probe::ok(latency, 1000, baseline_ms);
+                if matches!(upstream, Some(DEGRADED) | Some(OUTAGE)) {
+                    probe.message = Some(format!("upstream: {}", upstream.unwrap_or("")));
+                }
+                probe.upstream_status = upstream_status;
+                (probe, body)
             } else {
-                (
-                    Probe {
-                        status: DEGRADED,
-                        latency_ms: Some(latency),
-                        message: Some(format!("HTTP {code}")),
-                    },
-                    None,
-                )
+                (Probe::degraded(latency, format!("HTTP {code}")), None)
             }
         }
         Err(e) => (Probe::down(scrub(&e)), None),
@@ -245,12 +282,14 @@ pub async fn check_postgres_tcp(database_url: &str) -> Probe {
     )
     .await
     {
-        Ok(Ok(_)) => Probe::ok(start.elapsed().as_millis() as i64, 1000),
+        Ok(Ok(_)) => Probe::ok(start.elapsed().as_millis() as i64, 1000, 0),
         Ok(Err(_)) => Probe::down("Connection failed"),
         Err(_) => Probe {
             status: OUTAGE,
             latency_ms: Some(5000),
             message: Some("Timeout".into()),
+            transport_error: true,
+            upstream_status: None,
         },
     }
 }
@@ -272,6 +311,37 @@ fn parse_pg_host_port(dsn: &str) -> (String, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D4: a transatlantic path carries ~500ms of physics. Judged against a
+    /// US-local constant, EU is structurally closer to `degraded` for identical
+    /// health; judged on excess over its own floor, identical health reads
+    /// identically.
+    #[test]
+    fn latency_is_judged_on_excess_over_the_paths_own_floor() {
+        // 100ms of excess, on a local path and a transatlantic one.
+        assert_eq!(latency_status(100, 1000, 0), OPERATIONAL);
+        assert_eq!(latency_status(600, 1000, 500), OPERATIONAL);
+        // The same 600ms WITHOUT a baseline is still fine here...
+        assert_eq!(latency_status(600, 1000, 0), OPERATIONAL);
+        // ...but 1200ms is not, unless 500 of it is the path's floor.
+        assert_eq!(latency_status(1200, 1000, 0), DEGRADED);
+        assert_eq!(latency_status(1200, 1000, 500), OPERATIONAL);
+        // A baseline can never make a probe look better than instant.
+        assert_eq!(latency_status(200, 1000, 5000), OPERATIONAL);
+    }
+
+    /// D3: a monitor must not report its own network failure as the world's.
+    #[test]
+    fn a_total_transport_failure_indicts_our_own_vantage() {
+        assert!(is_vantage_failure(6, 6), "everything failed to connect");
+        assert!(
+            !is_vantage_failure(6, 5),
+            "one target answered — the net works"
+        );
+        // Too few probes to tell a local failure from a genuine dual outage.
+        assert!(!is_vantage_failure(2, 2));
+        assert!(!is_vantage_failure(0, 0));
+    }
 
     #[test]
     fn parses_pg_dsn() {

@@ -222,7 +222,7 @@ async fn history(State(st): State<AppState>, Query(q): Query<HistoryParams>) -> 
             .into_response();
         }
     };
-    match history::query_history(&db, days, region.as_deref()) {
+    match history::query_history(&db, days, region.as_deref(), &st.cfg().capabilities) {
         Ok(hist) => Json(HistoryResponse {
             days,
             region,

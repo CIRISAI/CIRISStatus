@@ -35,6 +35,7 @@ Drop-in for the Lens nginx route (`agents.ciris.ai/lens/api/…` → this servic
 | `GET /api/v1/status/events?days=&limit=` | **Observed transitions**, newest first: `{ts, component, from, to}`. `days` 1–365 (default 7), `limit` ≤ 1000 |
 | `GET /api/v1/status/history?days=&region=` | Daily uptime rollup from SQLite. `days` 1–365 (default 30), `region` ∈ `us\|eu\|global`. Each day carries `date`, `uptime_pct` (and its `overall_uptime_pct` alias), a one-word `status`, and the per-region/service breakdown. `outage_count` counts **incidents**, not samples. |
 | `GET /api/v1/scoring` | **Public scoring roster** (Flow A): opted-in agents `{key_id, capacity_composite, factors?, valid_until}`, consent-gated. Replaces lens-python's scoring feed. Served from cache, populated from this node's OWN corpus by the adapter loop. |
+| `GET /api/v1/status` (capabilities) | The same response now carries `capabilities` (per-pool rollup with `min_available`, `available`, and per-member `role`/`status`), an `indicator` (Statuspage v2 severity), and `vantage_failure`. The headline is derived from capabilities, not from whichever component is unhappiest — see `FSD/CAPABILITY_MONITORING.md` |
 | `GET /api/v1/ci` | **Substrate build health**: the last 10 GitHub Actions runs per repo (verify → persist → edge → server → agent) as `{repo, runs[]}`, each run one of `success\|failure\|in_progress\|queued\|cancelled`. A ~600-byte projection so a microcontroller can read it in one request; polled server-side with conditional requests (see below). |
 | `GET /api/v1/scoring/live`, `GET /api/v1/status/live` | **SSE** live-push of roster + overall-health deltas (the "extra website sockets"). |
 | `GET /api/v1/status/ws` | **WebSocket** variant of the same live-push. |
@@ -117,6 +118,9 @@ baked CORS allow-list, and 60s cadence.
 | `status.ci.repos` | list | the substrate five | repos `/api/v1/ci` reports, in render order. Empty ⇒ CI polling off |
 | `status.ci.token` | str | — | GitHub token. Optional: unauthenticated works, but a token raises the ceiling from 60 to 5000 req/hour |
 | `status.ci.poll_secs` | i64 | `300` | CI poll cadence — deliberately slower than `status.poll_secs` |
+| `status.capability.<id>.members` | list | the AI pool | call-path order; `*` marks the primary (`deepinfra*,openrouter,groq`) |
+| `status.capability.<id>.min_available` | i64 | `1` | how many members must be up. `2` of `3` says "serving, but one failure from dark" |
+| `status.region.<r>.latency_baseline_ms` | i64 | `0` | physics floor for probes to this region, subtracted before the threshold |
 
 ### Why `/api/v1/ci` exists
 
@@ -171,6 +175,44 @@ previous one and every change is appended to `status_events` and served by
 
 A component that stops being reported transitions to `unknown` rather than
 silently vanishing — losing sight of something must not look like it being fine.
+
+### Capabilities — what "down" means when the fabric is redundant
+
+A component being unhappy is not a service being impaired. Several providers
+back one capability, so a single slow provider costs nothing — and reporting it
+as degraded service is what put four days of amber on ciris.ai for a provider
+that is not even in the default call path.
+
+A capability is a set of members and a threshold (`min_available`, the model
+[Vigil](https://github.com/valeriansaliou/vigil) uses for replicas):
+
+- `available >= min_available` → operational
+- some available, but below threshold → **degraded** — serving, margin gone
+- none available → outage
+
+Two consequences worth knowing:
+
+- **A pooled provider no longer degrades the service that reports it.** The
+  proxy's own verdict is its transport health folded with the dependencies
+  nothing else can serve; what it said about *itself* is preserved as
+  `upstream_status` rather than silently overwritten.
+- **A declared member nobody measures is `unknown`, never absent.** DeepInfra
+  serves by default and CIRISProxy does not health-check it, so it renders
+  `unknown` — visibly wrong, rather than invisibly missing.
+
+Daily capability SLIs are computed by **exact overlap**, not bounded: every row
+in a poll cycle shares one timestamp, so "were enough members up at the same
+instant" is a `GROUP BY ts`. A consumer working from daily rollups can only say
+"at least the best member's uptime"; we hold the samples, so we say what it was.
+
+### When the monitor is the thing that broke
+
+If every probe in a cycle fails at the **transport** layer, the fault is almost
+certainly ours — unrelated third parties on three continents do not fail in the
+same second. That cycle records `monitor.network` and **nothing else**; writing
+every component down as an outage is how one node's network flicker became four
+days of everyone else's downtime. Below three probes the two cases are
+indistinguishable, so no verdict is claimed.
 
 ### Reading the history honestly
 

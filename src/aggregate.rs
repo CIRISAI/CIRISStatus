@@ -10,9 +10,20 @@ use chrono::Utc;
 use reqwest::Client;
 use serde_json::Value;
 
+use crate::capability;
 use crate::config::Config;
 use crate::model::*;
 use crate::probe::*;
+
+/// Statuses come off the wire owned; the summary field wants a &'static str.
+fn leak_status(s: &str) -> &'static str {
+    match s {
+        DEGRADED => DEGRADED,
+        OUTAGE => OUTAGE,
+        UNKNOWN => UNKNOWN,
+        _ => OPERATIONAL,
+    }
+}
 
 fn now_z() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -172,6 +183,27 @@ fn is_shared_search(p: &Upstream) -> bool {
         || (p.kind.is_none() && matches!(p.id.as_str(), "exa" | "brave"))
 }
 
+/// A router's OWN health: its transport probe folded with the dependencies
+/// nothing else can serve. Pooled members are excluded — the router is serving
+/// fine on the others, and inheriting their unhappiness is what walked one slow
+/// provider to the public headline (FSD §3.1 / D1).
+pub fn service_status_excluding_pools(
+    transport: &'static str,
+    providers: &[Upstream],
+    specs: &[capability::CapabilitySpec],
+) -> &'static str {
+    let mut status = transport;
+    for p in providers {
+        if capability::is_pooled(specs, p.kind.as_deref(), &p.id) {
+            continue;
+        }
+        if severity(&p.status) > severity(status) {
+            status = leak_status(&p.status);
+        }
+    }
+    status
+}
+
 /// Fold one region's CIRISProxy `/v1/status` into the LLM + internal buckets.
 pub(crate) fn fold_proxy(
     llm: &mut BTreeMap<String, ProviderDetail>,
@@ -239,6 +271,28 @@ pub fn flatten(agg: &AggregatedStatus) -> BTreeMap<String, String> {
     for (name, i) in &agg.infrastructure {
         out.insert(format!("infra.{name}"), i.status.clone());
     }
+    // Capabilities are transition subjects in their own right: "the AI pool
+    // went degraded" is the event a reader wants, not five provider rows they
+    // have to correlate. And serving on a fallback gets its own component, so
+    // it is recorded WITHOUT moving the headline (FSD §2.3) — it precedes cost,
+    // latency and quality changes nothing else on the board would explain.
+    for (id, cap) in &agg.capabilities {
+        out.insert(format!("capability.{id}"), cap.status.clone());
+        if cap
+            .members
+            .iter()
+            .any(|m| m.role == crate::model::ROLE_PRIMARY)
+        {
+            out.insert(
+                format!("capability.{id}.primary"),
+                if capability::on_fallback(cap) {
+                    "serving_on_fallback".to_string()
+                } else {
+                    cap.status.clone()
+                },
+            );
+        }
+    }
     for (bucket, map) in [
         ("llm", &agg.llm_providers),
         ("auth", &agg.auth_providers),
@@ -289,6 +343,17 @@ pub fn transitions(
 
 /// `GET /api/v1/status` — the aggregated multi-region status page contract.
 pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatus {
+    let specs = &cfg.capabilities;
+    // Vantage accounting (FSD §3.3): transport failures are OUR network's
+    // problem until proven otherwise; an HTTP status is the upstream's.
+    let mut probes_attempted = 0usize;
+    let mut transport_failures = 0usize;
+    let mut count = |p: &Probe| {
+        probes_attempted += 1;
+        if p.transport_error {
+            transport_failures += 1;
+        }
+    };
     let mut regions: BTreeMap<String, RegionStatus> = BTreeMap::new();
     let mut infrastructure: BTreeMap<String, InfrastructureStatus> = BTreeMap::new();
     let mut llm: BTreeMap<String, ProviderDetail> = BTreeMap::new();
@@ -301,13 +366,15 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
         let mut services: BTreeMap<String, ServiceSummary> = BTreeMap::new();
 
         if let Some(url) = &region.billing_url {
-            let (probe, body) = fetch_service_status(client, url).await;
+            let (probe, body) = fetch_service_status(client, url, region.latency_baseline_ms).await;
+            count(&probe);
             services.insert(
                 "billing".into(),
                 ServiceSummary {
                     name: "Billing & Authentication".into(),
                     status: probe.status.to_string(),
                     latency_ms: probe.latency_ms,
+                    upstream_status: probe.upstream_status.clone(),
                 },
             );
             if let Some(b) = &body {
@@ -316,13 +383,26 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
         }
 
         if let Some(url) = &region.proxy_url {
-            let (probe, body) = fetch_service_status(client, url).await;
+            let (probe, body) = fetch_service_status(client, url, region.latency_baseline_ms).await;
+            count(&probe);
+            // OUR verdict for the router: its own reachability folded with the
+            // dependencies nothing else can serve. A slow member of a redundant
+            // pool is excluded — the proxy is serving fine on the others, and
+            // inheriting its self-report is what walked one slow provider all
+            // the way to the public headline (FSD §3.1 / D1).
+            let svc_status = match &body {
+                Some(b) => {
+                    service_status_excluding_pools(probe.status, &upstream_providers(b), specs)
+                }
+                None => probe.status,
+            };
             services.insert(
                 "proxy".into(),
                 ServiceSummary {
                     name: "LLM Proxy".into(),
-                    status: probe.status.to_string(),
+                    status: svc_status.to_string(),
                     latency_ms: probe.latency_ms,
+                    upstream_status: probe.upstream_status.clone(),
                 },
             );
             if let Some(b) = &body {
@@ -344,7 +424,9 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
 
         // Infrastructure host health (Vultr/Hetzner).
         if let Some(url) = &region.infra_url {
-            let p = check_infrastructure(client, url, 1000, false).await;
+            let p =
+                check_infrastructure(client, url, 1000, false, region.latency_baseline_ms).await;
+            count(&p);
             infrastructure.insert(
                 region.infra_provider.to_string(),
                 InfrastructureStatus {
@@ -359,7 +441,8 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
 
     // ── Container registry (GHCR): higher threshold, 401 == up ──
     {
-        let p = check_infrastructure(client, &cfg.ghcr_url, 3000, true).await;
+        let p = check_infrastructure(client, &cfg.ghcr_url, 3000, true, 0).await;
+        count(&p);
         infrastructure.insert(
             "github".into(),
             InfrastructureStatus {
@@ -404,6 +487,30 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
         );
     }
 
+    // ── Capabilities: the headline comes from what the fabric can DO ──
+    let mut observed: BTreeMap<String, String> = BTreeMap::new();
+    for (id, d) in &llm {
+        observed.insert(id.clone(), d.status.clone());
+    }
+    let mut capabilities: BTreeMap<String, crate::model::CapabilityStatus> = BTreeMap::new();
+    for spec in specs {
+        capabilities.insert(spec.id.clone(), capability::roll_up(spec, &observed));
+    }
+    // Regions and infrastructure are singletons — no pooling across regions
+    // (FSD §2.1: a regional outage is a regional outage).
+    for (key, r) in &regions {
+        capabilities.insert(
+            format!("region.{key}"),
+            capability::singleton(&format!("region.{key}"), &r.status),
+        );
+    }
+    for (name, i) in &infrastructure {
+        capabilities.insert(
+            format!("infra.{name}"),
+            capability::singleton(&format!("infra.{name}"), &i.status),
+        );
+    }
+
     // ── Overall status arithmetic (regions + infrastructure) ──
     let mut considered: Vec<&str> = Vec::new();
     for r in regions.values() {
@@ -414,20 +521,22 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
     for i in infrastructure.values() {
         considered.push(&i.status);
     }
-    let outages = considered.iter().filter(|s| **s == OUTAGE).count();
-    let degraded = considered.contains(&DEGRADED);
-    let overall = if outages >= 3 {
-        "major_outage"
-    } else if outages > 0 {
-        "partial_outage"
-    } else if degraded {
-        DEGRADED
-    } else {
-        OPERATIONAL
-    };
+    let _ = &considered; // superseded by the capability rollup below
+    let overall = capability::overall(&capabilities);
+
+    // Every probe failed at the transport layer: that indicts our own network,
+    // not the simultaneous failure of unrelated third parties on three
+    // continents. Below MIN_FOR_VERDICT probes we cannot tell the difference
+    // and do not claim to (FSD §3.3 / D3).
+    let vantage_failure =
+        probes_attempted >= crate::probe::MIN_FOR_VERDICT && transport_failures == probes_attempted;
+    let overall = if vantage_failure { UNKNOWN } else { overall };
 
     AggregatedStatus {
         status: overall.to_string(),
+        indicator: crate::model::indicator_for(overall),
+        capabilities,
+        vantage_failure,
         timestamp: now_z(),
         age_seconds: 0,
         stale: false,
@@ -494,6 +603,60 @@ mod tests {
         let pg = got.iter().find(|p| p.id == "postgresql").unwrap();
         assert_eq!(pg.status, "operational");
         assert!(pg.kind.is_none(), "billing declares no type");
+    }
+
+    fn up(id: &str, kind: Option<&str>, status: &str) -> Upstream {
+        Upstream {
+            id: id.into(),
+            kind: kind.map(str::to_string),
+            status: status.into(),
+            latency_ms: Some(10),
+        }
+    }
+
+    /// D1, the defect that started this: a pooled provider degrades, and the
+    /// router that merely REPORTS it inherits the unhappiness — which then
+    /// walks through region status to the public headline. Four days of amber
+    /// on ciris.ai for a provider that is not even in the default call path.
+    #[test]
+    fn a_degraded_pool_member_does_not_degrade_its_router() {
+        let specs = crate::capability::default_specs();
+        let providers = [
+            up("together", Some("llm"), DEGRADED),
+            up("groq", Some("llm"), OPERATIONAL),
+            up("billing", Some("internal"), OPERATIONAL),
+        ];
+        assert_eq!(
+            service_status_excluding_pools(OPERATIONAL, &providers, &specs),
+            OPERATIONAL,
+            "the proxy is serving fine on the other providers"
+        );
+    }
+
+    /// But a dependency nothing else can serve DOES degrade it.
+    #[test]
+    fn a_non_pooled_dependency_still_degrades_its_router() {
+        let specs = crate::capability::default_specs();
+        let providers = [
+            up("together", Some("llm"), OUTAGE),
+            up("billing", Some("internal"), OUTAGE),
+        ];
+        assert_eq!(
+            service_status_excluding_pools(OPERATIONAL, &providers, &specs),
+            OUTAGE,
+            "nothing else serves billing"
+        );
+    }
+
+    /// Transport trouble is the router's own, whatever its providers say.
+    #[test]
+    fn transport_health_is_never_masked_by_healthy_providers() {
+        let specs = crate::capability::default_specs();
+        let providers = [up("groq", Some("llm"), OPERATIONAL)];
+        assert_eq!(
+            service_status_excluding_pools(DEGRADED, &providers, &specs),
+            DEGRADED
+        );
     }
 
     /// An upstream that gives only a display name still gets a usable key.
@@ -632,6 +795,7 @@ mod transition_tests {
                 name: "LLM Proxy".into(),
                 status: proxy_eu.to_string(),
                 latency_ms: Some(10),
+                upstream_status: None,
             },
         );
         regions.insert(
@@ -650,6 +814,9 @@ mod transition_tests {
         AggregatedStatus {
             status: status.to_string(),
             timestamp: "2026-08-13T14:03:00Z".into(),
+            indicator: "none",
+            capabilities: BTreeMap::new(),
+            vantage_failure: false,
             age_seconds: 0,
             stale: false,
             last_incident: None,
@@ -692,6 +859,45 @@ mod transition_tests {
         assert!(back
             .iter()
             .all(|e| e.from == DEGRADED && e.to == OPERATIONAL));
+    }
+
+    /// FSD §2.3: the primary goes down, fallbacks carry the traffic. The
+    /// capability stays operational and the headline does not move — but the
+    /// fact is recorded, because it precedes cost and latency changes that
+    /// nothing else on the board would explain.
+    #[test]
+    fn serving_on_a_fallback_is_an_event_not_an_outage() {
+        let spec = crate::capability::CapabilitySpec {
+            id: "ai_providers".into(),
+            label: "AI providers".into(),
+            members: vec![("deepinfra".into(), true), ("groq".into(), false)],
+            min_available: 1,
+        };
+        let observed = |primary: &str| -> BTreeMap<String, String> {
+            [
+                ("deepinfra".to_string(), primary.to_string()),
+                ("groq".to_string(), OPERATIONAL.to_string()),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let healthy = crate::capability::roll_up(&spec, &observed(OPERATIONAL));
+        let on_fallback = crate::capability::roll_up(&spec, &observed(OUTAGE));
+        assert_eq!(on_fallback.status, OPERATIONAL, "fallbacks are serving");
+
+        let mut a = snap(OPERATIONAL, OPERATIONAL, OPERATIONAL);
+        a.capabilities.insert("ai_providers".into(), healthy);
+        let mut b = snap(OPERATIONAL, OPERATIONAL, OPERATIONAL);
+        b.capabilities.insert("ai_providers".into(), on_fallback);
+
+        let events = transitions(&flatten(&a), &flatten(&b), "t");
+        let subjects: Vec<_> = events.iter().map(|e| e.component.as_str()).collect();
+        assert_eq!(
+            subjects,
+            ["capability.ai_providers.primary"],
+            "the primary transition is recorded, and NOTHING else moves"
+        );
+        assert_eq!(events[0].to, "serving_on_fallback");
     }
 
     #[test]

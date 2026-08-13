@@ -91,8 +91,16 @@ pub struct ServiceStatus {
 #[derive(Serialize, Clone)]
 pub struct ServiceSummary {
     pub name: String,
+    /// OUR verdict: the transport probe folded with the upstream's non-pooled
+    /// dependencies. A slow member of a redundant pool does not appear here —
+    /// the router is serving fine on the others (FSD §3.1).
     pub status: String,
     pub latency_ms: Option<i64>,
+    /// What the service said about ITSELF, preserved rather than overwritten.
+    /// It folds pooled providers into its own verdict; we do not, but we also
+    /// do not get to silently discard its opinion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -120,6 +128,15 @@ pub struct ProviderDetail {
 #[derive(Serialize, Clone)]
 pub struct AggregatedStatus {
     pub status: String,
+    /// Statuspage v2 severity for `status`.
+    pub indicator: &'static str,
+    /// Capability rollups (FSD §2.2) — what the headline is derived from.
+    pub capabilities: BTreeMap<String, CapabilityStatus>,
+    /// True when every probe this cycle failed at the transport layer, which
+    /// indicts our own network rather than the world (FSD §3.3). `status` is
+    /// then `unknown`: we cannot see, and saying so beats reporting a global
+    /// outage we have no evidence for.
+    pub vantage_failure: bool,
     pub timestamp: String,
     /// Age of this snapshot when served. A cached snapshot that says nothing
     /// about its own age can be served as current forever by a stalled loop.
@@ -134,6 +151,47 @@ pub struct AggregatedStatus {
     pub auth_providers: BTreeMap<String, ProviderDetail>,
     pub database_providers: BTreeMap<String, ProviderDetail>,
     pub internal_providers: BTreeMap<String, ProviderDetail>,
+}
+
+// ── Capabilities (FSD/CAPABILITY_MONITORING.md §2) ───────────────────────────
+/// One member of a capability, and the role it plays in the call path.
+#[derive(Serialize, Clone, PartialEq, Debug)]
+pub struct CapabilityMember {
+    pub id: String,
+    /// `primary` | `fallback`. Serving on a fallback is not an outage, but it is
+    /// a fact worth surfacing: it precedes cost, latency and quality changes
+    /// that nothing else on the board would explain.
+    pub role: &'static str,
+    /// `unknown` when the member is declared but never reported — silence is
+    /// not health.
+    pub status: String,
+}
+
+/// A thing the fabric can do, and how many members must be up for it to work.
+#[derive(Serialize, Clone, Debug)]
+pub struct CapabilityStatus {
+    pub label: String,
+    pub status: String,
+    pub min_available: usize,
+    pub available: usize,
+    pub members: Vec<CapabilityMember>,
+}
+
+pub const ROLE_PRIMARY: &str = "primary";
+pub const ROLE_FALLBACK: &str = "fallback";
+
+/// Statuspage v2 severity words, so our top line and the vendor feeds we consume
+/// speak one language. Component strings keep their current vocabulary — see
+/// FSD §4 for why renaming them out from under two live consumers is a bad
+/// trade for interop we can get additively.
+pub fn indicator_for(status: &str) -> &'static str {
+    match status {
+        OPERATIONAL => "none",
+        DEGRADED => "minor",
+        "partial_outage" => "major",
+        "major_outage" | OUTAGE => "critical",
+        _ => "none",
+    }
 }
 
 // ── /api/v1/status/events ────────────────────────────────────────────────────
@@ -219,6 +277,12 @@ pub struct HistoryDay {
     pub overall_uptime_pct: f64,
     /// Alias of `overall_uptime_pct`.
     pub uptime_pct: f64,
+    /// Per-capability SLI for the day, computed by EXACT overlap (FSD §2.4).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub capabilities: BTreeMap<String, CapabilitySli>,
+    /// The worst capability's SLI — service availability, as opposed to the
+    /// component mean `uptime_pct` keeps reporting.
+    pub service_uptime_pct: f64,
     /// The day as one word: `operational` ≥ 99.9%, `degraded` ≥ 95%, else
     /// `outage`. Derived here so every consumer draws the same conclusion from
     /// the same number.
@@ -233,6 +297,14 @@ pub fn age_seconds(timestamp: &str, now: chrono::DateTime<chrono::Utc>) -> i64 {
         Ok(t) => (now.naive_utc() - t).num_seconds().max(0),
         Err(_) => 0,
     }
+}
+
+/// A capability's measured availability over a day.
+#[derive(Serialize, Clone, Debug)]
+pub struct CapabilitySli {
+    pub sli_pct: f64,
+    pub min_available: usize,
+    pub members: Vec<String>,
 }
 
 /// Bucket a day's uptime percentage into the status vocabulary.
