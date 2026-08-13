@@ -12,15 +12,21 @@ Ten lettered rows, one list, nothing floats and nothing cycles. Each row is a
 alternate edges — letter left, letter right, letter left — because with 5-row
 letters stacked flush two neighbours on the same edge touch and blur.
 
+Letters alternate edges; the DOTS never move. Letters take either the first
+three columns or the last three, so 3..7 are the only five never covered by a
+glyph, and both halves of the board use exactly those: a repo's five run columns
+line up with the five service columns beneath them.
+
   vy  0-24   REPOS - V/P/E/S/A: verify, persist, edge, server, agent. The ten
-             most recent CI runs as two rows of five dots: older five on the
-             band's first row, newer five two rows below.
-  vy  25     divider, lit in the colour of the OVERALL status
-  vy  26-50  SERVICES - B/P/D/L/I: billing, proxy, database, LLM providers,
-             infrastructure. One dot per region, ordered west to east, then a
-             gap and one dot for GLOBAL (what belongs to no region). Each dot
-             is the WORST status among that block's components, so nothing
-             hides behind a healthy sibling.
+             most recent CI runs as two rows of five dots, on rows 2 and 4 of
+             the letter's five: older five above, newer five below.
+  vy  25-27  REGION HEADER - one column per block, its height counting the
+             column (1, 2, 3), lit in that block's rollup colour.
+  vy  28-52  SERVICES - B/P/D/L/I: billing, proxy, database, LLM providers,
+             infrastructure. One dot per block on the letter's middle row,
+             ordered west to east with GLOBAL last. Each dot is the WORST
+             status among that block's components, so nothing hides behind a
+             healthy sibling.
 
 The repeated P (persist, proxy) is never ambiguous: the divider separates the
 two groups, and their dot layouts differ.
@@ -141,16 +147,17 @@ RUN_ROWS = (1, 3)
 # than parking it on top with four empty rows beneath.
 HEALTH_DOT_ROW = LETTER_H // 2  # 2
 
-# Bands alternate sides: even rows letter-left, odd rows letter-right. With
-# 5-row letters stacked flush there is no blank row between bands, so two
-# letters on the same edge touch and blur into each other; putting neighbours
-# on opposite edges separates them horizontally instead. The whole band mirrors
-# — letter and dots — but the dots themselves always read left to right, so run
-# order and the west-to-east region order never flip.
-DOT_GAP = 2                     # columns between a letter and its dots
-DOT_X_LEFT = LETTER_W + DOT_GAP                          # 5
-LETTER_X_RIGHT = VW - LETTER_W                           # 8
-DOT_X_RIGHT = LETTER_X_RIGHT - DOT_GAP - RUNS_PER_ROW    # 1
+# LETTERS alternate edges: with 5-row letters stacked flush there is no blank
+# row between bands, so two on the same edge touch and blur; putting neighbours
+# on opposite edges separates them horizontally instead.
+#
+# DOTS do not alternate. Letters occupy either the first three columns or the
+# last three, so 3..7 are the only five never covered by a glyph — and both
+# sections use exactly those five. Run dots and service dots therefore sit on
+# ONE grid running down the middle of the board: a repo's five run columns line
+# up with the five service columns beneath them. It also means the service row
+# can hold five blocks when a fourth region exists, in the same columns.
+LETTER_X_RIGHT = VW - LETTER_W  # 8
 
 # The three rows between the two groups are the REGION HEADER: one column per
 # block, lit in that block's own rollup colour, its height counting the column
@@ -255,6 +262,10 @@ centipedes = []   # [(repo, [run_state, ...])]
 
 last_status_ok_ms = None
 last_ci_ok_ms = None
+# The server tells us when ITS snapshot has outlived the poll window. Without
+# this the board treats any HTTP 200 as freshness and would render a stalled
+# node's last healthy snapshot as current, indefinitely.
+server_stale = False
 
 
 def log(msg):
@@ -268,8 +279,9 @@ def _stale(mark, window):
 
 
 def stale():
-    """Health data no longer trustworthy."""
-    return _stale(last_status_ok_ms, STALE_AFTER_MS)
+    """Health data no longer trustworthy — either we cannot reach the service,
+    or the service is telling us its own snapshot is stale."""
+    return server_stale or _stale(last_status_ok_ms, STALE_AFTER_MS)
 
 
 def ci_stale():
@@ -319,6 +331,10 @@ def parse_status(data):
         })
 
     blocks = [r['key'] for r in regions] + ['global']
+    if len(blocks) > CENTRE_COLS:
+        # Never drop a block silently: the board would look healthy by omission.
+        log("  WARNING: %d blocks, only %d columns — %s not shown"
+            % (len(blocks), CENTRE_COLS, ",".join(blocks[CENTRE_COLS:])))
     idx = {}
     for i, b in enumerate(blocks):
         idx[b] = i
@@ -420,12 +436,16 @@ def fetch_json(url):
 
 
 def refresh_status():
-    global last_status_ok_ms
+    global last_status_ok_ms, server_stale
     data = fetch_json(STATUS_URL)
     if data is None:
         return False
     parse_status(data)
     last_status_ok_ms = time.ticks_ms()
+    server_stale = bool(data.get('stale'))
+    if server_stale:
+        log("  server reports a STALE snapshot (age %ss) — showing unknown"
+            % data.get('age_seconds', '?'))
     bad = []
     for (row, b), cells in grid.items():
         for s in cells:
@@ -477,21 +497,19 @@ def pulse_pen(phase):
 
 
 def region_cols(n):
-    """x for each block. Spaced every other column while they fit (3, 5, 7) so
-    neighbouring dots cannot fuse; packed adjacent only if there are more blocks
-    than that allows."""
-    if n <= 0:
-        return []
-    if n <= (CENTRE_COLS + 1) // 2:
-        return [CENTRE_X0 + 2 * i for i in range(n)]
-    return [CENTRE_X0 + i for i in range(min(n, CENTRE_COLS))]
+    """One column per block, packed from the left of the centre grid — the SAME
+    five columns a repo's runs use, so block N sits directly under run column N.
+
+    Two same-coloured neighbours do merge into a bar, which is fine horizontally:
+    a run of green reads as "all green", and anything else breaks the run exactly
+    where it is. That is not the vertical fusion that made the old health rows
+    unreadable, where you could not tell which category you were looking at."""
+    return [CENTRE_X0 + i for i in range(max(0, min(n, CENTRE_COLS)))]
 
 
-def band_side(idx):
-    """(letter_x, first_dot_x) for row `idx`, alternating edges."""
-    if idx % 2:
-        return LETTER_X_RIGHT, DOT_X_RIGHT
-    return 0, DOT_X_LEFT
+def letter_x(idx):
+    """Which edge row `idx`'s letter sits on. Dots never move — see CENTRE_X0."""
+    return LETTER_X_RIGHT if idx % 2 else 0
 
 
 def worst_status(cells):
@@ -511,13 +529,12 @@ def draw_centipedes(phase):
 
     for band in range(CI_BANDS):
         top = band * BAND_H
-        letter_x, dot_x = band_side(band)
         if band < len(centipedes):
             name, runs = centipedes[band]
         else:
             name, runs = '?', []
 
-        draw_letter(letter_x, top, repo_letter(name),
+        draw_letter(letter_x(band), top, repo_letter(name),
                     PEN_UNKNOWN if blue else PEN_LETTER)
 
         for i in range(RUNS):
@@ -528,7 +545,7 @@ def draw_centipedes(phase):
                 )
             else:
                 pen = PEN_EMPTY          # a young repo draws a short centipede
-            vpixel(dot_x + i % RUNS_PER_ROW,
+            vpixel(CENTRE_X0 + i % RUNS_PER_ROW,
                    top + RUN_ROWS[i // RUNS_PER_ROW], pen)
 
 
@@ -558,8 +575,7 @@ def draw_health():
     cols = region_cols(len(blocks))
     for row in range(HEALTH_ROWS):
         y = HEALTH_Y0 + row * BAND_H
-        letter_x, _ = band_side(CI_BANDS + row)
-        draw_letter(letter_x, y, HEALTH_LETTERS[row],
+        draw_letter(letter_x(CI_BANDS + row), y, HEALTH_LETTERS[row],
                     PEN_UNKNOWN if blue else PEN_LETTER)
         for b, x in enumerate(cols):
             cells = grid.get((row, b))
