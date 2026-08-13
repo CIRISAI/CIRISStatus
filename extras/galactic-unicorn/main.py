@@ -8,7 +8,9 @@ Getting this backwards is what made the first version unreadable: five 1px-tall
 rows and a letter drawn sideways.
 
 Ten lettered rows, one list, nothing floats and nothing cycles. Each row is a
-3x5 letter with its status as single-pixel dots in the columns to its right.
+3x5 letter with its status as single-pixel dots beside it, and the rows
+alternate edges — letter left, letter right, letter left — because with 5-row
+letters stacked flush two neighbours on the same edge touch and blur.
 
   vy  0-24   REPOS - V/P/E/S/A: verify, persist, edge, server, agent. The ten
              most recent CI runs as two rows of five dots: older five on the
@@ -130,9 +132,19 @@ BAND_H = LETTER_H               # a row is exactly one letter tall
 CI_BANDS = 5
 RUNS = 10
 
-DOT_X = LETTER_W + 2            # first dot column: letter + a 2px gap
 RUNS_PER_ROW = 5                # 10 runs as 2 rows of 5 — what makes 10 rows fit
 RUN_ROWS = (0, 2)               # a blank row between them so they cannot fuse
+
+# Bands alternate sides: even rows letter-left, odd rows letter-right. With
+# 5-row letters stacked flush there is no blank row between bands, so two
+# letters on the same edge touch and blur into each other; putting neighbours
+# on opposite edges separates them horizontally instead. The whole band mirrors
+# — letter and dots — but the dots themselves always read left to right, so run
+# order and the west-to-east region order never flip.
+DOT_GAP = 2                     # columns between a letter and its dots
+DOT_X_LEFT = LETTER_W + DOT_GAP                          # 5
+LETTER_X_RIGHT = VW - LETTER_W                           # 8
+DOT_X_RIGHT = LETTER_X_RIGHT - DOT_GAP - RUNS_PER_ROW    # 1
 
 DIVIDER_Y = CI_BANDS * BAND_H   # 25
 HEALTH_Y0 = DIVIDER_Y + 1       # 26
@@ -445,6 +457,13 @@ def pulse_pen(phase):
     return graphics.create_pen(int(210 * v), int(140 * v), 0)
 
 
+def band_side(idx):
+    """(letter_x, first_dot_x) for row `idx`, alternating edges."""
+    if idx % 2:
+        return LETTER_X_RIGHT, DOT_X_RIGHT
+    return 0, DOT_X_LEFT
+
+
 def worst_status(cells):
     """Collapse a block's components to the one status that matters."""
     worst, rank = 'unknown', -1
@@ -462,12 +481,13 @@ def draw_centipedes(phase):
 
     for band in range(CI_BANDS):
         top = band * BAND_H
+        letter_x, dot_x = band_side(band)
         if band < len(centipedes):
             name, runs = centipedes[band]
         else:
             name, runs = '?', []
 
-        draw_letter(0, top, repo_letter(name),
+        draw_letter(letter_x, top, repo_letter(name),
                     PEN_UNKNOWN if blue else PEN_LETTER)
 
         for i in range(RUNS):
@@ -478,7 +498,7 @@ def draw_centipedes(phase):
                 )
             else:
                 pen = PEN_EMPTY          # a young repo draws a short centipede
-            vpixel(DOT_X + i % RUNS_PER_ROW,
+            vpixel(dot_x + i % RUNS_PER_ROW,
                    top + RUN_ROWS[i // RUNS_PER_ROW], pen)
 
 
@@ -496,16 +516,20 @@ def draw_health():
     last = len(blocks) - 1
     for row in range(HEALTH_ROWS):
         y = HEALTH_Y0 + row * BAND_H
-        draw_letter(0, y, HEALTH_LETTERS[row],
+        # Keep alternating across the divider: the service rows continue the
+        # repo rows' zigzag rather than restarting it.
+        letter_x, dot_x = band_side(CI_BANDS + row)
+        draw_letter(letter_x, y, HEALTH_LETTERS[row],
                     PEN_UNKNOWN if blue else PEN_LETTER)
+        limit = VW if letter_x == 0 else letter_x - 1
         for b in range(len(blocks)):
             cells = grid.get((row, b))
             if not cells:
                 continue
-            # GLOBAL sits one column further right, so region and global never
+            # GLOBAL sits one column further along, so region and global never
             # read as one run of dots.
-            x = DOT_X + b + (1 if b == last else 0)
-            if x >= VW:
+            x = dot_x + b + (1 if b == last else 0)
+            if x >= limit:
                 continue
             vpixel(x, y, PEN_UNKNOWN if blue
                    else PENS.get(worst_status(cells), PEN_UNKNOWN))

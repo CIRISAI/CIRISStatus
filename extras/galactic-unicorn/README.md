@@ -12,27 +12,32 @@ floats, nothing cycles.
 ```
      +-----------+
    0 |# #  GGGGG |   V verify      runs 1-5  (oldest first)
-   1 |# #        |
    2 |# #  GGGGG |                 runs 6-10 (newest last)
-   3 |# #        |
    4 | #         |
-   5 |##   b##G# |   P persist     queued / cancelled churn
-   7 |##   G#b#G |
+   5 | b##G#  ## |   P persist     letter on the far edge …
+   7 | G#b#G  ## |                 … dots on the near one
   10 |###  GGRGG |   E edge        a failure in the older five
-  15 | ##  GGGGG |   S server
-  17 | #   GGGGY |                 newest run in progress
+  15 | GGGGG   ##|   S server
+  17 | GGGGY   # |                 newest run in progress
   20 | #   GGG.. |   A agent       a young repo: only three runs
   25 |Y Y Y Y Y Y|   overall status
-  26 |##   GG    |   B billing     US EU
+  26 | GG     ## |   B billing     US EU
   31 |##   YY    |   P proxy
-  36 |##   GG    |   D database
+  36 | GG     ## |   D database
   41 |#    GG Y  |   L providers   US EU | GLOBAL
-  46 |###  GG G  |   I infra
+  46 | GG G   ###|   I infra
      +-----------+
 ```
 
-Every row is a 3×5 letter with its status as single-pixel dots in the columns to
-its right. Ten rows fill the board exactly.
+Every row is a 3×5 letter with its status as single-pixel dots beside it. Ten
+rows fill the board exactly.
+
+Rows **alternate edges** — letter left, letter right, letter left. Ten 5-row
+letters stacked flush leave no blank row between them, so two neighbours on the
+same edge touch and blur into each other; putting them on opposite edges
+separates them horizontally instead. The whole band mirrors, letter and dots
+together, but the dots always read left to right, so run order and the
+west-to-east region order never flip.
 
 **Repos (rows 0–24)** — V/P/E/S/A, the substrate in dependency order: verify →
 persist → edge → server → agent. Each row carries that repo's ten most recent
