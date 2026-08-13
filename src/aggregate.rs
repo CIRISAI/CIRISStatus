@@ -429,6 +429,8 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
     AggregatedStatus {
         status: overall.to_string(),
         timestamp: now_z(),
+        age_seconds: 0,
+        stale: false,
         last_incident: None,
         regions,
         infrastructure,
@@ -648,6 +650,8 @@ mod transition_tests {
         AggregatedStatus {
             status: status.to_string(),
             timestamp: "2026-08-13T14:03:00Z".into(),
+            age_seconds: 0,
+            stale: false,
             last_incident: None,
             regions,
             infrastructure: BTreeMap::new(),

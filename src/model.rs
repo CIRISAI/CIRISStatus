@@ -46,6 +46,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_age_is_measured_and_never_negative() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T14:05:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(age_seconds("2026-08-13T14:03:00Z", now), 120);
+        assert_eq!(age_seconds("2026-08-13T14:05:00Z", now), 0);
+        // Clock skew must not read as impossibly old and flap the endpoint.
+        assert_eq!(age_seconds("2026-08-13T14:06:00Z", now), 0);
+        assert_eq!(age_seconds("not a timestamp", now), 0);
+    }
+
+    #[test]
     fn worst_picks_most_severe() {
         assert_eq!(
             worst(["operational", "degraded", "operational"]),
@@ -109,6 +121,12 @@ pub struct ProviderDetail {
 pub struct AggregatedStatus {
     pub status: String,
     pub timestamp: String,
+    /// Age of this snapshot when served. A cached snapshot that says nothing
+    /// about its own age can be served as current forever by a stalled loop.
+    pub age_seconds: i64,
+    /// True when the snapshot has outlived its poll window; `status` is then
+    /// `unknown` rather than a stale-but-healthy-looking verdict.
+    pub stale: bool,
     pub last_incident: Option<serde_json::Value>,
     pub regions: BTreeMap<String, RegionStatus>,
     pub infrastructure: BTreeMap<String, InfrastructureStatus>,
@@ -205,6 +223,16 @@ pub struct HistoryDay {
     /// `outage`. Derived here so every consumer draws the same conclusion from
     /// the same number.
     pub status: &'static str,
+}
+
+/// Seconds between a `%Y-%m-%dT%H:%M:%SZ` stamp and `now`. An unparseable or
+/// future stamp reads as `0` — never as "impossibly old", which would flap the
+/// endpoint into `unknown` on a clock skew.
+pub fn age_seconds(timestamp: &str, now: chrono::DateTime<chrono::Utc>) -> i64 {
+    match chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ") {
+        Ok(t) => (now.naive_utc() - t).num_seconds().max(0),
+        Err(_) => 0,
+    }
 }
 
 /// Bucket a day's uptime percentage into the status vocabulary.

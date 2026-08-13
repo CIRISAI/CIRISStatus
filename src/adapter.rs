@@ -92,6 +92,10 @@ impl AppState {
     }
 }
 
+/// How many missed poll cycles before a cached snapshot stops being served as
+/// current. Three, to match what the status board uses before it blues out.
+const STALE_AFTER_POLLS: i64 = 3;
+
 fn now_z() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
@@ -116,11 +120,33 @@ async fn v1_status(State(st): State<AppState>) -> impl IntoResponse {
 /// `GET /api/v1/status` — served from the poll loop's snapshot, so a caller sees
 /// exactly what was recorded and attested. Falls back to a live probe only
 /// before the first poll has landed (a freshly booted node still answers).
+///
+/// A cached snapshot is only worth serving while it is fresh. If the lifecycle
+/// stalls — or simply runs long, since the probes are sequential and their
+/// timeouts can exceed the cadence — an old snapshot would otherwise be served
+/// as though it were current, indefinitely and with every appearance of health.
+/// Past `STALE_AFTER_POLLS` cycles the response is marked `stale` and its
+/// overall status becomes `unknown`: we do not know, and saying so is the whole
+/// point of the endpoint.
 async fn api_status(State(st): State<AppState>) -> impl IntoResponse {
     let cached = st.status.read().expect("status lock").clone();
+    let cfg = st.cfg();
     match cached {
-        Some(agg) => Json(agg),
-        None => Json(aggregate::aggregated_status(&st.cfg(), &st.client).await),
+        Some(mut agg) => {
+            let max_age = (cfg.poll_seconds as i64) * STALE_AFTER_POLLS;
+            agg.age_seconds = crate::model::age_seconds(&agg.timestamp, chrono::Utc::now());
+            if agg.age_seconds > max_age {
+                tracing::warn!(
+                    age_s = agg.age_seconds,
+                    max_age_s = max_age,
+                    "serving a STALE snapshot — the poll loop has not produced one in time"
+                );
+                agg.stale = true;
+                agg.status = crate::model::UNKNOWN.to_string();
+            }
+            Json(agg)
+        }
+        None => Json(aggregate::aggregated_status(&cfg, &st.client).await),
     }
 }
 
@@ -557,16 +583,35 @@ impl Adapter for StatusAdapter {
                             aggregate::transitions(&prev, &flat, &now_z())
                         }
                     };
-                    if !events.is_empty() {
+                    // The baseline advances ONLY once the transitions are
+                    // durable. If the write fails and we move on, the component
+                    // is already in its new state, so the next cycle sees no
+                    // diff — the transition is lost for good. Holding the old
+                    // baseline means the diff is simply retried next cycle.
+                    let persisted = if events.is_empty() {
+                        true
+                    } else {
                         for e in &events {
                             tracing::info!(component = %e.component, from = %e.from, to = %e.to, "status transition");
                         }
-                        let db = self.state.db.read().expect("db lock").clone();
-                        if let Some(db) = db {
-                            history::record_events(&db, &events);
+                        match self.state.db.read().expect("db lock").clone() {
+                            Some(db) => match history::record_events(&db, &events) {
+                                Ok(n) => {
+                                    tracing::debug!(rows = n, "transitions recorded");
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, count = events.len(),
+                                        "transitions NOT recorded — holding the baseline so the diff retries");
+                                    false
+                                }
+                            },
+                            None => false,
                         }
+                    };
+                    if persisted {
+                        *self.state.prev_flat.write().expect("flat lock") = flat;
                     }
-                    *self.state.prev_flat.write().expect("flat lock") = flat;
 
                     // Serve what we just recorded.
                     *self.state.status.write().expect("status lock") = Some(agg.clone());

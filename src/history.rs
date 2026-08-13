@@ -204,22 +204,27 @@ fn normalize_legacy_provider_names(conn: &Connection) {
     }
 }
 
-/// Append observed transitions.
-pub fn record_events(db: &Db, events: &[StatusEvent]) {
+/// Append observed transitions, all or nothing.
+///
+/// Transactional and fallible on purpose: the caller advances its baseline only
+/// when this returns `Ok`. Swallowing the error and advancing anyway meant a
+/// failed write lost the transition *permanently* — the component stays in its
+/// new state, so the next cycle sees no diff and there is nothing left to retry.
+pub fn record_events(db: &Db, events: &[StatusEvent]) -> Result<usize> {
     if events.is_empty() {
-        return;
+        return Ok(0);
     }
-    if let Ok(conn) = db.lock() {
-        for e in events {
-            if let Err(err) = conn.execute(
-                "INSERT INTO status_events (ts, component, from_status, to_status)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![e.ts, e.component, e.from, e.to],
-            ) {
-                tracing::warn!(error = %err, component = %e.component, "history: event insert failed");
-            }
-        }
+    let mut guard = db.lock().map_err(|_| anyhow::anyhow!("db poisoned"))?;
+    let tx = guard.transaction()?;
+    for e in events {
+        tx.execute(
+            "INSERT INTO status_events (ts, component, from_status, to_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![e.ts, e.component, e.from, e.to],
+        )?;
     }
+    tx.commit()?;
+    Ok(events.len())
 }
 
 /// `/api/v1/status/events` — transitions newest-first within the window.
@@ -936,7 +941,32 @@ mod event_tests {
     fn empty_event_list_is_a_noop() {
         let path = repair_tests::tmp_db();
         let db = init(&path).unwrap();
-        record_events(&db, &[]);
+        assert_eq!(record_events(&db, &[]).unwrap(), 0);
         assert!(query_events(&db, 7, 100).unwrap().is_empty());
+    }
+
+    /// A failed write must REPORT failure, so the caller can hold its baseline
+    /// and retry. Silently returning `()` meant the transition was lost for
+    /// good: the component stays in its new state, so the next diff is empty.
+    #[test]
+    fn a_failed_write_is_reported_and_writes_nothing() {
+        let path = repair_tests::tmp_db();
+        let db = init(&path).unwrap();
+        let ev = |c: &str| StatusEvent {
+            ts: "2026-08-13T14:03:00Z".into(),
+            component: c.into(),
+            from: "operational".into(),
+            to: "degraded".into(),
+        };
+        assert_eq!(record_events(&db, &[ev("a"), ev("b")]).unwrap(), 2);
+
+        db.lock()
+            .unwrap()
+            .execute("DROP TABLE status_events", [])
+            .unwrap();
+        assert!(
+            record_events(&db, &[ev("c"), ev("d")]).is_err(),
+            "the caller must be able to tell that nothing was persisted"
+        );
     }
 }
