@@ -831,13 +831,20 @@ mod repair_tests {
 mod event_tests {
     use super::*;
 
+    /// Test-only: a write that is expected to succeed. Dropping the `Result`
+    /// would silently ignore exactly the failure this module is about.
+    fn record_events_expect(db: &Db, events: &[StatusEvent]) {
+        let n = record_events(db, events).expect("write must succeed");
+        assert_eq!(n, events.len());
+    }
+
     #[test]
     fn events_round_trip_newest_first_and_prune_with_retention() {
         let path = repair_tests::tmp_db();
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         {
             let db = init(&path).unwrap();
-            record_events(
+            record_events_expect(
                 &db,
                 &[
                     StatusEvent {
@@ -888,7 +895,7 @@ mod event_tests {
         let recent = (chrono::Utc::now() - chrono::Duration::hours(2))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
-        record_events(
+        record_events_expect(
             &db,
             &[
                 StatusEvent {
