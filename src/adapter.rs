@@ -11,7 +11,7 @@
 //!     `/api/v1/scoring`, the live SSE/WS sockets), merged onto ciris-server's
 //!     read-API listener (`:4243`). One node, one read surface.
 //!   * [`StatusAdapter::run_lifecycle`] is the background poller: probe the
-//!     external services → (a) emit signed `health:liveness:v1` into the node's
+//!     external services → (a) emit signed `observation:reachability:v1` into the node's
 //!     own corpus (Flow B), (b) rebuild the Flow-A public roster from THIS node's
 //!     OWN corpus (the rows replicated in under `consent:replication`), (c) update
 //!     the roster cache + uptime history + broadcast the live delta. Loops on a
@@ -431,60 +431,54 @@ impl StatusAdapter {
         }
     }
 
-    /// Flow B: probe the configured external services, fold the result into a
-    /// `health:liveness:v1` envelope ABOUT this node, and sign + emit it into the
-    /// node's own corpus. (Per-keyed-service attestation can layer on later via
-    /// a `config:*` service-key map; the node always self-attests its own liveness
-    /// here, and that key is already registered by `serve_with_adapter`.)
-    async fn emit_liveness(&self, ctx: &AdapterContext, agg: &crate::model::AggregatedStatus) {
+    /// Flow B: sign + emit one `observation:reachability:v1` row **per observed
+    /// target** into this node's own corpus.
+    ///
+    /// One row per target, not one folded row for the fabric: the folded shape
+    /// named its targets only in a prose `context`, so the corpus could be asked
+    /// what ciris-status said about *itself* and nothing else. Per-subject rows
+    /// are what `resolve_scores` folds per attester, which is what a second
+    /// vantage needs (`FSD/MULTI_VANTAGE.md` §4).
+    ///
+    /// The claim is first-person by construction — `attester == attested` is
+    /// this node attesting its OWN observation — because "billing is alive" is
+    /// not something a monitor knows. See §2 D5 for the decision and for what
+    /// registering service keys would cost.
+    async fn emit_observations(&self, ctx: &AdapterContext, agg: &crate::model::AggregatedStatus) {
+        let cfg = self.state.cfg();
         let now = chrono::Utc::now();
-        let valid_until = now + chrono::Duration::seconds(self.state.cfg().poll_seconds as i64);
+        // Freshness tracks the EMIT cadence, not the probe cadence. An expiry
+        // that outruns the refresh would let a consumer read a row as current
+        // after we stopped writing it.
+        let valid_until = now + chrono::Duration::seconds(cfg.observation_seconds as i64);
 
-        // Fold every probed region/provider as evidence behind the node's own
-        // liveness score (non-keyed infra is evidence, not a subject — §1/§2.2).
-        let mut evidence: Vec<crate::ceg::EvidenceRef> = Vec::new();
-        for (region_key, region) in &agg.regions {
-            for (svc, summ) in &region.services {
-                evidence.push(crate::ceg::EvidenceRef {
-                    ref_id: format!("service:{region_key}.{svc}"),
-                    status: summ.status.clone(),
-                    latency_ms: summ.latency_ms,
-                    detail: None,
-                });
+        let envs = crate::ceg::observation_envelopes(&cfg, agg, now, valid_until);
+        let total = envs.len();
+        let mut emitted = 0usize;
+        let mut failed = 0usize;
+        for env in &envs {
+            match crate::ceg::emit_observation(&ctx.engine, &ctx.key_id, env).await {
+                Ok(_) => emitted += 1,
+                Err(e) => {
+                    failed += 1;
+                    // Per-row, with the target named: a batch that reports only
+                    // a count cannot tell you WHICH subject stopped being
+                    // attestable, which is the thing worth knowing.
+                    tracing::warn!(
+                        observed = %env.observed,
+                        error = %e,
+                        "Flow B: observation emit failed"
+                    );
+                }
             }
         }
-        for (name, d) in agg
-            .llm_providers
-            .iter()
-            .chain(agg.internal_providers.iter())
-        {
-            evidence.push(crate::ceg::EvidenceRef {
-                ref_id: format!("provider:{name}"),
-                status: d.status.clone(),
-                latency_ms: d.latency_ms,
-                detail: d.source.clone(),
-            });
-        }
-
-        let env = crate::ceg::LivenessEnvelope {
-            attested_key_id: ctx.key_id.clone(),
-            score: crate::ceg::liveness_score(&agg.status),
-            confidence: 0.9,
-            context: format!("ciris-status monitor — overall {}", agg.status),
-            evidence,
-            valid_until,
-            asserted_at: now,
-            epistemic_mode: crate::ceg::EpistemicMode::Derivative,
-        };
-
-        match crate::ceg::emit_liveness(&ctx.engine, &ctx.key_id, &env).await {
-            Ok(hash) => tracing::info!(
-                attestation_id = %hash,
-                overall = %agg.status,
-                "Flow B: emitted signed health:liveness:v1"
-            ),
-            Err(e) => tracing::warn!(error = %e, "Flow B health:liveness emit failed"),
-        }
+        tracing::info!(
+            emitted,
+            failed,
+            total,
+            overall = %agg.status,
+            "Flow B: emitted signed observation:reachability:v1"
+        );
     }
 }
 
@@ -576,9 +570,13 @@ impl Adapter for StatusAdapter {
         let mut last_poll = self.state.cfg().poll_seconds;
         // Far enough in the past that the first tick refreshes CI immediately.
         let mut last_ci = std::time::Instant::now() - Duration::from_secs(86_400);
+        // Same trick for the signed plane: attest on the first cycle, then on
+        // the observation cadence.
+        let mut last_observation = std::time::Instant::now() - Duration::from_secs(86_400);
         tracing::info!(
             poll_s = last_poll,
-            "StatusAdapter lifecycle running (probe → emit_liveness → roster refresh → history)"
+            observation_s = self.state.cfg().observation_seconds,
+            "StatusAdapter lifecycle running (probe → emit observations → roster refresh → history)"
         );
         loop {
             tokio::select! {
@@ -601,7 +599,7 @@ impl Adapter for StatusAdapter {
                         history::poll_once(&cfg, &self.state.client, &db).await;
                     }
 
-                    // ── Flow B: probe-derived signed health:liveness emit. ──
+                    // ── Flow B: probe-derived signed observation emit. ──
                     let agg = aggregate::aggregated_status(&cfg, &self.state.client).await;
                     // A vantage failure means we could not SEE, so the snapshot
                     // is full of synthetic outages we have no evidence for.
@@ -611,7 +609,13 @@ impl Adapter for StatusAdapter {
                     // The only honest handling is to record that WE went blind
                     // and otherwise change nothing.
                     if !agg.vantage_failure {
-                        self.emit_liveness(ctx, &agg).await;
+                        // Metered plane: emit on its OWN cadence, not the probe's.
+                        if last_observation.elapsed()
+                            >= Duration::from_secs(cfg.observation_seconds.max(1))
+                        {
+                            last_observation = std::time::Instant::now();
+                            self.emit_observations(ctx, &agg).await;
+                        }
                     } else {
                         tracing::warn!(
                             "vantage failure — not attesting, not installing this snapshot"

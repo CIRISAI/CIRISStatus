@@ -45,7 +45,7 @@ Everything ciris-status touches is a `scores` attestation on a dimension:
 |---|---|---|
 | Per-agent CIRIS score (the website's "key_id + score") | **`capacity:*`** — `capacity:composite` (𝒞_CIRIS) + factors `capacity:core_identity` (C), `:integrity` (I_int), `:resilience` (R), `:incompleteness_awareness` (I_inc), `:sustained_coherence` (S) | Attested *about* an agent by a `lenscore_detector`. §7.5: an entity may **not** self-emit `capacity:*` (anti-Goodhart). The public roster is a public-tier projection of these rows. |
 | A node's own substrate health | **`system:*`** (§5.3 / §7.2) — `corpus_health:n_eff_measurable`, `federation_directory:replication_lag`, `audit_chain:hash_continuity`, `identity_continuity:relational_anchor` | **Reserved** to the substrate self-reporting: emitter `identity_type ∈ {substrate_persist, substrate_edge}`, steward-cross-attested. `witness_relation: self`. ciris-status **reads** these; it must **not** emit them. |
-| ciris-status's external health observations | **`health:liveness`** (open vocab, §11.2.1) — *proposed leaf* | External witness: `witness_relation: external`, `epistemic_mode: direct` (probe) or `derivative` (proxy-folded). |
+| ciris-status's external health observations | **`observation:reachability:v1`** (open vocab) — *superseded `health:liveness`, see below* | First-person: `witness_relation: self`, `epistemic_mode: direct` (we made the request) or `derivative` (a service told us, and `via` names which). One row per observed target. |
 
 ## 2. The two `scores` flows
 
@@ -78,16 +78,20 @@ health `scores`**.
    ```
    attestation_type: scores
    attesting_key_id:  <ciris-status node key>
-   attested_key_id:   <the CIRIS service node's key_id>
+   attested_key_id:   <the same key — the subject is the OBSERVATION, which is ours>
    envelope: {
-     dimension:        "health:liveness",
+     dimension:        "observation:reachability:v1",
+     observed:         "service:us.billing",          // WHAT we observed
+     endpoint:         "<the URL we hit>",            // direct observations only
+     via:              "service:us.proxy",            // derivative only: who told us
      score:            +1.0 operational | 0.0 degraded | -1.0 outage,
-     confidence:       <probe certainty>,
+     latency_ms:       <the measurement itself>,
+     confidence:       <probe certainty; hearsay is worth less>,
      context:          "<region / target detail>",
-     evidence_refs:    ["<probe result hashes / provider statuses>"],
-     valid_until:      "<now + poll cadence>",        // freshness
+     evidence_refs:    ["<the upstream's own verdict, kept not folded>"],
+     valid_until:      "<now + observation cadence>", // freshness
      epistemic_mode:   "direct" | "derivative",
-     witness_relation: "external",
+     witness_relation: "self",
      stake:            "reputational"
    }
    ```
@@ -96,10 +100,22 @@ health `scores`**.
    verify them. The 60s poller's probe results are the *evidence* behind these
    signed statements, not the product.
 
-**The honest line CEG enforces:** ciris-status speaks **about** services
-(`witness_relation: external`, open-vocab `health:liveness`); it never speaks
-**as** the substrate (`system:*` is reserved and would be a category error — and
-is rejected at admission). Self-report vs. external-observation stays distinct.
+**The honest line, revised 2026-08-14.** This document originally had
+ciris-status speak *about* services on `health:liveness` as an external witness.
+That was wrong in a way worth recording: the row named this node as its own
+subject while declaring `witness_relation: external`, and persist's family rule
+for `health:liveness:` is *a service never attests its own liveness*. It was
+admitted only by a gate keyed on the wrong axis.
+
+The deeper error was epistemic. A monitor cannot sign *"billing is alive"* — it
+does not know that. It knows what happened when it made a request. So the claim
+is first-person on `observation:reachability:v1`, where `attester == attested` is
+correct because the subject is the observation. `health:liveness` becomes
+available honestly once each service is a registered federation key that signs
+for itself; see `FSD/MULTI_VANTAGE.md` §2 D5 for that decision and its cost.
+
+ciris-status still never speaks **as** the substrate (`system:*` is reserved and
+would be a category error — and is rejected at admission).
 
 ## 3. The website surface (the "extra sockets")
 

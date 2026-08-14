@@ -87,6 +87,19 @@ pub struct Config {
     /// DERIVED from the node `data_dir` — convention, not config, not env.
     pub db_path: String,
     pub poll_seconds: u64,
+    /// Cadence for the signed `observation:reachability:v1` emits, DECOUPLED
+    /// from `poll_seconds`.
+    ///
+    /// Authoring is metered: persist charges `PeerWriteQuota` inside
+    /// `put_attestation` on every backend, keyed on the row's author with no
+    /// exemption for a node's own writes — 14,400 rows/day sustained. One row
+    /// per observed target at a 60s probe cadence would spend the entire budget
+    /// on ourselves and leave a peer nothing (the same bucket is charged again
+    /// at any node that replicates us, since it is keyed on OUR key there too).
+    ///
+    /// The page and the SSE stream keep the 60s snapshot: human-facing freshness
+    /// is a local concern. See `FSD/MULTI_VANTAGE.md` §2 D5.
+    pub observation_seconds: u64,
     pub version: &'static str,
     pub grafana_url: Option<String>,
     pub database_url: Option<String>, // local "postgresql" provider (TCP liveness)
@@ -181,6 +194,18 @@ impl Config {
             .filter(|v| *v > 0)
             .unwrap_or(60) as u64;
 
+        // Never faster than the probe cadence: emitting an observation more
+        // often than we observe would re-sign the same measurement under a new
+        // instant, which is what an equivocation check is built to catch.
+        let observation_seconds = graph_config::get_i64(engine, "status.observation_secs")
+            .await
+            .ok()
+            .flatten()
+            .filter(|v| *v > 0)
+            .map(|v| v as u64)
+            .unwrap_or(300)
+            .max(poll_seconds);
+
         let cors_origins = graph_config::get_str_list(engine, "status.cors_origins")
             .await
             .ok()
@@ -253,6 +278,7 @@ impl Config {
         Config {
             db_path,
             poll_seconds,
+            observation_seconds,
             version: env!("CARGO_PKG_VERSION"),
             grafana_url: get_str(engine, "status.grafana_url").await,
             database_url: get_str(engine, "status.database_url").await,
@@ -295,6 +321,7 @@ impl Config {
         Config {
             db_path,
             poll_seconds: 60,
+            observation_seconds: 300,
             version: env!("CARGO_PKG_VERSION"),
             grafana_url: None,
             database_url: None,

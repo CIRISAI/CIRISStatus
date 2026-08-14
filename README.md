@@ -10,7 +10,7 @@ The whole node — the shared persist `Engine`, the Reticulum edge,
 foundation, and NAT-traversal — is `ciris_server::serve_with_adapter`. The status
 page is a `StatusAdapter: ciris_server::Adapter`, mirroring CIRISAgent's adapter
 model: it contributes the status HTTP routers (merged onto the node's read-API
-listener) and a background lifecycle (probe → emit signed `health:liveness:v1` →
+listener) and a background lifecycle (probe → emit signed `observation:reachability:v1` →
 rebuild the public roster from this node's OWN corpus → cache/history/live push).
 
 The status surface itself is still pure outbound HTTP probes + a SQLite uptime
@@ -52,10 +52,14 @@ self-key registration, `consent:replication` peering, and A↔B replication are 
 `ciris-server`'s `serve_with_adapter`. The adapter only contributes the two flows
 of `FSD/MONITORING_NODE_DESIGN.md`:
 
-- **Flow B** — each poll, probe results become a signed CEG `scores` attestation
-  on dimension `health:liveness:v1` (`witness_relation: external`,
-  operational/degraded/outage → `+1/0/-1`). Non-keyed infra (LLM/search
-  providers, regions) folds in as `evidence_refs`, not as separate subjects.
+- **Flow B** — probe results become signed CEG `scores` attestations on
+  dimension `observation:reachability:v1` (`witness_relation: self`,
+  operational/degraded/outage → `+1/0/-1`), **one row per observed target**,
+  each naming what was observed and — when the knowledge is second-hand — who
+  told us. A monitor can honestly sign *"I got 200 in 84ms from billing"*; it
+  cannot sign *"billing is alive"*, which is why this is not `health:liveness`
+  (see `FSD/MULTI_VANTAGE.md` §2 D5). Emitted on `status.observation_secs`
+  (300s), not the probe cadence — authoring is metered.
   Hybrid-signed (Ed25519 + ML-DSA-65) via persist v9.0.3 / verify v6.2.0 over
   `ceg_produce_canonicalize` and written with
   `FederationDirectory::put_attestation` into **this node's own corpus**
@@ -85,7 +89,7 @@ other config is signed CEG, owner-authored at runtime.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--home <path>` | `/var/lib/ciris` | the data root. `data_dir = <home>/data`; corpus `<data_dir>/ciris_engine.db`; minted Ed25519 + ML-DSA-65 identity under `<home>`; the uptime-history DB is **derived** as `<data_dir>/status.db`. The corpus is this node's **OWN** — never share `--home` with / mount the lens node's DB. |
-| `--key-id <name>` | `ciris-status` | the node's federation `key_id` (the `health:liveness` attester; self-registered at boot by `serve_with_adapter`). |
+| `--key-id <name>` | `ciris-status` | the node's federation `key_id` (the observation attester; self-registered at boot by `serve_with_adapter`). |
 
 The node's listen address, transport/NAT-traversal, replication cadence, and mode
 are the **node's** `config:*` CEG (resolved at boot) — see `ciris-server`'s
@@ -104,6 +108,7 @@ baked CORS allow-list, and 60s cadence.
 | key | type | default | meaning |
 |---|---|---|---|
 | `status.poll_secs` | i64 | `60` | probe + roster-refresh + history poll cadence |
+| `status.observation_secs` | i64 | `300` | signed-observation emit cadence. Floored at `status.poll_secs` (never attest more often than we observe) and metered: persist charges 14,400 rows/day against the authoring key, so per-target rows at probe cadence would spend the whole budget on ourselves |
 | `status.cors_origins` | list | baked `ciris.ai` set | CORS allow-list |
 | `status.ghcr_url` | str | `https://ghcr.io/v2/` | container registry (401 = up) |
 | `status.database_url` | str | — | local `postgresql` provider (TCP liveness) |
@@ -161,7 +166,7 @@ consequences worth naming, because both bit us:
 
 Now the poll loop is the only sampler. It probes once per cycle, and that single
 snapshot is what gets served, recorded, diffed for transitions, and signed into
-the `health:liveness:v1` attestation. The endpoint is at most `status.poll_secs`
+the `observation:reachability:v1` attestations. The endpoint is at most `status.poll_secs`
 stale (60s by default); the SSE/WS sockets still push deltas as they happen.
 
 ### Transitions, not just averages

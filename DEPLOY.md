@@ -6,8 +6,8 @@ node + a `StatusAdapter`** (not a parallel federation impl): the whole node —
 identity, the OWN local corpus, `consent:replication` peering, A↔B replication,
 the read API — is `ciris-server`'s `serve_with_adapter`; the status page is the
 adapter. Node B owns its **OWN local corpus**: Flow A reads `capacity:*` signed
-`scores` from **B's own corpus** and Flow B emits signed `health:liveness` into
-it. Node A's `capacity:*` lands in B's corpus by **consented anti-entropy
+`scores` from **B's own corpus** and Flow B emits signed
+`observation:reachability` rows into it. Node A's `capacity:*` lands in B's corpus by **consented anti-entropy
 replication** that `ciris-server` performs — Node B **never reads Node A's
 database directly**.
 
@@ -46,7 +46,7 @@ in a `.env`).
 | Flag | Default | Meaning |
 |---|---|---|
 | `--home <path>` | `/var/lib/ciris` | the data root. `data_dir = <home>/data`; the corpus is `<data_dir>/ciris_engine.db`, the minted Ed25519 + ML-DSA-65 identity lives under `<home>`, and the uptime-history DB is **derived** as `<data_dir>/status.db`. The docker-compose deploy passes `--home /data` (the mounted volume). |
-| `--key-id <name>` | `ciris-status` | this node's federation `key_id` — the `health:liveness` attester. `serve_with_adapter` self-registers it at boot, so Flow B rows admit with no extra step. |
+| `--key-id <name>` | `ciris-status` | this node's federation `key_id` — the observation attester. `serve_with_adapter` self-registers it at boot, so Flow B rows admit with no extra step. |
 
 ```sh
 ciris-status --home /data --key-id ciris-status   # docker-compose passes this as command:
@@ -97,7 +97,7 @@ resolved). Claim ownership of this node, then author a `consent:replication`
 grant naming Node A (desktop client or `POST /v1/federation/peering`). The grant
 lands in the corpus → the reconciler picks it up → A's `capacity:*` flows INTO
 B's own corpus, live. Unset ⇒ B runs solo (self-registers + emits its own
-`health:liveness`; roster stays empty until a grant is authored).
+observations; roster stays empty until a grant is authored).
 
 ```sh
 curl -X POST https://status.ciris.ai/v1/federation/peering \
@@ -142,8 +142,11 @@ cutover covers ONLY the public scoring/status surface (Phase 2 of the design §6
    If `agents` is empty: replication hasn't delivered opted-in `capacity:*` rows
    yet, no consent grant is authored, or this node's key isn't admitted at the peer.
    (Empty is well-formed, not an error.)
-   Verify Flow B emits: look for `Flow B: emitted signed health:liveness:v1` in the
-   logs after one poll cadence.
+   Verify Flow B emits: look for `Flow B: emitted signed observation:reachability:v1`
+   in the logs, with an `emitted=` count. It fires on `status.observation_secs`
+   (300s default), not the probe cadence — the first one lands on the first cycle,
+   then every five minutes. A non-zero `failed=` names the target on its own
+   warning line.
 
 3. **Cut the `ciris.ai/ciris-scoring/` public page lens → status.** Repoint the
    front-end / nginx / Caddy route for the public scoring + status surface from

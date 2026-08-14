@@ -1,34 +1,55 @@
-//! CEG `health:liveness:v1` `scores` attestation shape + the Flow-B emit (probe →
-//! signed `health:liveness`).
+//! CEG `observation:reachability:v1` `scores` attestation shape + the Flow-B emit
+//! (probe → signed observation).
 //!
 //! This is the novel piece the StatusAdapter contributes to the node: it turns
 //! the cost-safe probe results into **first-class, signed, replicable federation
-//! data**. Per `FSD/MONITORING_NODE_DESIGN.md` §2 (Flow B) / §1, the node speaks
-//! *about* services as an **external witness** on the open-vocab `health:liveness`
-//! dimension — it never speaks *as* the substrate (`system:*` is reserved and
+//! data**.
+//!
+//! # Why this is an observation and not a liveness claim
+//!
+//! We cannot sign "billing is alive" — we do not know it. We know that at T,
+//! from this node, a request to billing's health endpoint answered (or did not).
+//! First-person experience is what this key is entitled to bind, so the row's
+//! subject is **the observation**, which is genuinely ours: `attester ==
+//! attested` is correct here, and `witness_relation` is `self`.
+//!
+//! `health:liveness` is the third-person claim, and persist's family rule for it
+//! is *witness_relation MUST be external — a service never attests its own
+//! liveness (attester != attested)*. Emitting it about ourselves was admitted
+//! only by a wrong-axis gate (`attestation_type` rather than the envelope
+//! dimension), and v31 ships that ban fully built. Moving there properly needs
+//! each service to be a registered federation key it signs for itself — see
+//! `FSD/MULTI_VANTAGE.md` §2 D5 for the decision and what it costs.
+//!
+//! The node never speaks *as* the substrate either (`system:*` is reserved and
 //! would be rejected at admission).
 //!
 //! The node itself (engine, signing key, self-registration, consent:replication
 //! peering, and A<->B replication) is ciris-server's job — `serve_with_adapter`
 //! already self-registers this node's signing key in the federation directory, so
-//! the `health:liveness` rows emitted here are authored under a key that's already
-//! admitted. This module is just the envelope shape + the sign-and-put recipe,
-//! driven from the adapter's `run_lifecycle` loop.
+//! the rows emitted here are authored under a key that's already admitted. This
+//! module is just the envelope shape + the sign-and-put recipe, driven from the
+//! adapter's `run_lifecycle` loop.
 
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::probe::Probe;
 
-/// The CEG dimension we emit on. Open-vocab leaf (§11.2.1) — NOT a reserved
-/// prefix, so any `device_class: service` node may emit it (no substrate role
-/// required). Versioned (`:v1`) to satisfy persist's default
+/// The CEG dimension we emit on. Open-vocab leaf — verified against persist
+/// v31.2.0 to be absent from `default_reserved_prefix_rules` (the reserved set
+/// is `system:`, `audit_chain:`, `corpus_health:`, `identity_continuity:`,
+/// `federation_directory:`, `transparency_log:cosigned:`), so no substrate role
+/// is required to emit it. Versioned (`:v1`) to satisfy persist's default
 /// `DimensionAdmissionPolicy { require_version_segment: true }` (admission.rs
 /// §T3) so the emit survives a deployment that turns the admission gate on.
-pub const DIMENSION: &str = "health:liveness:v1";
+pub const DIMENSION: &str = "observation:reachability:v1";
 
-/// `witness_relation` — the node observes services from the outside.
-pub const WITNESS_RELATION_EXTERNAL: &str = "external";
+/// `witness_relation` — we witnessed our OWN probe. Nothing validates this
+/// field (no closed vocabulary, no gate), which is the reason to state it
+/// accurately rather than a reason not to: `external` next to
+/// `attester == attested` was false.
+pub const WITNESS_RELATION_SELF: &str = "self";
 
 /// `stake` — the monitor is reputationally accountable for its claims.
 pub const STAKE_REPUTATIONAL: &str = "reputational";
@@ -37,7 +58,7 @@ pub const STAKE_REPUTATIONAL: &str = "reputational";
 /// `ciris_server::ciris_persist::federation::types::attestation_type::SCORES`).
 pub const ATTESTATION_TYPE_SCORES: &str = "scores";
 
-/// Map a component health string → the CEG `scores` value on `health:liveness`:
+/// Map a component health string → the CEG `scores` value:
 /// operational `+1.0` / degraded `0.0` / outage `-1.0`.
 pub fn liveness_score(status: &str) -> f64 {
     match status {
@@ -70,11 +91,12 @@ impl EpistemicMode {
     }
 }
 
-/// One piece of evidence behind a keyed service's `health:liveness` score.
+/// One piece of evidence behind an observation.
 ///
-/// Non-keyed infra (LLM/search providers, regions, billing/proxy) folds in here
-/// — it has no federation key, so per design §1/§2.2 it is *evidence behind* a
-/// keyed service's health, **not** a subject of its own CEG attestation.
+/// Since the cut-over to per-target rows, an observed target is a SUBJECT in its
+/// own right (`observed`), so this is no longer the place non-keyed infra hides.
+/// It carries what sat behind one target's verdict — the upstream's own opinion
+/// of itself, the probe detail — rather than the whole fabric folded flat.
 #[derive(Clone, Debug, Serialize)]
 pub struct EvidenceRef {
     /// e.g. `"provider:openrouter"`, `"region:us"`, `"probe:billing.us"`.
@@ -99,23 +121,49 @@ impl EvidenceRef {
     }
 }
 
-/// The full CEG `health:liveness` `scores` envelope the node emits per keyed
-/// CIRIS service. This is the canonical-signing payload (the JCS bytes signed),
-/// matching `FSD/MONITORING_NODE_DESIGN.md` §2 Flow B step 3.
+/// The full CEG `observation:reachability` `scores` envelope, **one per observed
+/// target**. This is the canonical-signing payload (the JCS bytes signed).
+///
+/// One row per target rather than one folded row for the whole fabric: the old
+/// shape named its targets only in a prose `context` and in `evidence_refs`, so
+/// no consumer could ask the corpus what we had seen of *billing*. Per-subject
+/// rows are also what `resolve_scores` folds per attester, which is the
+/// mechanism a second vantage needs (`FSD/MULTI_VANTAGE.md` §4).
 #[derive(Clone, Debug)]
-pub struct LivenessEnvelope {
-    /// The CIRIS service node's `key_id` (the subject — goes in the row's
-    /// `attested_key_id`, and is also echoed in the envelope for self-containment).
-    pub attested_key_id: String,
+pub struct ObservationEnvelope {
+    /// **What we observed**, as a stable id in the same vocabulary the history
+    /// tables and `EvidenceRef`s use: `service:us.billing`, `provider:groq`,
+    /// `auth:google_oauth`. Not a federation key — these have none, which is
+    /// precisely why the claim is first-person (see the module doc).
+    pub observed: String,
+    /// The endpoint we actually hit, when we hit one directly. Absent for a
+    /// derivative observation, where we hit something else and it told us.
+    pub endpoint: Option<String>,
+    /// For a derivative observation: WHO told us, in the same id vocabulary.
+    /// `epistemic_mode: derivative` without this is an unattributable rumour.
+    pub via: Option<String>,
     /// `+1.0 | 0.0 | -1.0` (operational/degraded/outage).
     pub score: f64,
+    /// How long it took, when we timed it ourselves. The measurement IS the
+    /// observation — a score with no latency is a verdict with its evidence
+    /// removed, and a second vantage disagreeing about a subject wants to
+    /// compare these, not just the signs.
+    pub latency_ms: Option<i64>,
     /// Probe certainty `[0,1]`.
     pub confidence: f64,
-    /// Region / target detail (e.g. `"US (Chicago) — billing+proxy"`).
+    /// Human detail for the target (e.g. `"US (Chicago) — billing"`).
     pub context: String,
-    /// Provider/region/probe evidence — the non-keyed infra folded in here.
+    /// What sat behind this one target's verdict — the upstream's own opinion,
+    /// the region, the probe. Evidence for THIS observation, not a dumping
+    /// ground for the whole fabric as in the folded shape.
     pub evidence: Vec<EvidenceRef>,
-    /// `now + poll cadence` (freshness; becomes the row's `expires_at`).
+    /// `now + observation cadence` (freshness; becomes the row's `expires_at`).
+    ///
+    /// This tracks `status.observation.poll_secs`, NOT the probe cadence: the
+    /// signed plane is metered (`PeerWriteQuota`, 14,400 rows/day keyed on the
+    /// author) and per-target rows at probe cadence would spend all of it. An
+    /// expiry that outruns the emit cadence would be the worse error — a
+    /// consumer would read a row as current after we stopped refreshing it.
     pub valid_until: chrono::DateTime<chrono::Utc>,
     /// When the observation was made. (`emit_attestation_self` stamps the row's
     /// `asserted_at` itself, CIRISStatus#31, so this is retained for the adapter's
@@ -125,28 +173,220 @@ pub struct LivenessEnvelope {
     pub epistemic_mode: EpistemicMode,
 }
 
-impl LivenessEnvelope {
+impl ObservationEnvelope {
     /// Build the `scores` envelope JSON — the exact object that gets
     /// JCS-canonicalized and hybrid-signed. Stable key set; numbers are plain
     /// JSON numbers (JCS-safe: small integers/one-dp confidences).
+    ///
+    /// No `vantage` member, deliberately (`FSD/MULTI_VANTAGE.md` §3):
+    /// `attesting_key_id` IS the vantage, it is already a filter axis, and one
+    /// node does not observe from several places. The temptation arrives with
+    /// per-target rows and is refused on the same grounds.
     pub fn to_envelope(&self) -> Value {
-        json!({
+        let mut v = json!({
             "dimension": DIMENSION,
+            "observed": self.observed,
             "score": self.score,
             "confidence": self.confidence,
             "context": self.context,
             "evidence_refs": self.evidence,
             "valid_until": rfc3339(self.valid_until),
             "epistemic_mode": self.epistemic_mode.as_str(),
-            "witness_relation": WITNESS_RELATION_EXTERNAL,
+            "witness_relation": WITNESS_RELATION_SELF,
             "stake": STAKE_REPUTATIONAL,
-            "attested_key_id": self.attested_key_id,
-        })
+        });
+        // Absent rather than null: a JCS-canonicalized envelope is the signed
+        // byte string, so an optional member that is sometimes `null` and
+        // sometimes missing is two shapes for one claim.
+        if let Some(e) = &self.endpoint {
+            v["endpoint"] = json!(e);
+        }
+        if let Some(via) = &self.via {
+            v["via"] = json!(via);
+        }
+        if let Some(ms) = self.latency_ms {
+            v["latency_ms"] = json!(ms);
+        }
+        v
     }
 }
 
 fn rfc3339(t: chrono::DateTime<chrono::Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Map a `ProviderDetail.source` to the id of whoever told us.
+///
+/// `cirisproxy.us` → `service:us.proxy`. A `direct.*` source is not a teller at
+/// all — we hit it ourselves — so it returns `None` and the caller emits a
+/// `direct` observation.
+fn via_id(source: &str) -> Option<String> {
+    if source.starts_with("direct.") {
+        return None;
+    }
+    let (who, region) = match source.split_once('.') {
+        Some((w, r)) => (w, Some(r)),
+        None => (source, None),
+    };
+    let svc = match who {
+        "cirisproxy" => "proxy",
+        "cirisbilling" => "billing",
+        // Anything else keeps its own name rather than being forced into the
+        // region.service shape — a wrong attribution is worse than a coarse one.
+        other => return Some(format!("service:{other}")),
+    };
+    Some(match region {
+        Some(r) => format!("service:{r}.{svc}"),
+        None => format!("service:{svc}"),
+    })
+}
+
+/// Turn one aggregated snapshot into the per-target observation envelopes to
+/// sign — **the whole emit set for a cycle**, so its size is the thing to look
+/// at when reasoning about the write quota (`Config::observation_seconds`).
+///
+/// Direct targets (we made the request) carry `endpoint` and
+/// `epistemic_mode: direct`. Everything a service told us about its own
+/// upstreams is `derivative` and carries `via`: we did not touch Groq, we
+/// touched the proxy and it told us about Groq. Collapsing those two into one
+/// claim is how a proxy outage reads as eight provider outages.
+pub fn observation_envelopes(
+    cfg: &crate::config::Config,
+    agg: &crate::model::AggregatedStatus,
+    now: chrono::DateTime<chrono::Utc>,
+    valid_until: chrono::DateTime<chrono::Utc>,
+) -> Vec<ObservationEnvelope> {
+    let mut out = Vec::new();
+    let mut push = |observed: String,
+                    endpoint: Option<String>,
+                    via: Option<String>,
+                    status: &str,
+                    latency_ms: Option<i64>,
+                    context: String,
+                    evidence: Vec<EvidenceRef>| {
+        let epistemic_mode = if via.is_some() {
+            EpistemicMode::Derivative
+        } else {
+            EpistemicMode::Direct
+        };
+        out.push(ObservationEnvelope {
+            observed,
+            endpoint,
+            via,
+            score: liveness_score(status),
+            latency_ms,
+            // A derivative claim is worth less than one we made ourselves, and
+            // saying so is the honest use of the field.
+            confidence: if epistemic_mode == EpistemicMode::Direct {
+                0.9
+            } else {
+                0.7
+            },
+            context,
+            evidence,
+            valid_until,
+            asserted_at: now,
+            epistemic_mode,
+        });
+    };
+
+    // ── Direct: the region services we probe ourselves. ──
+    for (region_key, region) in &agg.regions {
+        let spec = cfg.regions.iter().find(|r| r.key == region_key);
+        for (svc, summ) in &region.services {
+            let endpoint = spec.and_then(|r| match svc.as_str() {
+                "billing" => r.billing_url.clone(),
+                "proxy" => r.proxy_url.clone(),
+                _ => None,
+            });
+            // The service's own opinion of itself, kept as evidence rather than
+            // folded into our verdict — it counts pooled providers we do not.
+            let evidence = summ
+                .upstream_status
+                .as_ref()
+                .map(|u| {
+                    vec![EvidenceRef {
+                        ref_id: format!("upstream:{region_key}.{svc}"),
+                        status: u.clone(),
+                        latency_ms: summ.latency_ms,
+                        detail: Some("the service's own verdict".into()),
+                    }]
+                })
+                .unwrap_or_default();
+            push(
+                format!("service:{region_key}.{svc}"),
+                endpoint,
+                None,
+                &summ.status,
+                summ.latency_ms,
+                format!("{} — {}", region.name, summ.name),
+                evidence,
+            );
+        }
+    }
+
+    // ── Direct: infrastructure (region hosts + the container registry). ──
+    for (key, infra) in &agg.infrastructure {
+        let endpoint = if key == "github" {
+            Some(cfg.ghcr_url.clone())
+        } else {
+            cfg.regions
+                .iter()
+                .find(|r| r.infra_provider == key)
+                .and_then(|r| r.infra_url.clone())
+        };
+        push(
+            format!("infra:{key}"),
+            endpoint,
+            None,
+            &infra.status,
+            infra.latency_ms,
+            infra.name.clone(),
+            Vec::new(),
+        );
+    }
+
+    // ── Providers, direct or reported, each keeping its own provenance. ──
+    let provider_sets: [(
+        &str,
+        &std::collections::BTreeMap<String, crate::model::ProviderDetail>,
+    ); 4] = [
+        ("auth", &agg.auth_providers),
+        ("provider", &agg.llm_providers),
+        ("provider", &agg.internal_providers),
+        ("database", &agg.database_providers),
+    ];
+    for (prefix, set) in provider_sets {
+        for (name, d) in set {
+            let source = d.source.clone().unwrap_or_default();
+            let via = via_id(&source);
+            let endpoint = if via.is_none() {
+                cfg.auth_targets
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, u)| u.clone())
+                    .or_else(|| {
+                        cfg.external
+                            .iter()
+                            .find(|e| e.key == name)
+                            .map(|e| e.url.clone())
+                    })
+            } else {
+                None
+            };
+            push(
+                format!("{prefix}:{name}"),
+                endpoint,
+                via,
+                &d.status,
+                d.latency_ms,
+                source,
+                Vec::new(),
+            );
+        }
+    }
+
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,9 +402,9 @@ use ciris_server::ciris_persist::prelude::Engine;
 // and cross-checks `SHA-256(canonical) == original_content_hash` before a
 // Strict hybrid-verify. Emit MUST sign over THESE bytes.
 
-/// Sign + emit one `health:liveness` `scores` attestation for a keyed service
-/// via persist's `emit_attestation_self` (CIRISStatus#31), returning the row's
-/// `attestation_id`.
+/// Sign + emit ONE `observation:reachability` `scores` attestation — one
+/// observed target — via persist's `emit_attestation_self` (CIRISStatus#31),
+/// returning the row's `attestation_id`.
 ///
 /// `engine` is the node's shared persist `Engine` (from
 /// [`ciris_server::AdapterContext::engine`]); the federation directory the row is
@@ -175,15 +415,15 @@ use ciris_server::ciris_persist::prelude::Engine;
 ///
 /// Recipe mirrors persist's native produce path AND the v9.0.0 federation-tier
 /// ingest gate, which re-derives + verifies against EXACTLY these bytes:
-///   1. build the envelope JSON ([`LivenessEnvelope::to_envelope`]),
+///   1. build the envelope JSON ([`ObservationEnvelope::to_envelope`]),
 ///   2. JCS-canonicalize it via the PRODUCE gate (`ceg_produce_canonicalize`),
 ///   3. `original_content_hash = hex(SHA-256(canonical))`,
 ///   4. `Engine::sign_hybrid(canonical)` → Ed25519 + ML-DSA-65 (base64),
 ///   5. assemble a federation-tier [`Attestation`] and `put_attestation`.
-pub async fn emit_liveness(
+pub async fn emit_observation(
     engine: &Engine,
     key_id: &str,
-    env: &LivenessEnvelope,
+    env: &ObservationEnvelope,
 ) -> Result<String> {
     let _ = key_id;
     // CIRISStatus#31 — emit via persist's `Engine::emit_attestation_self`
@@ -196,8 +436,13 @@ pub async fn emit_liveness(
     // derives `attesting_key_id`/`scrub_key_id` internally from the engine's own
     // composed signer (the #247 floor — never a caller alias), canonicalizes +
     // hybrid-signs, and assembles the federation-tier row — so it CANNOT pick the
-    // raw form. `attested_key_id = None` defaults it to the same derived self key
-    // (this node attesting its own liveness); the envelope carries the subject.
+    // raw form.
+    //
+    // `attested_key_id = None` defaults it to the same derived self key, and here
+    // that is the CORRECT subject rather than a tolerated one: the row asserts an
+    // observation, and the observation is ours. The thing observed has no
+    // federation key — which is exactly why the claim is first-person — and it
+    // rides the envelope's `observed` member.
     use ciris_server::ciris_persist::federation::EmitAttestationInput;
 
     // persist #519/#527 added an explicit write-side cohort_scope: write and read
@@ -206,6 +451,12 @@ pub async fn emit_liveness(
     // claim published so peers can read it. Defaulting this to `self` would leave
     // every status score born (self, local) and unpromotable, which is precisely
     // how the trace plane shipped zero rows for eight releases while staying green.
+    //
+    // `subject_key_ids` stays EMPTY. It is not a label slot for the observed
+    // target: under CIRISPersist#643 a canonical binding hash there confers
+    // revocation authority (`resolve_withdraws_admission_rule` rule 2), and the
+    // previous shape put our own key in it, which named a subject that added
+    // nothing and claimed authority over ourselves.
     let mut input = EmitAttestationInput::with_envelope(
         ATTESTATION_TYPE_SCORES,
         ciris_server::ciris_persist::federation::envelope::EnvelopeCore::from_value(
@@ -215,12 +466,11 @@ pub async fn emit_liveness(
     )
     .with_weight(Some(env.confidence));
     input.expires_at = Some(env.valid_until);
-    input.subject_key_ids = vec![env.attested_key_id.clone()];
 
     engine
         .emit_attestation_self(input)
         .await
-        .map_err(|e| anyhow::anyhow!("emit_attestation_self(health:liveness): {e}"))
+        .map_err(|e| anyhow::anyhow!("emit_attestation_self({DIMENSION}): {e}"))
 }
 
 #[cfg(test)]
@@ -235,44 +485,291 @@ mod tests {
         assert_eq!(liveness_score("unknown"), 0.0);
     }
 
-    #[test]
-    fn envelope_shape_is_stable_and_external() {
-        let env = LivenessEnvelope {
-            attested_key_id: "k_service_us".into(),
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn direct(observed: &str) -> ObservationEnvelope {
+        ObservationEnvelope {
+            observed: observed.into(),
+            endpoint: Some("https://billing.example/health".into()),
+            via: None,
             score: 1.0,
+            latency_ms: Some(84),
             confidence: 0.9,
-            context: "US (Chicago)".into(),
+            context: "US (Chicago) — billing".into(),
             evidence: vec![EvidenceRef {
-                ref_id: "provider:openrouter".into(),
+                ref_id: "probe:us.billing".into(),
                 status: "operational".into(),
                 latency_ms: Some(120),
                 detail: None,
             }],
-            valid_until: chrono::DateTime::parse_from_rfc3339("2026-06-16T00:01:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-            asserted_at: chrono::DateTime::parse_from_rfc3339("2026-06-16T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
+            valid_until: at("2026-06-16T00:05:00Z"),
+            asserted_at: at("2026-06-16T00:00:00Z"),
             epistemic_mode: EpistemicMode::Direct,
-        };
-        let v = env.to_envelope();
+        }
+    }
+
+    #[test]
+    fn envelope_names_what_was_observed() {
+        let v = direct("service:us.billing").to_envelope();
         assert_eq!(v["dimension"], DIMENSION);
-        assert_eq!(v["witness_relation"], WITNESS_RELATION_EXTERNAL);
-        assert_eq!(v["epistemic_mode"], "direct");
         assert_eq!(v["score"], 1.0);
         assert_eq!(v["stake"], STAKE_REPUTATIONAL);
-        // Non-keyed infra is evidence, not a subject.
-        assert_eq!(v["evidence_refs"][0]["ref_id"], "provider:openrouter");
-        // valid_until present for freshness.
+        assert_eq!(v["epistemic_mode"], "direct");
+        // The point of the cut-over: the target is machine-readable, so a
+        // consumer can ask the corpus what we saw of billing. The folded
+        // `health:liveness` shape named it only in prose.
+        assert_eq!(v["observed"], "service:us.billing");
+        assert_eq!(v["endpoint"], "https://billing.example/health");
         assert!(v["valid_until"].is_string());
+    }
+
+    #[test]
+    fn witness_relation_is_self_because_the_observation_is_ours() {
+        // `external` next to attester == attested was false. Nothing validates
+        // this field, which is why the test does.
+        let v = direct("service:us.billing").to_envelope();
+        assert_eq!(v["witness_relation"], WITNESS_RELATION_SELF);
+        assert_eq!(WITNESS_RELATION_SELF, "self");
+    }
+
+    #[test]
+    fn no_vantage_member_until_one_node_observes_from_two_places() {
+        // FSD/MULTI_VANTAGE.md §3: `attesting_key_id` IS the vantage. Pinned
+        // because per-target rows are exactly when someone reaches for it.
+        let v = direct("service:us.billing").to_envelope();
+        assert!(v.get("vantage").is_none(), "no vantage member: {v}");
+        assert!(v.get("observer").is_none(), "no observer member: {v}");
+    }
+
+    #[test]
+    fn optional_members_are_absent_not_null() {
+        // The envelope IS the signed byte string. A member that is sometimes
+        // `null` and sometimes missing is two shapes for one claim.
+        let mut env = direct("provider:groq");
+        env.endpoint = None;
+        env.via = Some("service:us.proxy".into());
+        env.epistemic_mode = EpistemicMode::Derivative;
+        let v = env.to_envelope();
+        assert!(v.get("endpoint").is_none(), "endpoint must be absent: {v}");
+        assert_eq!(v["via"], "service:us.proxy");
+        assert_eq!(v["epistemic_mode"], "derivative");
+    }
+
+    // ── The snapshot → envelope-set builder ──────────────────────────────────
+    fn snapshot() -> crate::model::AggregatedStatus {
+        use crate::model::*;
+        use std::collections::BTreeMap;
+        let mut services = BTreeMap::new();
+        services.insert(
+            "billing".to_string(),
+            ServiceSummary {
+                name: "Billing & Authentication".into(),
+                status: OPERATIONAL.into(),
+                latency_ms: Some(84),
+                upstream_status: Some(DEGRADED.into()),
+            },
+        );
+        services.insert(
+            "proxy".to_string(),
+            ServiceSummary {
+                name: "LLM Proxy".into(),
+                status: OPERATIONAL.into(),
+                latency_ms: Some(90),
+                upstream_status: None,
+            },
+        );
+        let mut regions = BTreeMap::new();
+        regions.insert(
+            "us".to_string(),
+            RegionStatus {
+                name: "US (Chicago)".into(),
+                status: OPERATIONAL.into(),
+                services,
+            },
+        );
+        let mut infrastructure = BTreeMap::new();
+        infrastructure.insert(
+            "github".to_string(),
+            InfrastructureStatus {
+                name: "Container Registry".into(),
+                status: OPERATIONAL.into(),
+                provider: "github".into(),
+                latency_ms: Some(210),
+            },
+        );
+        let mut llm = BTreeMap::new();
+        llm.insert(
+            "groq".to_string(),
+            ProviderDetail {
+                status: OUTAGE.into(),
+                latency_ms: None,
+                source: Some("cirisproxy.us".into()),
+            },
+        );
+        let mut auth = BTreeMap::new();
+        auth.insert(
+            "google_oauth".to_string(),
+            ProviderDetail {
+                status: OPERATIONAL.into(),
+                latency_ms: Some(120),
+                source: Some("direct.google_oauth".into()),
+            },
+        );
+        AggregatedStatus {
+            status: OPERATIONAL.into(),
+            indicator: indicator_for(OPERATIONAL),
+            capabilities: BTreeMap::new(),
+            vantage_failure: false,
+            timestamp: "2026-06-16T00:00:00Z".into(),
+            age_seconds: 0,
+            stale: false,
+            last_incident: None,
+            regions,
+            infrastructure,
+            llm_providers: llm,
+            auth_providers: auth,
+            database_providers: BTreeMap::new(),
+            internal_providers: BTreeMap::new(),
+        }
+    }
+
+    fn built() -> Vec<ObservationEnvelope> {
+        let mut cfg = crate::config::Config::defaults(String::new());
+        cfg.auth_targets = vec![(
+            "google_oauth".to_string(),
+            "https://oauth2.googleapis.com/tokeninfo".to_string(),
+        )];
+        if let Some(us) = cfg.regions.iter_mut().find(|r| r.key == "us") {
+            us.billing_url = Some("https://billing.example/health".into());
+            us.proxy_url = Some("https://proxy.example/v1/status".into());
+        }
+        observation_envelopes(
+            &cfg,
+            &snapshot(),
+            at("2026-06-16T00:00:00Z"),
+            at("2026-06-16T00:05:00Z"),
+        )
+    }
+
+    fn find<'a>(v: &'a [ObservationEnvelope], observed: &str) -> &'a ObservationEnvelope {
+        v.iter()
+            .find(|e| e.observed == observed)
+            .unwrap_or_else(|| panic!("no envelope for {observed}"))
+    }
+
+    #[test]
+    fn every_observed_target_gets_its_own_row() {
+        let envs = built();
+        for want in [
+            "service:us.billing",
+            "service:us.proxy",
+            "infra:github",
+            "provider:groq",
+            "auth:google_oauth",
+        ] {
+            let _ = find(&envs, want);
+        }
+        assert_eq!(envs.len(), 5, "one row per target, no folding");
+    }
+
+    #[test]
+    fn what_we_probed_is_direct_and_carries_its_endpoint() {
+        let envs = built();
+        let billing = find(&envs, "service:us.billing");
+        assert_eq!(billing.epistemic_mode, EpistemicMode::Direct);
+        assert_eq!(
+            billing.endpoint.as_deref(),
+            Some("https://billing.example/health")
+        );
+        assert_eq!(billing.via, None);
+        assert_eq!(billing.latency_ms, Some(84));
+        // The service's own verdict is kept as evidence, not folded into ours:
+        // it counts pooled providers we deliberately do not.
+        assert_eq!(billing.evidence.len(), 1);
+        assert_eq!(billing.evidence[0].status, crate::model::DEGRADED);
+    }
+
+    #[test]
+    fn what_a_service_told_us_is_derivative_and_names_the_teller() {
+        // We never touched Groq. We touched the proxy, and it told us. Merging
+        // those into one first-person claim is how one proxy outage reads as
+        // eight independent provider outages.
+        let envs = built();
+        let groq = find(&envs, "provider:groq");
+        assert_eq!(groq.epistemic_mode, EpistemicMode::Derivative);
+        assert_eq!(groq.via.as_deref(), Some("service:us.proxy"));
+        assert_eq!(groq.endpoint, None);
+        assert!(
+            groq.confidence < find(&envs, "service:us.billing").confidence,
+            "hearsay must not be worth as much as a measurement we made"
+        );
+    }
+
+    #[test]
+    fn a_directly_probed_provider_is_not_hearsay() {
+        // 0.3.45 started probing the identity providers ourselves precisely so
+        // their health stopped being a value lifted out of billing's report.
+        let envs = built();
+        let google = find(&envs, "auth:google_oauth");
+        assert_eq!(google.epistemic_mode, EpistemicMode::Direct);
+        assert_eq!(google.via, None);
+        assert_eq!(
+            google.endpoint.as_deref(),
+            Some("https://oauth2.googleapis.com/tokeninfo")
+        );
+    }
+
+    #[test]
+    fn via_maps_a_source_to_the_teller_and_refuses_to_guess() {
+        assert_eq!(via_id("cirisproxy.eu").as_deref(), Some("service:eu.proxy"));
+        assert_eq!(
+            via_id("cirisbilling.us").as_deref(),
+            Some("service:us.billing")
+        );
+        // Not ours to reshape: keep the name we were given rather than forcing
+        // it into region.service and attributing the claim to the wrong node.
+        assert_eq!(via_id("cirislens").as_deref(), Some("service:cirislens"));
+        // We hit it ourselves — there is no teller.
+        assert_eq!(via_id("direct.google_oauth"), None);
+    }
+
+    #[test]
+    fn a_cycle_fits_inside_the_write_quota() {
+        // persist charges PeerWriteQuota per put, keyed on the AUTHOR:
+        // 14_400 rows/day. At the 300s default that is 288 cycles/day, so a
+        // cycle has ~50 rows of room. This test exists so that adding targets
+        // is a decision rather than an accident.
+        const SUSTAINED_ROWS_PER_DAY: usize = 14_400;
+        const DEFAULT_OBSERVATION_SECS: usize = 300;
+        let cycles_per_day = 86_400 / DEFAULT_OBSERVATION_SECS;
+        let per_cycle = built().len();
+        assert!(
+            per_cycle * cycles_per_day < SUSTAINED_ROWS_PER_DAY / 2,
+            "{per_cycle} rows/cycle × {cycles_per_day} cycles leaves no headroom for a peer"
+        );
+    }
+
+    #[test]
+    fn a_derivative_observation_names_who_told_us() {
+        // Second-hand knowledge that cannot say whose it is cannot be checked
+        // against the teller later.
+        let mut env = direct("provider:groq");
+        env.epistemic_mode = EpistemicMode::Derivative;
+        env.via = Some("service:us.proxy".into());
+        let v = env.to_envelope();
+        assert_eq!(v["epistemic_mode"], "derivative");
+        assert!(v["via"].is_string());
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Flow B — REAL probe→emit sign path proof. Builds a `LivenessEnvelope`,
+// Flow B — REAL probe→emit sign path proof. Builds an `ObservationEnvelope`,
 // JCS-canonicalizes via the PRODUCE gate, hybrid-signs, and `put_attestation`s a
-// federation-tier `health:liveness:v1` row via `emit_liveness`. Mirrors the node
+// federation-tier `observation:reachability:v1` row via `emit_observation`. Mirrors the node
 // runtime: the attesting (node) key must be self-registered first (what
 // `serve_with_adapter` does at boot) before the row is admissible.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -330,7 +827,7 @@ mod flow_b_emit {
     }
 
     /// Self-register the node's witness key (what ciris-server does at boot) so
-    /// `emit_liveness` rows pass the attesting-key gate.
+    /// `emit_observation` rows pass the attesting-key gate.
     async fn register_self_key(engine: &Engine, key_id: &str) {
         // CIRISStatus#31 — register the engine's OWN DERIVED key_id (what
         // `serve_with_adapter` does in production and what `emit_attestation_self`
@@ -353,52 +850,71 @@ mod flow_b_emit {
         }
     }
 
-    fn sample_env(attested: &str) -> LivenessEnvelope {
-        LivenessEnvelope {
-            attested_key_id: attested.into(),
+    fn sample_env(observed: &str) -> ObservationEnvelope {
+        ObservationEnvelope {
+            observed: observed.into(),
+            endpoint: Some("https://billing.example/health".into()),
+            via: None,
             score: liveness_score(crate::model::OPERATIONAL),
+            latency_ms: Some(84),
             confidence: 0.9,
-            context: "ciris-status monitor — overall operational".into(),
+            context: "US (Chicago) — billing".into(),
             evidence: vec![EvidenceRef {
-                ref_id: "provider:openrouter".into(),
+                ref_id: "probe:us.billing".into(),
                 status: "operational".into(),
                 latency_ms: Some(120),
                 detail: None,
             }],
-            valid_until: chrono::Utc::now() + chrono::Duration::seconds(60),
+            valid_until: chrono::Utc::now() + chrono::Duration::seconds(300),
             asserted_at: chrono::Utc::now(),
-            epistemic_mode: EpistemicMode::Derivative,
+            epistemic_mode: EpistemicMode::Direct,
         }
     }
 
     #[tokio::test]
-    async fn self_registration_admits_signed_health_liveness() {
+    async fn self_registration_admits_a_signed_observation() {
         const NODE: &str = "ciris-status-monitor";
         let (engine, _seeds) = node(NODE).await;
 
         // Before self-registration the attesting key is absent → emit rejected.
-        let env = sample_env(NODE);
-        let before = emit_liveness(&engine, NODE, &env).await;
+        let env = sample_env("service:us.billing");
+        let before = emit_observation(&engine, NODE, &env).await;
         assert!(
             before.is_err(),
             "without self-registration the attesting key is absent → emit must be rejected"
         );
 
-        // Self-register (the node attests its OWN liveness → subject == attester,
-        // both satisfied by this one key), then the emit is admissible.
+        // Self-register, then the emit is admissible. attester == attested is
+        // the node attesting its OWN observation, which is what it witnessed.
         register_self_key(&engine, NODE).await;
-        let hash = emit_liveness(&engine, NODE, &env)
+        let hash = emit_observation(&engine, NODE, &env)
             .await
-            .expect("after self-registration, health:liveness must be admitted");
+            .expect("after self-registration, the observation must be admitted");
         assert!(
             !hash.is_empty(),
             "emit_attestation_self returns the attestation_id"
         );
     }
 
+    /// The reason for the cut-over, as a test: `observation:` is unreserved, so
+    /// the substrate admits it from a key holding no substrate role. If a future
+    /// persist reserves the prefix, this fails here rather than in production.
+    #[tokio::test]
+    async fn the_observation_prefix_needs_no_substrate_role() {
+        const NODE: &str = "ciris-status-unprivileged";
+        let (engine, _seeds) = node(NODE).await;
+        register_self_key(&engine, NODE).await;
+
+        // `witness` identity_type, no infra:* capability roles — the same
+        // standing a monitor actually has.
+        emit_observation(&engine, NODE, &sample_env("provider:groq"))
+            .await
+            .expect("observation:* is open vocabulary — no reserved-prefix gate");
+    }
+
     #[tokio::test]
     async fn degraded_and_outage_map_to_zero_and_negative() {
-        let mut env = sample_env("ciris-status-monitor");
+        let mut env = sample_env("service:us.billing");
         env.score = liveness_score(crate::model::DEGRADED);
         assert_eq!(env.to_envelope()["score"], 0.0);
         env.score = liveness_score(crate::model::OUTAGE);
