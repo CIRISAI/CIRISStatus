@@ -122,6 +122,7 @@ baked CORS allow-list, and 60s cadence.
 | `status.capability.<id>.members` | list | the AI pool | call-path order; `*` marks the primary (`deepinfra*,openrouter,groq`) |
 | `status.capability.<id>.min_available` | i64 | `1` | how many members must be up. `2` of `3` says "serving, but one failure from dark" |
 | `status.region.<r>.latency_baseline_ms` | i64 | `0` | physics floor for probes to this region, subtracted before the threshold |
+| `status.auth.<id>.url` | str | baked Google endpoints | direct keyless probe for an identity provider; `""` disables it and falls back to billing's report |
 
 ### Why `/api/v1/ci` exists
 
@@ -205,6 +206,26 @@ Daily capability SLIs are computed by **exact overlap**, not bounded: every row
 in a poll cycle shares one timestamp, so "were enough members up at the same
 instant" is a `GROUP BY ts`. A consumer working from daily rollups can only say
 "at least the best member's uptime"; we hold the samples, so we say what it was.
+
+### Two observers of one dependency
+
+Identity-provider health used to be lifted out of CIRISBilling's `/v1/status`.
+Billing probes Google and folds the result into its own status, so **one**
+measurement reached the page twice: the billing service row and the auth
+provider row moved together, which looked like corroboration and localised
+nothing. There was no way to tell "Google is down" from "billing cannot reach
+Google".
+
+We now probe the same endpoints directly — keyless and free, mirroring what
+billing probes so the two observations are comparable — and keep billing's
+report as a second observation rather than as the answer:
+
+- **Everyone sees it** → it is Google.
+- **Only billing sees it** → it is billing's path to Google, or billing.
+
+Both views are recorded and served by `/api/v1/status/vantage`. Nothing about
+the rollups changed: the comparison rows live under the `observation` service
+that every uptime calculation ignores.
 
 ### Is it them, or is it us?
 

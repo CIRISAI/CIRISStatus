@@ -245,7 +245,7 @@ pub(crate) fn fold_proxy(
 /// internal buckets.
 pub(crate) fn fold_billing(
     database: &mut BTreeMap<String, ProviderDetail>,
-    auth: &mut BTreeMap<String, ProviderDetail>,
+    auth_reports: &mut Vec<(String, String, String)>,
     internal: &mut BTreeMap<String, ProviderDetail>,
     region_key: &str,
     body: &Value,
@@ -261,9 +261,15 @@ pub(crate) fn fold_billing(
             "postgresql" => {
                 database.insert(format!("{region_key}.postgresql"), d);
             }
-            // Shared external identity providers, checked from every region →
-            // one row, worst vantage point wins.
-            "google_oauth" | "google_play" => merge_worst(auth, p.id, d),
+            // Billing's OPINION of an identity provider — recorded as a second
+            // observation, not as the value we serve. Billing probes Google and
+            // folds the result into its own status, so lifting it into
+            // `auth_providers` made ONE measurement appear as two independent
+            // signals: the billing row and the auth dot moved together and
+            // looked like corroboration.
+            "google_oauth" | "google_play" => {
+                auth_reports.push((region_key.to_string(), p.id, p.status))
+            }
             // Anything billing grows later: surfaced as a regional internal dep
             // instead of dropped on the floor.
             _ => {
@@ -398,6 +404,9 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
             transport_failures += 1;
         }
     };
+    // What each region's billing service SAYS about the identity providers —
+    // compared against our own direct probe, never substituted for it.
+    let mut billing_auth_reports: Vec<(String, String, String)> = Vec::new();
     // Providers the fold classified as routable-but-undeclared.
     let mut informational_ids: std::collections::BTreeSet<String> = Default::default();
     let mut regions: BTreeMap<String, RegionStatus> = BTreeMap::new();
@@ -434,7 +443,13 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
                 },
             );
             if let Some(b) = &body {
-                fold_billing(&mut database, &mut auth, &mut internal, region.key, b);
+                fold_billing(
+                    &mut database,
+                    &mut billing_auth_reports,
+                    &mut internal,
+                    region.key,
+                    b,
+                );
             }
         }
 
@@ -551,6 +566,31 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
             ext.display.to_string(),
             detail(p.status, p.latency_ms, format!("direct.{}", ext.key)),
         );
+    }
+
+    // ── Identity providers, probed DIRECTLY (keyless, free) ────────────────
+    // Our own observation is what we serve. Billing's report becomes a
+    // comparison rather than the answer, so a disagreement localises the fault:
+    // both see it -> Google; only billing sees it -> billing's path to Google.
+    for (id, url) in &cfg.auth_targets {
+        // Any HTTP answer proves reachability — Google's tokeninfo returns 400
+        // without a token, which is a healthy endpoint refusing a bad request.
+        let p = check_reachable(client, url, std::time::Duration::from_secs(10), 2000).await;
+        count(&p);
+        auth.insert(
+            id.clone(),
+            detail(p.status, p.latency_ms, format!("direct.{id}")),
+        );
+    }
+    // Where we have no direct probe, billing's word beats nothing.
+    for (region_key, id, status) in &billing_auth_reports {
+        if !cfg.auth_targets.iter().any(|(t, _)| t == id) {
+            merge_worst(
+                &mut auth,
+                id.clone(),
+                detail(status, None, format!("cirisbilling.{region_key}")),
+            );
+        }
     }
 
     // ── Capabilities: the headline comes from what the fabric can DO ──
@@ -859,16 +899,33 @@ mod tests {
                 "google_play": {"status": "operational", "latency_ms": 484},
             }})
         };
-        let (mut db, mut auth, mut internal) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
-        fold_billing(&mut db, &mut auth, &mut internal, "us", &body(OUTAGE));
-        fold_billing(&mut db, &mut auth, &mut internal, "eu", &body(OPERATIONAL));
+        let (mut db, mut internal) = (BTreeMap::new(), BTreeMap::new());
+        let mut auth_reports: Vec<(String, String, String)> = Vec::new();
+        fold_billing(
+            &mut db,
+            &mut auth_reports,
+            &mut internal,
+            "us",
+            &body(OUTAGE),
+        );
+        fold_billing(
+            &mut db,
+            &mut auth_reports,
+            &mut internal,
+            "eu",
+            &body(OPERATIONAL),
+        );
 
         // Regional databases stay distinct — a US outage cannot hide behind EU.
         assert_eq!(db["us.postgresql"].status, OUTAGE);
         assert_eq!(db["eu.postgresql"].status, OPERATIONAL);
-        // Shared identity providers collapse to one row each.
-        assert_eq!(auth.len(), 2);
-        assert!(auth.contains_key("google_oauth") && auth.contains_key("google_play"));
+        // Billing's view of the identity providers is kept PER REGION, as an
+        // opinion to compare against our own probe — not merged into one row
+        // and served as the answer.
+        assert_eq!(auth_reports.len(), 4, "two providers, two regions");
+        assert!(auth_reports
+            .iter()
+            .any(|(r, id, _)| r == "eu" && id == "google_oauth"));
     }
 
     /// A shared provider probed from every region collapses to ONE row that keeps

@@ -109,6 +109,9 @@ pub struct Config {
     /// member nobody measures shows as `unknown` instead of being absent and
     /// therefore invisibly fine.
     pub capabilities: Vec<crate::capability::CapabilitySpec>,
+    /// `(id, url)` identity providers probed directly. Empty ⇒ auth health comes
+    /// only from CIRISBilling's report, as before.
+    pub auth_targets: Vec<(String, String)>,
 }
 
 /// The baked CORS allow-list used when `status.cors_origins` is unset.
@@ -127,6 +130,25 @@ fn default_cors_origins() -> Vec<String> {
 const REGION_SPECS: &[(&str, &str, &str)] = &[
     ("us", "US (Chicago)", "vultr"),
     ("eu", "EU (Germany)", "hetzner"),
+];
+
+/// Identity providers we probe DIRECTLY, keyless, so their health is our own
+/// observation rather than a value lifted out of CIRISBilling's self-report.
+///
+/// Without this, `auth_providers` and the billing service status came from the
+/// SAME measurement: billing probes Google, folds the result into its own
+/// status, and we surfaced both. Two dots moving together looked like
+/// corroboration and was one observation rendered twice — with no way to tell
+/// "Google is down" from "billing cannot reach Google".
+///
+/// Both endpoints are unauthenticated and free; the URLs mirror what
+/// CIRISBilling probes, so the two observations are comparable.
+pub const AUTH_SPECS: &[(&str, &str)] = &[
+    ("google_oauth", "https://oauth2.googleapis.com/tokeninfo"),
+    (
+        "google_play",
+        "https://androidpublisher.googleapis.com/$discovery/rest?version=v3",
+    ),
 ];
 
 /// The external-provider scaffold: (key, display, header, expected_text). The
@@ -244,6 +266,7 @@ impl Config {
             ci_repos,
             ci_token: get_str(engine, "status.ci.token").await,
             capabilities: resolve_capabilities(engine).await,
+            auth_targets: resolve_auth_targets(engine).await,
             ci_poll_seconds: graph_config::get_i64(engine, "status.ci.poll_secs")
                 .await
                 .ok()
@@ -287,6 +310,10 @@ impl Config {
             ci_token: None,
             ci_poll_seconds: 300,
             capabilities: crate::capability::default_specs(),
+            auth_targets: AUTH_SPECS
+                .iter()
+                .map(|(k, u)| (k.to_string(), u.to_string()))
+                .collect(),
         }
     }
 }
@@ -329,6 +356,24 @@ async fn resolve_capabilities(engine: &Arc<Engine>) -> Vec<crate::capability::Ca
             members,
             min_available,
         });
+    }
+    out
+}
+
+/// Direct identity-provider probes. `status.auth.<id>.url` overrides the baked
+/// endpoint; setting it to `""` disables that probe and falls back to billing's
+/// report alone.
+async fn resolve_auth_targets(engine: &Arc<Engine>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (id, default_url) in AUTH_SPECS {
+        let url = graph_config::get_str(engine, &format!("status.auth.{id}.url"))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| (*default_url).to_string());
+        if !url.trim().is_empty() {
+            out.push(((*id).to_string(), url));
+        }
     }
     out
 }
