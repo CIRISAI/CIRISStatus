@@ -427,6 +427,7 @@ mod tests {
 mod config_ceg {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use ciris_server::ciris_persist::federation::admission::subject_binding;
     use ciris_server::ciris_persist::federation::types::{algorithm, KeyRecord, SignedKeyRecord};
     use ciris_server::ciris_persist::federation::Error as FederationError;
     use ciris_server::ciris_persist::prelude::{Engine, LocalSigner, LocalSignerConfig};
@@ -481,7 +482,23 @@ mod config_ceg {
     }
 
     async fn register_self_key(engine: &Engine, key_id: &str) {
-        let envelope = serde_json::json!({ "key_id": key_id });
+        // The envelope must BIND the subject it registers — key_id,
+        // identity_type and both pubkeys (CIRISPersist#659). A bare
+        // `{"key_id": …}` stands for any record it is pasted onto, so persist
+        // v31 refuses it outright rather than tolerating the legacy shape.
+        //
+        // Built from persist's own `subject_binding` rather than hand-rolled a
+        // second time: this fixture existed because the binding was hand-rolled
+        // once, and a fifth member would silently pass an envelope we wrote by
+        // hand while failing the one the substrate expects.
+        let sig = engine
+            .sign_hybrid(b"probe")
+            .await
+            .expect("sign to obtain the pubkeys");
+        let ed = B64.encode(&sig.classical.public_key);
+        let pqc = B64.encode(&sig.pqc.public_key);
+        let envelope =
+            serde_json::Value::Object(subject_binding(key_id, "node", &ed, Some(pqc.as_str())));
         let canonical = ceg_produce_canonicalize(&envelope).unwrap();
         let och = hex::encode(Sha256::digest(&canonical));
         let sig = engine.sign_hybrid(&canonical).await.unwrap();

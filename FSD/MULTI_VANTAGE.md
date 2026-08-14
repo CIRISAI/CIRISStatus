@@ -1,8 +1,10 @@
 # Multi-vantage monitoring — a second observer, over CEG
 
 > **Status:** design / build spec, informed by a source audit of the pinned
-> `ciris-server v0.5.169` / `ciris-persist v30.11.0` / `ciris-edge v15.22.0`
-> revs and CC 1.0-rc3.
+> `ciris-server v0.5.171` / `ciris-persist v31.2.0` / `ciris-edge v16.1.0`
+> revs and CC 1.0-rc3. (Audited at server v0.5.169 / persist v30.11.0; §2's
+> three defects were re-checked against v31.2.0 at the repin — D6 closed, D5
+> and D7 still live.)
 >
 > **Thesis:** one observer cannot distinguish "the service is down" from "my
 > path to it is down". The information is not there. A second node makes the
@@ -110,6 +112,15 @@ wrong-axis bug for `capacity:` one line above in the same function. When the
 `health:liveness:` twin lands — one line, and the pattern is right there — **our
 emits stop being admitted.**
 
+Re-verified against persist v31.2.0, and the distance is now shorter, not
+longer: `invariant::NEWLY_ENFORCED_SELF_EMISSION_PREFIXES = ["health:liveness:"]`
+exists, `enforce_admission_invariants` implements the attester≠attested check,
+and it is already wired into `check_reserved_prefix_admission` — the same
+chokepoint every backend's `put_attestation` runs. Only the axis still saves
+us: that function is handed the row's `attestation_type`. The fix is a
+`starts_with` against the envelope dimension, and the day it lands our liveness
+plane goes dark. Deciding D5 (1/2/3 above) is not indefinitely deferrable.
+
 Naming the *service* as `attested_key_id` is not a drop-in fix: the attested
 subject must resolve to a registered key, and billing/proxy have none.
 Options, to decide before building:
@@ -127,14 +138,30 @@ Options, to decide before building:
 (1) is the shape the grammar wants. (2) is the shape the *epistemics* want.
 This FSD does not choose; it refuses to let the choice be made by accident.
 
-### D6 — our envelope carries no signed instant
+### D6 — our envelope carries no signed instant — **closed by the substrate in persist v31.2.0**
 
 Equivocation detection (CC 6.1.1 N4) compares the instant **inside the signed
 envelope**; an envelope without one is `NoSignedInstant` — counted, not guessed
-at. Our liveness envelope omits `asserted_at`, so every row we emit is invisible
-to it. Adding the field is one line and buys real integrity checking. Note the
-row column `asserted_at` is stamped at write time and is *not* covered by the
-content hash — never reconcile on it.
+at. Our liveness envelope omitted `asserted_at`, so every row we emitted was
+invisible to it.
+
+persist v31.0.0 (CIRISPersist#598) made this refusable rather than merely
+lossy: `check_instant_binding` now runs on **every** dimension, so a row whose
+envelope carries no signed `asserted_at` is one the substrate's own put door
+rejects — "folds pick a winner by the `asserted_at` COLUMN, which no signature
+covers". The note below about never reconciling on the column is now enforced
+rather than advised.
+
+We satisfy it for free because `src/ceg.rs` emits through
+`emit_attestation_self`: `stamp_and_canonicalize` stamps a truncated
+`asserted_at` into the envelope before signing when the producer did not set
+one, and `assemble` then reads the column back *from* the signed envelope — so
+column and signed twin are equal by construction. The one thing that must not
+regress is the door: a hand-rolled row assembled around `put_attestation`
+carries no stamp and is refused. That is exactly what our two roster fixtures
+did, and v31 caught both; they now mint through
+`envelope::RowMirror::stamp_local_row(&mut row, false)` before signing, which
+places the instants *and* the seven-column mirror (#643/#656).
 
 ### D7 — our consumer collapses attesters
 
