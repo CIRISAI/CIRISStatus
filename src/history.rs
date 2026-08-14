@@ -11,6 +11,7 @@ use rusqlite::Connection;
 use crate::config::Config;
 use crate::model::{CapabilitySli, HistoryDay, HistoryRegion, ServiceUptime, StatusEvent, OUTAGE};
 use crate::probe::{check_grafana, check_postgres_tcp, fetch_service_status, Probe};
+use std::time::Duration;
 
 pub type Db = Arc<Mutex<Connection>>;
 
@@ -468,6 +469,25 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
                 probe,
             ));
             for p in providers {
+                // An identity provider is something BOTH we and billing can
+                // see. Keeping billing's view as an observation is what lets
+                // `/api/v1/status/vantage` separate "Google is down" from
+                // "billing cannot reach Google" — one measurement rendered
+                // twice looked like corroboration and localised nothing.
+                if matches!(p.id.as_str(), "google_oauth" | "google_play") {
+                    observations.push((
+                        OBSERVATION_SERVICE.to_string(),
+                        p.id.clone(),
+                        format!("cirisbilling.{}", region.key),
+                        Probe {
+                            status: leak(p.status.clone()),
+                            latency_ms: p.latency_ms,
+                            message: None,
+                            transport_error: false,
+                            upstream_status: None,
+                        },
+                    ));
+                }
                 rows.push((
                     "cirisbilling".into(),
                     p.id,
@@ -572,6 +592,20 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
     // that, and record NOTHING about the components we could not see — writing
     // them all down as outages is how a monitor's own flicker became four days
     // of everyone else's downtime (FSD §3.3 / D3).
+    // Our OWN observation of the identity providers, keyless and free, so their
+    // health stops being a value lifted out of billing's self-report.
+    for (id, url) in &cfg.auth_targets {
+        let p = crate::probe::check_reachable(client, url, Duration::from_secs(10), 2000).await;
+        attempted += 1;
+        transport_failures += usize::from(p.transport_error);
+        observations.push((
+            OBSERVATION_SERVICE.to_string(),
+            id.clone(),
+            "direct".to_string(),
+            p,
+        ));
+    }
+
     let blind = crate::probe::is_vantage_failure(attempted, transport_failures);
     if !blind {
         rows.extend(observations);
@@ -1547,6 +1581,84 @@ mod event_tests {
             day.service_uptime_pct, 50.0,
             "but EU billing was down half the samples, and nothing else serves it"
         );
+    }
+
+    /// The question the board could not answer: Google, or billing's path to
+    /// Google? Two observers of one dependency — ours and billing's — make it
+    /// answerable. Previously both dots came from billing's single measurement.
+    #[test]
+    fn a_direct_auth_probe_separates_google_from_billing() {
+        let path = repair_tests::tmp_db();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        {
+            let db = init(&path).unwrap();
+            let conn = db.lock().unwrap();
+            // Instant 1: everyone agrees Google is fine.
+            let ts = format!("{today}T00:00:00Z");
+            for who in ["direct", "cirisbilling.us", "cirisbilling.eu"] {
+                repair_tests::insert_region(
+                    &conn,
+                    &ts,
+                    OBSERVATION_SERVICE,
+                    "google_oauth",
+                    who,
+                    "operational",
+                );
+            }
+            // Instant 2: EU billing cannot reach it; we can, and so can US.
+            // That is billing's path, not Google.
+            let ts = format!("{today}T00:01:00Z");
+            repair_tests::insert_region(
+                &conn,
+                &ts,
+                OBSERVATION_SERVICE,
+                "google_oauth",
+                "direct",
+                "operational",
+            );
+            repair_tests::insert_region(
+                &conn,
+                &ts,
+                OBSERVATION_SERVICE,
+                "google_oauth",
+                "cirisbilling.us",
+                "operational",
+            );
+            repair_tests::insert_region(
+                &conn,
+                &ts,
+                OBSERVATION_SERVICE,
+                "google_oauth",
+                "cirisbilling.eu",
+                "outage",
+            );
+            // Instant 3: nobody can reach it. That IS Google.
+            let ts = format!("{today}T00:02:00Z");
+            for who in ["direct", "cirisbilling.us", "cirisbilling.eu"] {
+                repair_tests::insert_region(
+                    &conn,
+                    &ts,
+                    OBSERVATION_SERVICE,
+                    "google_oauth",
+                    who,
+                    "outage",
+                );
+            }
+        }
+        let rows = query_vantage(&init(&path).unwrap(), 2).unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.component == "google_oauth")
+            .expect("google_oauth");
+        assert_eq!(row.samples, 3);
+        assert_eq!(row.disagreements, 1, "only the middle instant differed");
+        assert_eq!(
+            row.dissent_by_vantage.get("cirisbilling.eu").copied(),
+            Some(1),
+            "EU billing is the odd one out — its path, not Google"
+        );
+        assert_eq!(row.dissent_by_vantage.get("direct").copied(), None);
+        assert_eq!(row.dissent_by_vantage.get("cirisbilling.us").copied(), None);
     }
 
     #[test]
