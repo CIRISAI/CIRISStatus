@@ -262,6 +262,7 @@ mod flow_a_real_data {
 
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use chrono::Utc;
+    use ciris_server::ciris_persist::federation::admission::subject_binding;
     use ciris_server::ciris_persist::federation::types::{
         algorithm, attestation_tier, cohort_scope, identity_type, Attestation, KeyRecord,
         SignedAttestation, SignedKeyRecord,
@@ -342,7 +343,18 @@ mod flow_a_real_data {
     }
 
     async fn register_attester(node: &Engine, attester: &Engine, key_id: &str, id_type: &str) {
-        let envelope = serde_json::json!({ "key_id": key_id });
+        // Bind the subject: key_id, identity_type and both pubkeys
+        // (CIRISPersist#659). An envelope naming only the key_id stands for any
+        // record it is pasted onto, so v31 refuses it. Built from persist's own
+        // `subject_binding` so a future member cannot silently diverge.
+        let probe = attester
+            .sign_hybrid(b"probe")
+            .await
+            .expect("sign to obtain the pubkeys");
+        let ed = B64.encode(&probe.classical.public_key);
+        let pqc = B64.encode(&probe.pqc.public_key);
+        let envelope =
+            serde_json::Value::Object(subject_binding(key_id, id_type, &ed, Some(pqc.as_str())));
         let canonical = ceg_produce_canonicalize(&envelope).unwrap();
         let och = hex::encode(Sha256::digest(&canonical));
         let sig = attester.sign_hybrid(&canonical).await.unwrap();
@@ -407,7 +419,7 @@ mod flow_a_real_data {
     ) {
         use ciris_server::ciris_persist::federation::admission::ANALYZE_CONSENT_SCOPE;
         use ciris_server::ciris_persist::federation::consent::consent_dimension;
-        use ciris_server::ciris_persist::federation::envelope::paths;
+        use ciris_server::ciris_persist::federation::envelope::{paths, RowMirror};
 
         // Single-source the KEYS and the dimension prefix from persist — a
         // hand-mirrored literal compiles and skews the wire (CIRISServer#322).
@@ -415,11 +427,8 @@ mod flow_a_real_data {
             (paths::DIMENSION): format!("{}:v1", consent_dimension::STATE_GRANTED_PREFIX),
             "scope": ANALYZE_CONSENT_SCOPE,
         });
-        let canonical = ceg_produce_canonicalize(&envelope).unwrap();
-        let och = hex::encode(Sha256::digest(&canonical));
-        let sig = subject_engine.sign_hybrid(&canonical).await.unwrap();
         let now = Utc::now();
-        let att = Attestation {
+        let mut att = Attestation {
             attestation_id: format!(
                 "{subject}-analyze-{}",
                 now.timestamp_nanos_opt().unwrap_or(0)
@@ -432,9 +441,11 @@ mod flow_a_real_data {
             asserted_at: now,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: B64.encode(&sig.classical.signature),
-            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+            // Minted below, once the row exists: the bytes cannot be signed
+            // until the row's own columns have been stamped INTO them.
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: subject.to_string(),
             additional_scrubs: Vec::new(),
             scrub_timestamp: now,
@@ -447,6 +458,21 @@ mod flow_a_real_data {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
         };
+        // v31 (CIRISPersist#598/#643/#656) — the row's own columns must be
+        // INSIDE the bytes the subject signs: the instants (`asserted_at`,
+        // `expires_at`) because folds pick a winner by the `asserted_at`
+        // COLUMN, and the seven-column mirror because a relay could otherwise
+        // append to `subject_key_ids` beside an untouched valid signature.
+        // The party that MINTS stamps and the party that RECEIVES checks; a
+        // fixture is a minter, so it stamps — through persist's own door,
+        // because a hand-mirrored copy of the recipe is a second definition
+        // of the binding.
+        RowMirror::stamp_local_row(&mut att, false).expect("stamp instants + row mirror");
+        let canonical = ceg_produce_canonicalize(&att.attestation_envelope).unwrap();
+        att.original_content_hash = hex::encode(Sha256::digest(&canonical));
+        let sig = subject_engine.sign_hybrid(&canonical).await.unwrap();
+        att.scrub_signature_classical = B64.encode(&sig.classical.signature);
+        att.scrub_signature_pqc = Some(B64.encode(&sig.pqc.signature));
         dir.put_attestation(SignedAttestation { attestation: att })
             .await
             .expect("seed analyze consent");
@@ -468,11 +494,8 @@ mod flow_a_real_data {
             "valid_until": valid_until.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             "witness_relation": "external",
         });
-        let canonical = ceg_produce_canonicalize(&envelope).unwrap();
-        let och = hex::encode(Sha256::digest(&canonical));
-        let sig = attester.sign_hybrid(&canonical).await.unwrap();
         let now = Utc::now();
-        let att = Attestation {
+        let mut att = Attestation {
             attestation_id: format!(
                 "{subject}-{leaf}-{}",
                 now.timestamp_nanos_opt().unwrap_or(0)
@@ -484,9 +507,10 @@ mod flow_a_real_data {
             asserted_at: now,
             expires_at: Some(valid_until),
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: B64.encode(&sig.classical.signature),
-            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+            // Minted after the stamp, as in `seed_analyze_consent`.
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: attester_key_id.to_string(),
             // persist #556: a row carries its own co-scrub quorum. This
             // fixture is a single-attester score, so the set is empty — the
@@ -501,6 +525,19 @@ mod flow_a_real_data {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
         };
+        // Same v31 stamp-then-sign order the consent seed above documents. Note
+        // this one HAS an `expires_at`, which is bound in both directions: the
+        // stamp mirrors the truncated column, so the fixture cannot hand the
+        // freshness test a row whose signed expiry disagrees with its column.
+        ciris_server::ciris_persist::federation::envelope::RowMirror::stamp_local_row(
+            &mut att, false,
+        )
+        .expect("stamp instants + row mirror");
+        let canonical = ceg_produce_canonicalize(&att.attestation_envelope).unwrap();
+        att.original_content_hash = hex::encode(Sha256::digest(&canonical));
+        let sig = attester.sign_hybrid(&canonical).await.unwrap();
+        att.scrub_signature_classical = B64.encode(&sig.classical.signature);
+        att.scrub_signature_pqc = Some(B64.encode(&sig.pqc.signature));
         dir.put_attestation(SignedAttestation { attestation: att })
             .await
             .expect("seed capacity:* row");
