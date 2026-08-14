@@ -136,7 +136,83 @@ Options, to decide before building:
    today and still fails the rule's intent once the gate is keyed correctly.
 
 (1) is the shape the grammar wants. (2) is the shape the *epistemics* want.
-This FSD does not choose; it refuses to let the choice be made by accident.
+
+#### The decision (2026-08-14): (2) now, (1) as the destination
+
+**We cannot sign "billing is alive." We do not know it.** We know that at T,
+from this node, an HTTPS GET to billing's health endpoint returned 200 in 84ms.
+First-person experience is the only thing our key is entitled to bind.
+`health:liveness` is a third-person claim about a service's state; the grammar
+wants that signed either by the service itself or by a witness *about a
+registered subject*, which is exactly what `attester != attested` encodes.
+
+So the two options are not alternatives, they are a sequence.
+
+**Now — `observation:reachability:v1`, one row per observed target.** The row's
+subject is *the observation*, and the observation is genuinely ours, so
+`attester == attested` is CORRECT here rather than a violation. What changes
+substantively is not the dimension string but the addressability: today's single
+row names no target in any machine-readable field (the services live in a
+`context` string and in `evidence_refs`), so the fabric can be asked *"what did
+ciris-status say about itself?"* and nothing else. Per-target rows are also the
+precondition for `resolve_scores`'s per-attester fold and `open_contradictions`
+to mean anything once a second vantage exists — §4's whole mechanism is
+per-subject.
+
+Verified admissible against persist v31.2.0 rather than assumed:
+`observation:` is absent from `default_reserved_prefix_rules` (the reserved set
+is `system:`, `audit_chain:`, `corpus_health:`, `identity_continuity:`,
+`federation_directory:`, `transparency_log:cosigned:`), the `scores` vocabulary
+is open, the `:v1` segment satisfies `require_version_segment`, and no morally-
+charged stem matches. No registration, no new gate, admitted today.
+
+`witness_relation` becomes `"self"`. It has no closed vocabulary, no validator
+and no gate (§3), so nothing enforces this — which is the reason to get it
+right rather than a reason not to bother. `"external"` alongside
+`attester == attested` was simply false.
+
+**No `vantage` field**, per §3: `attesting_key_id` IS the vantage, and one node
+does not observe from several places. The temptation to add one arrives with
+this change and should be refused on the same grounds.
+
+**Later — services as fabric identities, and then `health:liveness` is
+legitimate.** attester = the monitor, attested = the service,
+`witness_relation: "external"` finally true. The cost is specific and it is not
+ours to pay alone: `check_attested_subject_admission` requires the attested
+subject to be a registered key (or a stored constitutional family), and
+CIRISPersist#659 requires the registration envelope to bind that subject's own
+`key_id`, `identity_type` and *both pubkeys* — which the subject must sign. We
+therefore cannot mint identities for billing and proxy on their behalf without
+holding their keys and signing as them, which is impersonation wearing a
+convenience costume. Each service repo grows a keypair and a self-signed
+registration, or the claim stays first-person.
+
+**(3) is rejected.** Beyond failing the rule's intent, `subject_key_ids` is not
+a label slot: under CIRISPersist#643 a canonical binding hash there confers
+REVOCATION AUTHORITY (`resolve_withdraws_admission_rule` rule 2).
+
+##### The cardinality constraint this decision runs into
+
+Per-target rows multiply what we author, and authoring is metered. Persist's
+`PeerWriteQuota` is charged inside `put_attestation` on every backend, keyed on
+**`attesting_key_id` — the row's author** — with no exemption for a node's own
+local writes: `PER_PEER_SUSTAINED_WRITES_PER_WINDOW = 14_400` per 86_400s. At
+the 60s probe cadence that is 1,440 cycles/day and therefore **10 rows per cycle
+before we saturate our own key's budget** — and the same ceiling applies again
+at any peer that replicates us, since the bucket there is keyed on our key too.
+
+Our direct targets alone (2 regions × {billing, proxy, infra}, plus the identity
+providers and the database) sit at roughly that number, so emitting per-target
+at probe cadence would spend the entire daily budget on observations and leave a
+second node nothing.
+
+**Therefore the observation cadence is decoupled from the probe cadence**
+(`status.observation.poll_secs`, default 300s) and `valid_until` follows the
+observation cadence, not the probe cadence. The page and the SSE stream keep
+serving the 60s snapshot — human-facing freshness is a local concern. The signed
+plane is for the fabric, where a 5-minute-old observation with an honest expiry
+is worth more than a 1-minute-old one that exhausts the budget it needs to
+replicate.
 
 ### D6 — our envelope carries no signed instant — **closed by the substrate in persist v31.2.0**
 

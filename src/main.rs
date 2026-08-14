@@ -8,7 +8,7 @@
 //! (`/health`, `/v1/status`, `/api/v1/status`, `/api/v1/status/history`,
 //! `/api/v1/scoring`, the live SSE/WS sockets) merge onto the node's read-API
 //! listener, and its background lifecycle probes the external services → emits
-//! signed `health:liveness:v1` (Flow B) + rebuilds the public roster from this
+//! signed `observation:reachability:v1` (Flow B) + rebuilds the public roster from this
 //! node's OWN corpus (Flow A) → updates the cache + uptime history + live push.
 //!
 //! **Zero env** (Server 0.5 zero-env model): boot takes only `--home <path>` and
