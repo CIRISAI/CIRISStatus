@@ -27,7 +27,7 @@
 # `rust-toolchain.toml` = 1.97.0, with "All four repos MUST agree on this
 # version" written on it. We are a fifth consumer of that graph; agreeing is
 # cheaper than re-deriving a floor every repin.
-ARG RUST_VERSION=1.97
+ARG RUST_VERSION=1.97.0
 
 # ── build stage ──────────────────────────────────────────────────────────────
 # PIN the build base to bookworm (glibc 2.36) so it MATCHES the bookworm runtime
