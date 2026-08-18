@@ -1,10 +1,10 @@
 # Multi-vantage monitoring — a second observer, over CEG
 
 > **Status:** design / build spec, informed by a source audit of the pinned
-> `ciris-server v0.5.171` / `ciris-persist v31.2.0` / `ciris-edge v16.1.0`
-> revs and CC 1.0-rc3. (Audited at server v0.5.169 / persist v30.11.0; §2's
-> three defects were re-checked against v31.2.0 at the repin — D6 closed, D5
-> and D7 still live.)
+> `ciris-server v0.5.177` / `ciris-persist v32.3.0` / `ciris-edge v17.4.1`
+> revs and CC 1.0-rc3. (Audited at server v0.5.169 / persist v30.11.0. §2's
+> defects are re-checked at every repin: D6 closed in v31.2.0; D5 and D7 still
+> live at v32.3.0.)
 >
 > **Thesis:** one observer cannot distinguish "the service is down" from "my
 > path to it is down". The information is not there. A second node makes the
@@ -121,6 +121,13 @@ us: that function is handed the row's `attestation_type`. The fix is a
 `starts_with` against the envelope dimension, and the day it lands our liveness
 plane goes dark. Deciding D5 (1/2/3 above) is not indefinitely deferrable.
 
+Still true at persist v32.3.0, and the asymmetry is now visible in a single
+screen of `check_reserved_prefix_admission`: `check_capacity_not_self_attested`
+is handed `envelope_dimension(&row.attestation_envelope)`, and
+`enforce_admission_invariants` — the `health:liveness:` arm — is handed `at`,
+the `attestation_type`, four lines below it. The correct axis is already in
+scope at the call site.
+
 Naming the *service* as `attested_key_id` is not a drop-in fix: the attested
 subject must resolve to a registered key, and billing/proxy have none.
 Options, to decide before building:
@@ -161,10 +168,18 @@ per-subject.
 
 Verified admissible against persist v31.2.0 rather than assumed:
 `observation:` is absent from `default_reserved_prefix_rules` (the reserved set
-is `system:`, `audit_chain:`, `corpus_health:`, `identity_continuity:`,
+was `system:`, `audit_chain:`, `corpus_health:`, `identity_continuity:`,
 `federation_directory:`, `transparency_log:cosigned:`), the `scores` vocabulary
 is open, the `:v1` segment satisfies `require_version_segment`, and no morally-
 charged stem matches. No registration, no new gate, admitted today.
+
+**Re-verified at v32.3.0, where the reserved set has since grown**
+(`age_assurance:`, the capacity-assurance prefix, `detection:` and two
+`detection:` sub-prefixes). `observation:` is still not in it. Because that set
+is a moving target rather than a settled boundary, the check is not left to
+this document: `ceg::flow_b_emit::the_observation_prefix_needs_no_substrate_role`
+emits through a real engine under a key holding no substrate role, so a repin
+that reserves the prefix fails in CI rather than in production.
 
 `witness_relation` becomes `"self"`. It has no closed vocabulary, no validator
 and no gate (§3), so nothing enforces this — which is the reason to get it
