@@ -1,0 +1,19 @@
+# Exact-pin the toolchain to match the substrate repos (CIRISServer, persist,
+# edge, verify), whose own `rust-toolchain.toml` carries the same version and the
+# note "All four repos MUST agree on this version". We are a fifth consumer of
+# that dependency graph.
+#
+# Why this file exists at all: before it, this repo pinned a toolchain in exactly
+# ONE place — the Dockerfile — while CI ran `dtolnay/rust-toolchain@stable` and a
+# developer ran whatever they had. Three environments, three versions, and the
+# image was both the oldest and the last to run. At ciris-server v0.5.177 that
+# cost a full CI cycle: `leviculum-lxmf` v0.16.0 failed with "`Y` does not live
+# long enough" under 1.90 while passing on CI's stable and on a 1.95 laptop.
+#
+# Keep the Dockerfile's `ARG RUST_VERSION` equal to `channel` below. They are
+# two halves of one decision: matching them exactly means the `rust:<ver>-slim`
+# base already carries this toolchain, so the build does not stop to fetch a
+# second one.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
