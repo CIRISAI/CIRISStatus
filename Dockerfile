@@ -12,9 +12,22 @@
 # the Reticulum port (default :4242); the read API + the status routers bind
 # port + 1 (default :4243) — point the status reverse-proxy there.
 
-# The substrate graph (ciris-persist/verify/edge) requires a recent stable rustc
-# (redb 4.1 → 1.89, time → 1.88).
-ARG RUST_VERSION=1.90
+# The substrate graph (ciris-persist/verify/edge) requires a recent stable rustc,
+# and this is the ONLY place in this repo where the toolchain is pinned: CI uses
+# `dtolnay/rust-toolchain@stable` and a developer uses whatever they have. So the
+# image is the one environment that can be too old, and it fails LAST — after the
+# test job has already gone green.
+#
+# It did exactly that at ciris-server v0.5.177: `leviculum-lxmf` v0.16.0 failed
+# with "`Y` does not live long enough" on `Box::pin(self.generate(..))` under
+# 1.90, while the same commit compiled clean on CI's stable and on a 1.95 laptop.
+#
+# So this tracks the version the substrate repos pin rather than the oldest one
+# that happens to work: CIRISServer/persist/edge/verify all carry
+# `rust-toolchain.toml` = 1.97.0, with "All four repos MUST agree on this
+# version" written on it. We are a fifth consumer of that graph; agreeing is
+# cheaper than re-deriving a floor every repin.
+ARG RUST_VERSION=1.97
 
 # ── build stage ──────────────────────────────────────────────────────────────
 # PIN the build base to bookworm (glibc 2.36) so it MATCHES the bookworm runtime
