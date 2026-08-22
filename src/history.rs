@@ -10,7 +10,7 @@ use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::model::{CapabilitySli, HistoryDay, HistoryRegion, ServiceUptime, StatusEvent, OUTAGE};
-use crate::probe::{check_grafana, check_postgres_tcp, fetch_service_status, Probe};
+use crate::probe::Probe;
 use std::time::Duration;
 
 pub type Db = Arc<Mutex<Connection>>;
@@ -420,7 +420,7 @@ fn record(conn: &Connection, ts: &str, service: &str, provider: &str, region: &s
 /// existed exactly on the polls that were down, so two bad polls out of 1440
 /// published `cirisproxy.service: 0.0% uptime` and — since a region's uptime is
 /// an unweighted mean over its provider rows — cost that region ~11 points.
-pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
+pub async fn poll_once(cfg: &Config, client: &crate::probe::Cycle, db: &Db) {
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut rows: Vec<(String, String, String, Probe)> = Vec::new();
     // EVERY probe counts toward the vantage verdict, local ones included:
@@ -436,7 +436,7 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
 
     if let Some(dsn) = &cfg.database_url {
         rows.push(("cirislens".into(), "postgresql".into(), "global".into(), {
-            let p = check_postgres_tcp(dsn).await;
+            let p = client.postgres_tcp(dsn).await;
             attempted += 1;
             transport_failures += usize::from(p.transport_error);
             p
@@ -444,7 +444,7 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
     }
     if let Some(g) = &cfg.grafana_url {
         rows.push(("cirislens".into(), "grafana".into(), "global".into(), {
-            let p = check_grafana(client, g).await;
+            let p = client.grafana(g).await;
             attempted += 1;
             transport_failures += usize::from(p.transport_error);
             p
@@ -453,7 +453,7 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
 
     for region in &cfg.regions {
         if let Some(url) = &region.billing_url {
-            let (probe, body) = fetch_service_status(client, url, region.latency_baseline_ms).await;
+            let (probe, body) = client.service_status(url, region.latency_baseline_ms).await;
             attempted += 1;
             transport_failures += usize::from(probe.transport_error);
             let providers = body
@@ -503,7 +503,7 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
             }
         }
         if let Some(url) = &region.proxy_url {
-            let (probe, body) = fetch_service_status(client, url, region.latency_baseline_ms).await;
+            let (probe, body) = client.service_status(url, region.latency_baseline_ms).await;
             attempted += 1;
             transport_failures += usize::from(probe.transport_error);
             let providers = body
@@ -595,7 +595,7 @@ pub async fn poll_once(cfg: &Config, client: &reqwest::Client, db: &Db) {
     // Our OWN observation of the identity providers, keyless and free, so their
     // health stops being a value lifted out of billing's self-report.
     for (id, url) in &cfg.auth_targets {
-        let p = crate::probe::check_reachable(client, url, Duration::from_secs(10), 2000).await;
+        let p = client.reachable(url, Duration::from_secs(10), 2000).await;
         attempted += 1;
         transport_failures += usize::from(p.transport_error);
         observations.push((

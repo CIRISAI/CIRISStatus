@@ -241,6 +241,46 @@ fn via_id(source: &str) -> Option<String> {
     })
 }
 
+/// What we last signed about one target, so the next cycle can tell a repeat
+/// from news.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EmitRecord {
+    pub score: f64,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Should this target be signed this cycle?
+///
+/// # Why not just emit everything, every cycle
+///
+/// Because storage is not free and expiry is not deletion. Re-signing an
+/// unchanged verdict every cycle produced 30,781 rows in a week on the US node,
+/// 95% of which were expired the moment they were written and then kept
+/// forever — inside a 388MB corpus on a 3.9GB box. A signed claim that repeats
+/// what the last one said is not new evidence; it is the same evidence with a
+/// fresh timestamp.
+///
+/// So: emit when the verdict CHANGED (news, and it must reach the fabric at
+/// probe speed), or when the last emit is old enough that the row is nearing
+/// expiry (the heartbeat, which is what keeps an unchanged target from silently
+/// vanishing out of a consumer's `valid_at` window).
+pub fn emit_due(
+    prev: Option<EmitRecord>,
+    score: f64,
+    now: chrono::DateTime<chrono::Utc>,
+    heartbeat: chrono::Duration,
+) -> bool {
+    match prev {
+        // Never emitted: the fabric knows nothing about this target yet.
+        None => true,
+        // A changed verdict is the whole point of the plane. Note `!=` on f64 is
+        // exact on purpose — these are the three constants +1.0/0.0/-1.0 that
+        // `liveness_score` returns, not measurements.
+        Some(p) if p.score != score => true,
+        Some(p) => now - p.at >= heartbeat,
+    }
+}
+
 /// Turn one aggregated snapshot into the per-target observation envelopes to
 /// sign — **the whole emit set for a cycle**, so its size is the thing to look
 /// at when reasoning about the write quota (`Config::observation_seconds`).
@@ -751,6 +791,65 @@ mod tests {
             per_cycle * cycles_per_day < SUSTAINED_ROWS_PER_DAY / 2,
             "{per_cycle} rows/cycle × {cycles_per_day} cycles leaves no headroom for a peer"
         );
+    }
+
+    // ── emit_due: what earns a signature ─────────────────────────────────────
+    fn t(mins: i64) -> chrono::DateTime<chrono::Utc> {
+        at("2026-06-16T00:00:00Z") + chrono::Duration::minutes(mins)
+    }
+
+    #[test]
+    fn a_target_never_seen_is_always_emitted() {
+        assert!(emit_due(None, 1.0, t(0), chrono::Duration::minutes(15)));
+    }
+
+    #[test]
+    fn a_changed_verdict_is_news_and_does_not_wait_for_the_heartbeat() {
+        // One minute after a healthy row, the target goes down. The whole point
+        // of the plane is that this reaches the fabric now, not in fourteen
+        // minutes.
+        let prev = EmitRecord {
+            score: 1.0,
+            at: t(0),
+        };
+        assert!(emit_due(
+            Some(prev),
+            -1.0,
+            t(1),
+            chrono::Duration::minutes(15)
+        ));
+    }
+
+    #[test]
+    fn an_unchanged_verdict_waits_for_the_heartbeat() {
+        let prev = EmitRecord {
+            score: 1.0,
+            at: t(0),
+        };
+        let beat = chrono::Duration::minutes(15);
+        // This is the case that produced 30,781 rows in a week: nothing has
+        // happened, and we used to sign that fact every cycle anyway.
+        assert!(!emit_due(Some(prev), 1.0, t(1), beat));
+        assert!(!emit_due(Some(prev), 1.0, t(14), beat));
+        assert!(
+            emit_due(Some(prev), 1.0, t(15), beat),
+            "heartbeat is inclusive"
+        );
+        assert!(emit_due(Some(prev), 1.0, t(30), beat));
+    }
+
+    #[test]
+    fn a_degraded_target_that_recovers_is_emitted_immediately() {
+        let prev = EmitRecord {
+            score: 0.0,
+            at: t(0),
+        };
+        assert!(emit_due(
+            Some(prev),
+            1.0,
+            t(2),
+            chrono::Duration::minutes(15)
+        ));
     }
 
     #[test]

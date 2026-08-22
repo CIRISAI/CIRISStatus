@@ -143,10 +143,17 @@ cutover covers ONLY the public scoring/status surface (Phase 2 of the design §6
    yet, no consent grant is authored, or this node's key isn't admitted at the peer.
    (Empty is well-formed, not an error.)
    Verify Flow B emits: look for `Flow B: emitted signed observation:reachability:v1`
-   in the logs, with an `emitted=` count. It fires on `status.observation_secs`
-   (300s default), not the probe cadence — the first one lands on the first cycle,
-   then every five minutes. A non-zero `failed=` names the target on its own
-   warning line.
+   with an `emitted=`/`skipped=` count. Emission is **change-driven**: a target
+   whose verdict moved is signed on the next probe cycle, and one that has not
+   moved is re-signed only every `status.observation_secs` (900s default). A
+   quiet fabric therefore logs `Flow B: nothing new to attest` at DEBUG and
+   nothing at INFO — that is the healthy steady state, not a stall. A non-zero
+   `failed=` names the target on its own warning line.
+
+   Retention runs every 10 minutes and logs `retention: pruned our own expired
+   observation rows` with `purged=`/`more=`. `more=true` means it took its
+   bounded bite and will continue next pass — expected while draining a
+   backlog.
 
 3. **Cut the `ciris.ai/ciris-scoring/` public page lens → status.** Repoint the
    front-end / nginx / Caddy route for the public scoring + status surface from

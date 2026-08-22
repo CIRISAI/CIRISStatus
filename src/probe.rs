@@ -3,6 +3,7 @@
 //! `fetch_service_status` / `check_grafana` semantics (timeouts, latency
 //! thresholds, the operational/degraded/outage decision, error scrubbing).
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -357,5 +358,217 @@ mod tests {
             parse_pg_host_port("postgres://u:p@h:5432"),
             ("h".to_string(), 5432)
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// One cycle's fetches, memoised.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every probe made during ONE poll cycle, cached by target.
+///
+/// # Why
+///
+/// The loop ran two independent sweeps per cycle — `history::poll_once` to
+/// record, then `aggregate::aggregated_status` to serve — each opening its own
+/// TLS connection to the same billing, proxy, infra, identity and search
+/// endpoints. Every cycle asked the world the same question twice
+/// (CIRISStatus#47).
+///
+/// That is wasteful anywhere and load-bearing here: the two sweeps run in
+/// series, so the cycle takes twice as long as it needs to, and on the US node
+/// that pushed snapshot age past the staleness ceiling — `age_s=190` against
+/// `max_age_s=180` — which makes `/api/v1/status` serve `unknown` while the
+/// probes themselves were succeeding.
+///
+/// A cache rather than a restructure: the recording sweep and the serving sweep
+/// keep their own shapes and their own fidelity (history records per-region
+/// provider views the served snapshot deliberately merges), they just stop
+/// asking twice. It also makes the two sweeps agree BY CONSTRUCTION — they now
+/// read one measurement, so "what we serve is what we recorded" stops depending
+/// on two probes landing on the same side of a threshold.
+///
+/// Scope is one cycle. Never share it across requests: a cached probe served to
+/// a later caller is a stale claim with a fresh timestamp.
+#[derive(Clone)]
+pub struct Cycle {
+    client: Client,
+    seen: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Cached>>>,
+    /// Requests that actually went out. The saving this type exists for is
+    /// invisible from the outside — a cached probe and a fresh one are the same
+    /// value — so the test asserts on this rather than on wall-clock timing.
+    fetches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Clone)]
+enum Cached {
+    Simple(Probe),
+    Service(Probe, Option<Value>),
+}
+
+impl Cycle {
+    pub fn new(client: &Client) -> Self {
+        Cycle {
+            client: client.clone(),
+            seen: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            fetches: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// How many requests this cycle actually made.
+    pub fn fetches(&self) -> usize {
+        self.fetches.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_fetch(&self) {
+        self.fetches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    async fn simple<F, Fut>(&self, key: String, f: F) -> Probe
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Probe>,
+    {
+        if let Some(Cached::Simple(p)) = self.seen.lock().await.get(&key) {
+            return p.clone();
+        }
+        self.count_fetch();
+        let p = f().await;
+        self.seen
+            .lock()
+            .await
+            .insert(key, Cached::Simple(p.clone()));
+        p
+    }
+
+    pub async fn service_status(&self, base: &str, baseline_ms: i64) -> (Probe, Option<Value>) {
+        let key = format!("service:{base}");
+        if let Some(Cached::Service(p, v)) = self.seen.lock().await.get(&key) {
+            return (p.clone(), v.clone());
+        }
+        self.count_fetch();
+        let (p, v) = fetch_service_status(&self.client, base, baseline_ms).await;
+        self.seen
+            .lock()
+            .await
+            .insert(key, Cached::Service(p.clone(), v.clone()));
+        (p, v)
+    }
+
+    pub async fn reachable(&self, url: &str, timeout: Duration, threshold_ms: i64) -> Probe {
+        self.simple(format!("reach:{url}"), || {
+            check_reachable(&self.client, url, timeout, threshold_ms)
+        })
+        .await
+    }
+
+    pub async fn infrastructure(
+        &self,
+        url: &str,
+        threshold_ms: i64,
+        allow_401: bool,
+        baseline_ms: i64,
+    ) -> Probe {
+        self.simple(format!("infra:{url}"), || {
+            check_infrastructure(&self.client, url, threshold_ms, allow_401, baseline_ms)
+        })
+        .await
+    }
+
+    pub async fn grafana(&self, base: &str) -> Probe {
+        self.simple(format!("grafana:{base}"), || {
+            check_grafana(&self.client, base)
+        })
+        .await
+    }
+
+    pub async fn external_provider(
+        &self,
+        url: &str,
+        header: &str,
+        api_key: Option<&str>,
+        expected_text: Option<&str>,
+        authenticated: bool,
+    ) -> Probe {
+        self.simple(format!("ext:{url}"), || {
+            check_external_provider(
+                &self.client,
+                url,
+                header,
+                api_key,
+                expected_text,
+                authenticated,
+            )
+        })
+        .await
+    }
+
+    pub async fn postgres_tcp(&self, dsn: &str) -> Probe {
+        self.simple(format!("pg:{dsn}"), || check_postgres_tcp(dsn))
+            .await
+    }
+}
+
+#[cfg(test)]
+mod cycle_tests {
+    use super::*;
+
+    /// The saving is invisible in the return value — a cached probe and a fresh
+    /// one are the same `Probe` — so assert on the request count.
+    #[tokio::test]
+    async fn one_target_is_fetched_once_per_cycle() {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .expect("client");
+        let cycle = Cycle::new(&client);
+        // Unroutable on purpose: this test is about how many requests leave,
+        // not about what comes back. TEST-NET-1 (RFC 5737) is guaranteed
+        // non-routable, so the result is a transport error either way.
+        let url = "http://192.0.2.1:9/health";
+
+        let first = cycle.reachable(url, Duration::from_millis(200), 1000).await;
+        let second = cycle.reachable(url, Duration::from_millis(200), 1000).await;
+
+        assert_eq!(
+            cycle.fetches(),
+            1,
+            "the recorder and the server share one probe"
+        );
+        assert_eq!(first.status, second.status);
+        assert_eq!(first.transport_error, second.transport_error);
+    }
+
+    #[tokio::test]
+    async fn different_targets_are_not_conflated() {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .expect("client");
+        let cycle = Cycle::new(&client);
+        cycle
+            .reachable("http://192.0.2.1:9/a", Duration::from_millis(200), 1000)
+            .await;
+        cycle
+            .reachable("http://192.0.2.2:9/b", Duration::from_millis(200), 1000)
+            .await;
+        assert_eq!(cycle.fetches(), 2);
+    }
+
+    /// Kinds share a URL space; a reachability probe must not satisfy an
+    /// infrastructure probe of the same endpoint (different thresholds, and
+    /// `allow_401` changes what counts as up).
+    #[tokio::test]
+    async fn probe_kinds_do_not_share_a_cache_slot() {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .expect("client");
+        let cycle = Cycle::new(&client);
+        let url = "http://192.0.2.1:9/same";
+        cycle.reachable(url, Duration::from_millis(200), 1000).await;
+        cycle.infrastructure(url, 1000, true, 0).await;
+        assert_eq!(cycle.fetches(), 2);
     }
 }

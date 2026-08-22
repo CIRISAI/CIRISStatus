@@ -27,6 +27,7 @@ mod config;
 mod history;
 mod model;
 mod probe;
+mod retention;
 mod roster;
 
 use std::path::PathBuf;

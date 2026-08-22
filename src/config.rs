@@ -87,8 +87,10 @@ pub struct Config {
     /// DERIVED from the node `data_dir` — convention, not config, not env.
     pub db_path: String,
     pub poll_seconds: u64,
-    /// Cadence for the signed `observation:reachability:v1` emits, DECOUPLED
-    /// from `poll_seconds`.
+    /// **Heartbeat** for the signed `observation:reachability:v1` plane — the
+    /// longest a target goes without a fresh row when nothing about it changes.
+    /// A CHANGED verdict is signed at probe speed regardless (`ceg::emit_due`);
+    /// this only bounds the quiet case.
     ///
     /// Authoring is metered: persist charges `PeerWriteQuota` inside
     /// `put_attestation` on every backend, keyed on the row's author with no
@@ -99,7 +101,16 @@ pub struct Config {
     ///
     /// The page and the SSE stream keep the 60s snapshot: human-facing freshness
     /// is a local concern. See `FSD/MULTI_VANTAGE.md` §2 D5.
+    /// Raised 300 → 900 after the US-node measurement of 2026-08-22: at 300s
+    /// with unconditional re-signing, one week produced 30,781 rows, 95% of them
+    /// expired-on-arrival, in a corpus that reached 388MB on a box with no swap
+    /// left.
     pub observation_seconds: u64,
+    /// How long our OWN expired observation rows are kept before
+    /// [`crate::retention`] deletes them. Expiry hides a row from readers; it
+    /// does not reclaim anything, and on a four-node mesh sharing one small box
+    /// that difference is the whole ballgame.
+    pub corpus_retention_hours: u64,
     pub version: &'static str,
     pub grafana_url: Option<String>,
     pub database_url: Option<String>, // local "postgresql" provider (TCP liveness)
@@ -203,8 +214,15 @@ impl Config {
             .flatten()
             .filter(|v| *v > 0)
             .map(|v| v as u64)
-            .unwrap_or(300)
+            .unwrap_or(900)
             .max(poll_seconds);
+
+        let corpus_retention_hours = graph_config::get_i64(engine, "status.corpus_retention_hours")
+            .await
+            .ok()
+            .flatten()
+            .filter(|v| *v > 0)
+            .unwrap_or(24) as u64;
 
         let cors_origins = graph_config::get_str_list(engine, "status.cors_origins")
             .await
@@ -279,6 +297,7 @@ impl Config {
             db_path,
             poll_seconds,
             observation_seconds,
+            corpus_retention_hours,
             version: env!("CARGO_PKG_VERSION"),
             grafana_url: get_str(engine, "status.grafana_url").await,
             database_url: get_str(engine, "status.database_url").await,
@@ -321,7 +340,8 @@ impl Config {
         Config {
             db_path,
             poll_seconds: 60,
-            observation_seconds: 300,
+            observation_seconds: 900,
+            corpus_retention_hours: 24,
             version: env!("CARGO_PKG_VERSION"),
             grafana_url: None,
             database_url: None,
