@@ -682,6 +682,12 @@ impl Adapter for StatusAdapter {
                     // work and — because they run in series — the wall clock,
                     // pushing snapshot age past the staleness ceiling.
                     let cycle = crate::probe::Cycle::new(&self.state.client);
+                    // Fire every probe CONCURRENTLY first; both sweeps then read
+                    // a warm memo. Serial probing is what took a lap from
+                    // seconds to 5-7 minutes, which is why the served snapshot
+                    // was almost always past its staleness ceiling and the page
+                    // answered `unknown` while every probe was in fact fine.
+                    cycle.prefetch(&cfg).await;
                     let db = self.state.db.read().expect("db lock").clone();
                     if let Some(db) = db {
                         history::poll_once(&cfg, &cycle, &db).await;

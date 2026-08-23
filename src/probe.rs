@@ -390,6 +390,11 @@ mod tests {
 ///
 /// Scope is one cycle. Never share it across requests: a cached probe served to
 /// a later caller is a stale claim with a fresh timestamp.
+/// How many probes run at once during [`Cycle::prefetch`]. Six: enough to turn
+/// minutes of serial timeouts into seconds, low enough that a status page does
+/// not become a burst source on a box it shares with the services it watches.
+const PREFETCH_CONCURRENCY: usize = 6;
+
 #[derive(Clone)]
 pub struct Cycle {
     client: Client,
@@ -442,8 +447,102 @@ impl Cycle {
         p
     }
 
+    /// Fire every probe this cycle will need, CONCURRENTLY, before either sweep
+    /// walks its targets.
+    ///
+    /// # Why this is the fix and the memo was only half of it
+    ///
+    /// Both sweeps walk their targets in series, and several probes carry
+    /// multi-second timeouts (10s for an identity provider, 5s for a service).
+    /// Seventeen targets in series is minutes of wall clock, and it showed:
+    /// on the US node the loop took 5-7 minutes per lap, against a staleness
+    /// ceiling of 3x60s. So `/api/v1/status` served `stale: true` and
+    /// `status: unknown` almost continuously — the board went blank not because
+    /// a probe failed but because our own snapshot was never young enough to
+    /// trust. Deduping the second sweep halves that; it does not fix it.
+    ///
+    /// The targets are independent, so the only reason they were serial was the
+    /// shape of the loops. This warms the memo instead of restructuring both
+    /// sweeps, which keeps each one's fidelity intact.
+    ///
+    /// Bounded concurrency, not a burst: this shares two cores with the rest of
+    /// the mesh, and opening seventeen TLS connections at once to save a second
+    /// would be answering a load problem with more load.
+    ///
+    /// A parameter here that does not match the sweep's call is a cache MISS,
+    /// never a wrong answer — the keys carry their parameters. The cost of
+    /// drift is a wasted request, and `fetches()` after a cycle is how you see
+    /// it: more than the target count means something is still probing twice.
+    pub async fn prefetch(&self, cfg: &crate::config::Config) {
+        use futures::stream::{self, StreamExt};
+
+        type Job<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+        let mut jobs: Vec<Job<'_>> = Vec::new();
+
+        for region in &cfg.regions {
+            let base = region.latency_baseline_ms;
+            if let Some(u) = region.billing_url.clone() {
+                jobs.push(Box::pin(async move {
+                    self.service_status(&u, base).await;
+                }));
+            }
+            if let Some(u) = region.proxy_url.clone() {
+                jobs.push(Box::pin(async move {
+                    self.service_status(&u, base).await;
+                }));
+            }
+            if let Some(u) = region.infra_url.clone() {
+                jobs.push(Box::pin(async move {
+                    self.infrastructure(&u, 1000, false, base).await;
+                }));
+            }
+        }
+        let ghcr = cfg.ghcr_url.clone();
+        jobs.push(Box::pin(async move {
+            self.infrastructure(&ghcr, 3000, true, 0).await;
+        }));
+        for (_, url) in cfg.auth_targets.clone() {
+            jobs.push(Box::pin(async move {
+                self.reachable(&url, Duration::from_secs(10), 2000).await;
+            }));
+        }
+        for ext in cfg.external.clone() {
+            jobs.push(Box::pin(async move {
+                self.external_provider(
+                    &ext.url,
+                    ext.header,
+                    ext.api_key.as_deref(),
+                    ext.expected_text,
+                    ext.authenticated,
+                )
+                .await;
+            }));
+        }
+        if let Some(g) = cfg.grafana_url.clone() {
+            jobs.push(Box::pin(async move {
+                self.grafana(&g).await;
+            }));
+        }
+        if let Some(dsn) = cfg.database_url.clone() {
+            jobs.push(Box::pin(async move {
+                self.postgres_tcp(&dsn).await;
+            }));
+        }
+
+        let planned = jobs.len();
+        stream::iter(jobs)
+            .buffer_unordered(PREFETCH_CONCURRENCY)
+            .count()
+            .await;
+        tracing::debug!(
+            targets = planned,
+            fetched = self.fetches(),
+            "probe prefetch complete"
+        );
+    }
+
     pub async fn service_status(&self, base: &str, baseline_ms: i64) -> (Probe, Option<Value>) {
-        let key = format!("service:{base}");
+        let key = format!("service:{base}:{baseline_ms}");
         if let Some(Cached::Service(p, v)) = self.seen.lock().await.get(&key) {
             return (p.clone(), v.clone());
         }
@@ -457,9 +556,10 @@ impl Cycle {
     }
 
     pub async fn reachable(&self, url: &str, timeout: Duration, threshold_ms: i64) -> Probe {
-        self.simple(format!("reach:{url}"), || {
-            check_reachable(&self.client, url, timeout, threshold_ms)
-        })
+        self.simple(
+            format!("reach:{url}:{threshold_ms}:{}", timeout.as_millis()),
+            || check_reachable(&self.client, url, timeout, threshold_ms),
+        )
         .await
     }
 
@@ -470,9 +570,10 @@ impl Cycle {
         allow_401: bool,
         baseline_ms: i64,
     ) -> Probe {
-        self.simple(format!("infra:{url}"), || {
-            check_infrastructure(&self.client, url, threshold_ms, allow_401, baseline_ms)
-        })
+        self.simple(
+            format!("infra:{url}:{threshold_ms}:{allow_401}:{baseline_ms}"),
+            || check_infrastructure(&self.client, url, threshold_ms, allow_401, baseline_ms),
+        )
         .await
     }
 
@@ -491,7 +592,7 @@ impl Cycle {
         expected_text: Option<&str>,
         authenticated: bool,
     ) -> Probe {
-        self.simple(format!("ext:{url}"), || {
+        self.simple(format!("ext:{url}:{authenticated}"), || {
             check_external_provider(
                 &self.client,
                 url,
@@ -569,6 +670,83 @@ mod cycle_tests {
         let url = "http://192.0.2.1:9/same";
         cycle.reachable(url, Duration::from_millis(200), 1000).await;
         cycle.infrastructure(url, 1000, true, 0).await;
+        assert_eq!(cycle.fetches(), 2);
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn cfg_with_targets() -> Config {
+        let mut cfg = Config::defaults(String::new());
+        for r in cfg.regions.iter_mut() {
+            r.billing_url = Some(format!("http://192.0.2.10:9/{}-billing", r.key));
+            r.proxy_url = Some(format!("http://192.0.2.10:9/{}-proxy", r.key));
+            r.infra_url = Some(format!("http://192.0.2.10:9/{}-infra", r.key));
+        }
+        cfg.auth_targets = vec![("google_oauth".into(), "http://192.0.2.11:9/oauth".into())];
+        cfg
+    }
+
+    /// The point of prefetching is that the sweeps then cost nothing. Asserting
+    /// on the request count is the only way to see that — a warm read and a cold
+    /// one return the same value.
+    #[tokio::test]
+    async fn a_prefetched_target_is_not_fetched_again() {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(250))
+            .build()
+            .expect("client");
+        let cycle = Cycle::new(&client);
+        let cfg = cfg_with_targets();
+
+        cycle.prefetch(&cfg).await;
+        let after_prefetch = cycle.fetches();
+        assert!(
+            after_prefetch >= 7,
+            "regions x3 + ghcr + auth: {after_prefetch}"
+        );
+
+        // Now replay exactly what the sweeps ask for. Every one must be a hit,
+        // because a parameter that drifts from the prefetch is a silent
+        // re-probe — correct, but back to serial timeouts.
+        for r in &cfg.regions {
+            let b = r.latency_baseline_ms;
+            cycle
+                .service_status(r.billing_url.as_ref().unwrap(), b)
+                .await;
+            cycle.service_status(r.proxy_url.as_ref().unwrap(), b).await;
+            cycle
+                .infrastructure(r.infra_url.as_ref().unwrap(), 1000, false, b)
+                .await;
+        }
+        cycle.infrastructure(&cfg.ghcr_url, 3000, true, 0).await;
+        for (_, url) in &cfg.auth_targets {
+            cycle.reachable(url, Duration::from_secs(10), 2000).await;
+        }
+
+        assert_eq!(
+            cycle.fetches(),
+            after_prefetch,
+            "the sweep re-probed something the prefetch had already fetched"
+        );
+    }
+
+    /// Keys carry their parameters, so a threshold that does not match cannot
+    /// hand back a verdict computed against a different one. It costs a request;
+    /// it never returns the wrong answer.
+    #[tokio::test]
+    async fn a_mismatched_parameter_misses_rather_than_lying() {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(250))
+            .build()
+            .expect("client");
+        let cycle = Cycle::new(&client);
+        let url = "http://192.0.2.12:9/x";
+        cycle.infrastructure(url, 1000, false, 0).await;
+        cycle.infrastructure(url, 3000, false, 0).await;
         assert_eq!(cycle.fetches(), 2);
     }
 }
