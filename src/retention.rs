@@ -60,6 +60,10 @@ pub struct PruneOutcome {
     pub refused: usize,
     /// More candidates remain past this pass's budget.
     pub more: bool,
+    /// Whether this pass rebuilt the signed wire index. Reported because it is
+    /// the expensive half and it must happen exactly once, at the end of a
+    /// drain — see the call site for what it costs on the runtime.
+    pub rebuilt: bool,
 }
 
 impl PruneOutcome {
@@ -112,9 +116,20 @@ pub async fn prune_own_observations(
     filter.lifecycle = LifecycleView::All;
     filter.window = Some((epoch, cutoff));
 
+    // Scan for ONE MORE than the budget, then keep the budget and let the
+    // extra decide `more`.
+    //
+    // The obvious version — stop at the budget and set `more` because you
+    // stopped — cannot tell "there are more rows" from "there were exactly this
+    // many". With a backlog that happens to end on a budget boundary it reports
+    // `more = true` with nothing left, which suppresses the end-of-drain
+    // rebuild; the next pass then purges nothing, so `purged > 0` is false and
+    // the rebuild never happens at all. A flag that is right except at the
+    // boundary is wrong, and this one guards the expensive operation.
+    let scan_target = budget.saturating_add(1);
     let mut cursor = None;
     let mut doomed: Vec<String> = Vec::new();
-    while doomed.len() < budget {
+    'pages: loop {
         let page = reader
             .list_attestations(
                 filter.clone(),
@@ -128,6 +143,7 @@ pub async fn prune_own_observations(
             .await
             .map_err(|e| anyhow::anyhow!("list own observation rows: {e}"))?;
 
+        let next = page.next_cursor;
         for row in page.items {
             out.scanned += 1;
             // Belt and braces on the two facts that license deletion. The
@@ -141,21 +157,20 @@ pub async fn prune_own_observations(
                 .is_some_and(|d| d.starts_with(OWN_PREFIX));
             if ours && mine && row.asserted_at < cutoff {
                 doomed.push(row.attestation_id);
-                if doomed.len() >= budget {
-                    out.more = true;
-                    break;
+                if doomed.len() >= scan_target {
+                    break 'pages;
                 }
             }
         }
-        match page.next_cursor {
-            Some(c) if doomed.len() < budget => cursor = Some(c),
-            Some(_) => {
-                out.more = true;
-                break;
-            }
+        match next {
+            Some(c) => cursor = Some(c),
             None => break,
         }
     }
+    // The extra candidate, if we found one, is evidence rather than an
+    // inference — and it is not deleted this pass.
+    out.more = doomed.len() > budget;
+    doomed.truncate(budget);
 
     for id in doomed {
         match directory.purge_attestation_v31(&id).await {
@@ -170,13 +185,30 @@ pub async fn prune_own_observations(
         }
     }
 
-    // The V111 signed wire index is not maintained per row by the purge door;
-    // rebuilding once per pass is the sanctioned repair (CIRISPersist#650). Skip
-    // it when nothing was removed — it is a full-table walk, and this node is
-    // sharing two cores with the rest of the mesh.
-    if out.purged > 0 {
+    // The V111 signed wire index is not maintained per row by the purge door, so
+    // it needs one rebuild — ONCE THE BACKLOG IS DRAINED, which is what
+    // persist's own migration does and what the first cut of this function got
+    // wrong by calling it per pass.
+    //
+    // The cost is not incidental. On the sqlite backend this walks every row
+    // into memory and then runs an upsert per row from an IMMEDIATELY-INVOKED
+    // closure — no `spawn_blocking` — while holding the shared connection
+    // mutex. At 52k rows that parks a tokio worker (one of two on this box) and
+    // blocks every other database user behind the mutex, including the read
+    // API's accept loop. Threads that are not on that runtime keep running, so
+    // the process looks alive while HTTP stops answering.
+    //
+    // Per pass, with a 30k backlog draining 400 at a time, that was ~75 of
+    // these. Once, at the end, is one.
+    if out.purged > 0 && !out.more {
         match directory.rebuild_signed_wire_index().await {
-            Ok(n) => tracing::debug!(rows = n, "retention: signed wire index rebuilt"),
+            Ok(n) => {
+                out.rebuilt = true;
+                tracing::info!(
+                    rows = n,
+                    "retention: signed wire index rebuilt (backlog drained)"
+                );
+            }
             Err(e) => tracing::warn!(error = %e, "retention: wire-index rebuild failed"),
         }
     }
@@ -321,6 +353,61 @@ mod tests {
             .expect("prune");
         assert_eq!(out.purged, 0, "{out:?}");
         assert_eq!(count_own(&engine).await, 1);
+    }
+
+    /// The regression this arm exists for: on the sqlite backend the rebuild is
+    /// 52k synchronous upserts on the async runtime, holding the shared
+    /// connection mutex. Doing it per pass while draining a backlog parks a
+    /// worker every few minutes and the read API stops accepting — the process
+    /// stays alive, so it reads as a hang rather than as load.
+    #[tokio::test]
+    async fn a_budgeted_pass_does_not_rebuild_the_wire_index() {
+        let (engine, _s) = node().await;
+        for i in 0..5 {
+            crate::ceg::emit_observation(&engine, "unused", &env(&format!("service:r{i}")))
+                .await
+                .expect("emit");
+        }
+        let mid = prune_own_observations(&engine, 0, 2).await.expect("prune");
+        assert!(mid.more, "precondition: this pass left work behind");
+        assert!(
+            !mid.rebuilt,
+            "no rebuild while the backlog is still draining"
+        );
+
+        // Drain the rest; the pass that finishes the job is the one that pays.
+        let last = prune_own_observations(&engine, 0, 100)
+            .await
+            .expect("prune");
+        assert!(!last.more);
+        assert!(last.rebuilt, "the final pass rebuilds exactly once");
+    }
+
+    /// The boundary Codex caught on #61: a backlog that ends exactly on a
+    /// budget boundary. The naive "I stopped, so there must be more" reports
+    /// `more = true` with nothing left, which suppresses the end-of-drain
+    /// rebuild — and the next pass purges nothing, so the `purged > 0` guard
+    /// means the rebuild never happens at all.
+    #[tokio::test]
+    async fn a_backlog_ending_exactly_on_the_budget_still_finishes() {
+        let (engine, _s) = node().await;
+        for i in 0..3 {
+            crate::ceg::emit_observation(&engine, "unused", &env(&format!("service:e{i}")))
+                .await
+                .expect("emit");
+        }
+        // Exactly as many candidates as the budget allows.
+        let out = prune_own_observations(&engine, 0, 3).await.expect("prune");
+        assert_eq!(out.purged, 3);
+        assert!(
+            !out.more,
+            "nothing is left, so the pass must not claim there is"
+        );
+        assert!(
+            out.rebuilt,
+            "the drain finished here, so the rebuild happens here"
+        );
+        assert_eq!(count_own(&engine).await, 0);
     }
 
     #[tokio::test]

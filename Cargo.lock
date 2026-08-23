@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-status"
-version = "0.3.52"
+version = "0.3.53"
 dependencies = [
  "anyhow",
  "async-trait",
