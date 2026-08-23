@@ -797,18 +797,19 @@ impl Adapter for StatusAdapter {
                     // Serve what we just recorded — unless we could not see, in
                     // which case the previous snapshot stands and ages into
                     // `stale` on its own.
-                    // Installed on EVERY cycle, vantage failure included. The
-                    // snapshot already carries `vantage_failure: true` and a
-                    // status of `unknown`, so serving it is reporting what we
-                    // know — that we cannot see — rather than asserting health.
+                    // Only when we could SEE. A vantage-failure snapshot
+                    // carries an `unknown` headline over component maps still
+                    // full of outages synthesised from our own failed probes,
+                    // so publishing it would report the fabric down because we
+                    // went blind — see `AggregatedStatus::safe_to_publish`.
                     //
-                    // Withholding it did not prevent a wrong answer; it left the
-                    // cache empty, which sent the handler down the live-probe
-                    // path above and made a blind node slow as well as blind.
-                    // Suppression still applies where it belongs: history and
-                    // transitions, which must not record outages we cannot
-                    // support.
-                    *self.state.status.write().expect("status lock") = Some(agg.clone());
+                    // Nothing is lost by withholding it now that the request
+                    // path never probes: the previous snapshot stands and ages
+                    // into `stale`, and an empty cache answers instantly with
+                    // `unknown`.
+                    if agg.safe_to_publish() {
+                        *self.state.status.write().expect("status lock") = Some(agg.clone());
+                    }
 
                     // ── Flow A: rebuild the public roster from the OWN corpus. ──
                     // Flow A is a FULL SCAN of the corpus (dimension-prefix

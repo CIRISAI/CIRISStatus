@@ -171,6 +171,24 @@ pub struct AggregatedStatus {
 }
 
 impl AggregatedStatus {
+    /// May this snapshot be published as the served answer?
+    ///
+    /// **No, when we went blind.** A vantage failure rewrites only the
+    /// HEADLINE to `unknown` (`aggregate::aggregated_status`); `regions`,
+    /// `capabilities`, `infrastructure` and every provider map still hold the
+    /// outage verdicts synthesised from our own failed probes. Publishing that
+    /// object reports billing, the proxies and the providers as down because
+    /// WE could not see them — the false global outage the transitions path
+    /// already refuses to record, arriving through the serving path instead.
+    ///
+    /// A blind cycle therefore publishes nothing, and the previous snapshot
+    /// stands and ages into `stale` on its own. That is not a gap: with the
+    /// request path no longer probing, an absent snapshot is answered instantly
+    /// with [`AggregatedStatus::unknown`].
+    pub fn safe_to_publish(&self) -> bool {
+        !self.vantage_failure
+    }
+
     /// The answer before the first poll cycle has produced anything: we do not
     /// know, said immediately.
     ///
@@ -413,6 +431,38 @@ mod unknown_tests {
     /// The pre-first-poll answer must be instant AND must not read as data.
     /// The branch it replaces ran a live probe sweep, so a starved node served
     /// 8-12s responses to every caller and the board timed out at 15s.
+    /// Codex caught this on #62: a blind snapshot keeps every component's
+    /// synthetic outage and only rewrites the headline, so caching it publishes
+    /// a fabric-wide outage that we manufactured out of our own failed probes.
+    #[test]
+    fn a_blind_snapshot_is_not_publishable_because_its_components_still_say_outage() {
+        let mut blind = AggregatedStatus::unknown("t");
+        blind.vantage_failure = true;
+        // What `aggregated_status` actually leaves behind when every probe
+        // fails at transport: headline unknown, components still condemned.
+        blind.llm_providers.insert(
+            "groq".into(),
+            ProviderDetail {
+                status: OUTAGE.into(),
+                latency_ms: None,
+                source: Some("cirisproxy.us".into()),
+            },
+        );
+        assert_eq!(blind.status, UNKNOWN, "the headline is honest");
+        assert_eq!(
+            blind.llm_providers["groq"].status, OUTAGE,
+            "the components are not — which is exactly why this must not be served"
+        );
+        assert!(!blind.safe_to_publish());
+    }
+
+    #[test]
+    fn a_snapshot_we_could_see_is_publishable() {
+        let seeing = AggregatedStatus::unknown("t");
+        assert!(!seeing.vantage_failure);
+        assert!(seeing.safe_to_publish());
+    }
+
     #[test]
     fn the_unknown_answer_says_it_knows_nothing() {
         let a = AggregatedStatus::unknown("0.0.0-test");
