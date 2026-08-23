@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 
 use chrono::Utc;
-use reqwest::Client;
 use serde_json::Value;
 
 use crate::capability;
@@ -45,20 +44,17 @@ fn provider_status(p: &Probe) -> ProviderStatus {
 
 /// `GET /v1/status` — the service's local view: the configured local providers
 /// (postgresql + grafana, each probed only if configured).
-pub async fn service_status(cfg: &Config, client: &Client) -> ServiceStatus {
+pub async fn service_status(cfg: &Config, client: &crate::probe::Cycle) -> ServiceStatus {
     let mut providers: BTreeMap<String, ProviderStatus> = BTreeMap::new();
 
     if let Some(dsn) = &cfg.database_url {
         providers.insert(
             "postgresql".into(),
-            provider_status(&check_postgres_tcp(dsn).await),
+            provider_status(&client.postgres_tcp(dsn).await),
         );
     }
     if let Some(g) = &cfg.grafana_url {
-        providers.insert(
-            "grafana".into(),
-            provider_status(&check_grafana(client, g).await),
-        );
+        providers.insert("grafana".into(), provider_status(&client.grafana(g).await));
     }
 
     let overall = worst(providers.values().map(|p| p.status.as_str())).unwrap_or(OPERATIONAL);
@@ -392,7 +388,7 @@ pub fn transitions(
 }
 
 /// `GET /api/v1/status` — the aggregated multi-region status page contract.
-pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatus {
+pub async fn aggregated_status(cfg: &Config, client: &crate::probe::Cycle) -> AggregatedStatus {
     let specs = &cfg.capabilities;
     // Vantage accounting (FSD §3.3): transport failures are OUR network's
     // problem until proven otherwise; an HTTP status is the upstream's.
@@ -421,7 +417,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
         let mut services: BTreeMap<String, ServiceSummary> = BTreeMap::new();
 
         if let Some(url) = &region.billing_url {
-            let (probe, body) = fetch_service_status(client, url, region.latency_baseline_ms).await;
+            let (probe, body) = client.service_status(url, region.latency_baseline_ms).await;
             count(&probe);
             // Same fold as the proxy: billing's dependencies are things NOTHING
             // else serves, so an outage in one is an outage in billing. Taking
@@ -454,7 +450,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
         }
 
         if let Some(url) = &region.proxy_url {
-            let (probe, body) = fetch_service_status(client, url, region.latency_baseline_ms).await;
+            let (probe, body) = client.service_status(url, region.latency_baseline_ms).await;
             count(&probe);
             // OUR verdict for the router: its own reachability folded with the
             // dependencies nothing else can serve. A slow member of a redundant
@@ -502,8 +498,9 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
 
         // Infrastructure host health (Vultr/Hetzner).
         if let Some(url) = &region.infra_url {
-            let p =
-                check_infrastructure(client, url, 1000, false, region.latency_baseline_ms).await;
+            let p = client
+                .infrastructure(url, 1000, false, region.latency_baseline_ms)
+                .await;
             count(&p);
             infrastructure.insert(
                 region.infra_provider.to_string(),
@@ -519,7 +516,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
 
     // ── Container registry (GHCR): higher threshold, 401 == up ──
     {
-        let p = check_infrastructure(client, &cfg.ghcr_url, 3000, true, 0).await;
+        let p = client.infrastructure(&cfg.ghcr_url, 3000, true, 0).await;
         count(&p);
         infrastructure.insert(
             "github".into(),
@@ -534,7 +531,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
 
     // ── Local providers (this service's own deps), if configured ──
     if let Some(dsn) = &cfg.database_url {
-        let p = check_postgres_tcp(dsn).await;
+        let p = client.postgres_tcp(dsn).await;
         count(&p);
         database.insert(
             "lens.postgresql".into(),
@@ -542,7 +539,7 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
         );
     }
     if let Some(g) = &cfg.grafana_url {
-        let p = check_grafana(client, g).await;
+        let p = client.grafana(g).await;
         count(&p);
         internal.insert(
             "lens.grafana".into(),
@@ -552,15 +549,15 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
 
     // ── Direct external providers (search APIs) — override upstream guesses ──
     for ext in &cfg.external {
-        let p = check_external_provider(
-            client,
-            &ext.url,
-            ext.header,
-            ext.api_key.as_deref(),
-            ext.expected_text,
-            ext.authenticated,
-        )
-        .await;
+        let p = client
+            .external_provider(
+                &ext.url,
+                ext.header,
+                ext.api_key.as_deref(),
+                ext.expected_text,
+                ext.authenticated,
+            )
+            .await;
         count(&p);
         internal.insert(
             ext.display.to_string(),
@@ -575,7 +572,9 @@ pub async fn aggregated_status(cfg: &Config, client: &Client) -> AggregatedStatu
     for (id, url) in &cfg.auth_targets {
         // Any HTTP answer proves reachability — Google's tokeninfo returns 400
         // without a token, which is a healthy endpoint refusing a bad request.
-        let p = check_reachable(client, url, std::time::Duration::from_secs(10), 2000).await;
+        let p = client
+            .reachable(url, std::time::Duration::from_secs(10), 2000)
+            .await;
         count(&p);
         auth.insert(
             id.clone(),

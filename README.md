@@ -53,7 +53,11 @@ self-key registration, `consent:replication` peering, and A↔B replication are 
 of `FSD/MONITORING_NODE_DESIGN.md`:
 
 - **Flow B** — probe results become signed CEG `scores` attestations on
-  dimension `observation:reachability:v1` (`witness_relation: self`,
+  dimension `observation:reachability:v1`, **emitted on change plus a
+  heartbeat** rather than every cycle, and reaped once expired
+  (`status.corpus_retention_hours`). Re-signing an unchanged verdict is not new
+  evidence; doing it every cycle put 30,781 rows into a 388MB corpus in a week.
+  (`witness_relation: self`,
   operational/degraded/outage → `+1/0/-1`), **one row per observed target**,
   each naming what was observed and — when the knowledge is second-hand — who
   told us. A monitor can honestly sign *"I got 200 in 84ms from billing"*; it
@@ -108,7 +112,8 @@ baked CORS allow-list, and 60s cadence.
 | key | type | default | meaning |
 |---|---|---|---|
 | `status.poll_secs` | i64 | `60` | probe + roster-refresh + history poll cadence |
-| `status.observation_secs` | i64 | `300` | signed-observation emit cadence. Floored at `status.poll_secs` (never attest more often than we observe) and metered: persist charges 14,400 rows/day against the authoring key, so per-target rows at probe cadence would spend the whole budget on ourselves |
+| `status.observation_secs` | i64 | `900` | signed-observation **heartbeat** — the longest a target goes unattested while nothing about it changes. A CHANGED verdict is signed at probe speed regardless; `expires_at` is 2× this so one late cycle degrades freshness instead of blanking the subject. Floored at `status.poll_secs` |
+| `status.corpus_retention_hours` | i64 | `24` | how long our OWN expired observation rows are kept before they are deleted from the corpus. Expiry hides a row from readers; it does not reclaim anything |
 | `status.cors_origins` | list | baked `ciris.ai` set | CORS allow-list |
 | `status.ghcr_url` | str | `https://ghcr.io/v2/` | container registry (401 = up) |
 | `status.database_url` | str | — | local `postgresql` provider (TCP liveness) |

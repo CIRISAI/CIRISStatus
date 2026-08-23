@@ -81,6 +81,12 @@ struct AppState {
     status: Arc<RwLock<Option<crate::model::AggregatedStatus>>>,
     /// `component -> status` from the previous cycle, for transition detection.
     prev_flat: Arc<RwLock<std::collections::BTreeMap<String, String>>>,
+    /// `observed -> what we last SIGNED about it`. Flow B re-signed every
+    /// target every cycle, which is how a week produced 30,781 rows that were
+    /// expired within minutes and kept forever. A repeat of an unchanged
+    /// verdict is not new evidence, so this ledger lets the loop tell news from
+    /// an echo (`ceg::emit_due`).
+    emitted: Arc<RwLock<std::collections::BTreeMap<String, crate::ceg::EmitRecord>>>,
     /// Live-push fan-out for roster + health deltas (the "extra website sockets").
     live_tx: broadcast::Sender<LiveDelta>,
 }
@@ -91,6 +97,11 @@ impl AppState {
         self.cfg.read().expect("cfg lock").clone()
     }
 }
+
+/// How often the corpus-retention pass runs. Ten minutes: the backlog is tens of
+/// thousands of rows and each pass takes a bounded bite, so this drains it over
+/// hours rather than holding the corpus while it catches up at once.
+const PRUNE_EVERY_SECS: u64 = 600;
 
 /// How many missed poll cycles before a cached snapshot stops being served as
 /// current. Three, to match what the status board uses before it blues out.
@@ -114,7 +125,7 @@ async fn health(State(st): State<AppState>) -> impl IntoResponse {
 }
 
 async fn v1_status(State(st): State<AppState>) -> impl IntoResponse {
-    Json(aggregate::service_status(&st.cfg(), &st.client).await)
+    Json(aggregate::service_status(&st.cfg(), &crate::probe::Cycle::new(&st.client)).await)
 }
 
 /// `GET /api/v1/status` — served from the poll loop's snapshot, so a caller sees
@@ -151,7 +162,12 @@ async fn api_status(State(st): State<AppState>) -> impl IntoResponse {
             }
             Json(agg)
         }
-        None => Json(aggregate::aggregated_status(&cfg, &st.client).await),
+        // A fresh cycle: this is the pre-first-poll fallback, and a cache that
+        // outlived one request would hand a later caller a stale probe wearing a
+        // current timestamp.
+        None => {
+            Json(aggregate::aggregated_status(&cfg, &crate::probe::Cycle::new(&st.client)).await)
+        }
     }
 }
 
@@ -382,6 +398,7 @@ impl StatusAdapter {
             ci: crate::ci::CiCache::default(),
             status: Arc::new(RwLock::new(None)),
             prev_flat: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            emitted: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             live_tx,
         };
         Ok(StatusAdapter { state })
@@ -447,23 +464,53 @@ impl StatusAdapter {
     async fn emit_observations(&self, ctx: &AdapterContext, agg: &crate::model::AggregatedStatus) {
         let cfg = self.state.cfg();
         let now = chrono::Utc::now();
-        // Freshness tracks the EMIT cadence, not the probe cadence. An expiry
-        // that outruns the refresh would let a consumer read a row as current
-        // after we stopped writing it.
-        let valid_until = now + chrono::Duration::seconds(cfg.observation_seconds as i64);
+        let heartbeat = chrono::Duration::seconds(cfg.observation_seconds as i64);
+        // TWICE the heartbeat, not once. `expires_at` is what a consumer's
+        // `valid_at` filter reads, so an expiry equal to the refresh interval
+        // leaves a gap every time a cycle runs a second late — and on a loaded
+        // box every cycle runs late. One missed beat should degrade freshness,
+        // not blank the subject out of the fabric.
+        let valid_until = now + heartbeat * 2;
 
         let envs = crate::ceg::observation_envelopes(&cfg, agg, now, valid_until);
         let total = envs.len();
-        let mut emitted = 0usize;
-        let mut failed = 0usize;
+        let (mut emitted, mut failed, mut skipped) = (0usize, 0usize, 0usize);
+
         for env in &envs {
+            let prev = self
+                .state
+                .emitted
+                .read()
+                .expect("emit ledger lock")
+                .get(&env.observed)
+                .copied();
+            if !crate::ceg::emit_due(prev, env.score, now, heartbeat) {
+                skipped += 1;
+                continue;
+            }
             match crate::ceg::emit_observation(&ctx.engine, &ctx.key_id, env).await {
-                Ok(_) => emitted += 1,
+                Ok(_) => {
+                    emitted += 1;
+                    self.state
+                        .emitted
+                        .write()
+                        .expect("emit ledger lock")
+                        .insert(
+                            env.observed.clone(),
+                            crate::ceg::EmitRecord {
+                                score: env.score,
+                                at: now,
+                            },
+                        );
+                }
                 Err(e) => {
                     failed += 1;
                     // Per-row, with the target named: a batch that reports only
                     // a count cannot tell you WHICH subject stopped being
-                    // attestable, which is the thing worth knowing.
+                    // attestable, which is the thing worth knowing. The ledger
+                    // is NOT updated on failure, so the next cycle retries
+                    // rather than waiting out a heartbeat on a row that was
+                    // never written.
                     tracing::warn!(
                         observed = %env.observed,
                         error = %e,
@@ -472,13 +519,48 @@ impl StatusAdapter {
                 }
             }
         }
-        tracing::info!(
-            emitted,
-            failed,
-            total,
-            overall = %agg.status,
-            "Flow B: emitted signed observation:reachability:v1"
-        );
+        if emitted > 0 || failed > 0 {
+            tracing::info!(
+                emitted,
+                failed,
+                skipped,
+                total,
+                overall = %agg.status,
+                "Flow B: emitted signed observation:reachability:v1"
+            );
+        } else {
+            // A cycle where nothing changed is the common case now, and logging
+            // it at INFO every 60s is its own small tax on a box under pressure.
+            tracing::debug!(skipped, total, "Flow B: nothing new to attest");
+        }
+    }
+
+    /// Delete our own long-expired observation rows.
+    ///
+    /// Expiry is a read-side predicate, not a storage policy: `valid_at` hides
+    /// these rows from every consumer, which is exactly why nobody noticed the
+    /// corpus reaching 388MB with 95% of its rows dead. Bounded per pass, on its
+    /// own slow cadence, because this shares two cores with the rest of the mesh.
+    async fn prune_corpus(&self, ctx: &AdapterContext) {
+        let hours = self.state.cfg().corpus_retention_hours as i64;
+        match crate::retention::prune_own_observations(
+            &ctx.engine,
+            hours,
+            crate::retention::PRUNE_BUDGET_PER_PASS,
+        )
+        .await
+        {
+            Ok(o) if o.did_anything() => tracing::info!(
+                purged = o.purged,
+                refused = o.refused,
+                scanned = o.scanned,
+                more = o.more,
+                retention_hours = hours,
+                "retention: pruned our own expired observation rows"
+            ),
+            Ok(_) => tracing::debug!("retention: nothing past the window"),
+            Err(e) => tracing::warn!(error = %e, "retention pass failed"),
+        }
     }
 }
 
@@ -570,9 +652,9 @@ impl Adapter for StatusAdapter {
         let mut last_poll = self.state.cfg().poll_seconds;
         // Far enough in the past that the first tick refreshes CI immediately.
         let mut last_ci = std::time::Instant::now() - Duration::from_secs(86_400);
-        // Same trick for the signed plane: attest on the first cycle, then on
-        // the observation cadence.
-        let mut last_observation = std::time::Instant::now() - Duration::from_secs(86_400);
+        // The first retention pass runs on the first cycle (there is a backlog
+        // to work through), then every `PRUNE_EVERY_SECS`.
+        let mut last_prune = std::time::Instant::now() - Duration::from_secs(86_400);
         tracing::info!(
             poll_s = last_poll,
             observation_s = self.state.cfg().observation_seconds,
@@ -594,13 +676,32 @@ impl Adapter for StatusAdapter {
                     // ── Probe everything once; record the uptime-history rows. ──
                     // Clone the handle out and drop the guard before awaiting (the
                     // guard is !Send and would poison the future otherwise).
+                    // ONE sweep of the world per cycle, shared by the recorder
+                    // and the server. Both used to probe every endpoint
+                    // independently (CIRISStatus#47), which doubled the outbound
+                    // work and — because they run in series — the wall clock,
+                    // pushing snapshot age past the staleness ceiling.
+                    let cycle = crate::probe::Cycle::new(&self.state.client);
+                    // Fire every probe CONCURRENTLY first; both sweeps then read
+                    // a warm memo. Serial probing is what took a lap from
+                    // seconds to 5-7 minutes, which is why the served snapshot
+                    // was almost always past its staleness ceiling and the page
+                    // answered `unknown` while every probe was in fact fine.
+                    cycle.prefetch(&cfg).await;
                     let db = self.state.db.read().expect("db lock").clone();
                     if let Some(db) = db {
-                        history::poll_once(&cfg, &self.state.client, &db).await;
+                        history::poll_once(&cfg, &cycle, &db).await;
                     }
 
                     // ── Flow B: probe-derived signed observation emit. ──
-                    let agg = aggregate::aggregated_status(&cfg, &self.state.client).await;
+                    let agg = aggregate::aggregated_status(&cfg, &cycle).await;
+                    // Both sweeps have now run against one cache, so this is
+                    // the real outbound cost of a cycle — and the number to
+                    // watch if a future target starts probing twice again.
+                    tracing::debug!(
+                        requests = cycle.fetches(),
+                        "probe sweep complete (recorder + server shared one pass)"
+                    );
                     // A vantage failure means we could not SEE, so the snapshot
                     // is full of synthetic outages we have no evidence for.
                     // Marking its headline `unknown` was not enough: it was
@@ -609,12 +710,17 @@ impl Adapter for StatusAdapter {
                     // The only honest handling is to record that WE went blind
                     // and otherwise change nothing.
                     if !agg.vantage_failure {
-                        // Metered plane: emit on its OWN cadence, not the probe's.
-                        if last_observation.elapsed()
-                            >= Duration::from_secs(cfg.observation_seconds.max(1))
-                        {
-                            last_observation = std::time::Instant::now();
-                            self.emit_observations(ctx, &agg).await;
+                        // Every cycle now — but `emit_due` signs only what
+                        // CHANGED, plus a per-target heartbeat. A cadence gate
+                        // here would have delayed news by up to the heartbeat,
+                        // which is the opposite of what a status plane is for.
+                        self.emit_observations(ctx, &agg).await;
+
+                        // Retention on its own slow cadence: bounded work, and
+                        // nothing about it is urgent.
+                        if last_prune.elapsed() >= Duration::from_secs(PRUNE_EVERY_SECS) {
+                            last_prune = std::time::Instant::now();
+                            self.prune_corpus(ctx).await;
                         }
                     } else {
                         tracing::warn!(
