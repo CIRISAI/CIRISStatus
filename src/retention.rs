@@ -40,10 +40,13 @@ use ciris_server::ciris_persist::scope::CallerScope;
 /// The dimension prefix this node mints and is therefore allowed to reap.
 const OWN_PREFIX: &str = "observation:";
 
-/// Rows examined per pass. The backlog is tens of thousands and the box this
-/// runs on is memory-starved, so a pass takes a bounded bite and comes back
-/// next cycle rather than holding the corpus for a minute to catch up at once.
-pub const PRUNE_BUDGET_PER_PASS: usize = 400;
+/// Default rows deleted per pass when no `config:*` value is set — the value
+/// that ships, not the one production is stuck with (`status.corpus_retention_budget`).
+///
+/// A pass still takes a BOUNDED bite: the point is that the bite is sized
+/// against how fast the backlog needs to disappear, not against a guess. Every
+/// row left in the corpus is paid for again by every scan until it goes.
+pub const PRUNE_BUDGET_PER_PASS: usize = 2_000;
 
 /// Page size for the candidate scan. Small on purpose: each row carries its
 /// signatures, so a 500-row page is several MB of allocation on a node that is

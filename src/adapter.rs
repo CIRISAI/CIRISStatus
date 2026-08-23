@@ -98,11 +98,6 @@ impl AppState {
     }
 }
 
-/// How often the corpus-retention pass runs. Ten minutes: the backlog is tens of
-/// thousands of rows and each pass takes a bounded bite, so this drains it over
-/// hours rather than holding the corpus while it catches up at once.
-const PRUNE_EVERY_SECS: u64 = 600;
-
 /// How many missed poll cycles before a cached snapshot stops being served as
 /// current. Three, to match what the status board uses before it blues out.
 const STALE_AFTER_POLLS: i64 = 3;
@@ -552,13 +547,8 @@ impl StatusAdapter {
     /// own slow cadence, because this shares two cores with the rest of the mesh.
     async fn prune_corpus(&self, ctx: &AdapterContext) {
         let hours = self.state.cfg().corpus_retention_hours as i64;
-        match crate::retention::prune_own_observations(
-            &ctx.engine,
-            hours,
-            crate::retention::PRUNE_BUDGET_PER_PASS,
-        )
-        .await
-        {
+        let budget = self.state.cfg().corpus_retention_budget;
+        match crate::retention::prune_own_observations(&ctx.engine, hours, budget).await {
             Ok(o) if o.did_anything() => tracing::info!(
                 purged = o.purged,
                 refused = o.refused,
@@ -663,8 +653,10 @@ impl Adapter for StatusAdapter {
         // Far enough in the past that the first tick refreshes CI immediately.
         let mut last_ci = std::time::Instant::now() - Duration::from_secs(86_400);
         // The first retention pass runs on the first cycle (there is a backlog
-        // to work through), then every `PRUNE_EVERY_SECS`.
+        // to work through), then on `status.corpus_retention_secs`.
         let mut last_prune = std::time::Instant::now() - Duration::from_secs(86_400);
+        // Roster likewise: built on the first cycle, then on its own cadence.
+        let mut last_roster = std::time::Instant::now() - Duration::from_secs(86_400);
         tracing::info!(
             poll_s = last_poll,
             observation_s = self.state.cfg().observation_seconds,
@@ -728,7 +720,9 @@ impl Adapter for StatusAdapter {
 
                         // Retention on its own slow cadence: bounded work, and
                         // nothing about it is urgent.
-                        if last_prune.elapsed() >= Duration::from_secs(PRUNE_EVERY_SECS) {
+                        if last_prune.elapsed()
+                            >= Duration::from_secs(cfg.corpus_retention_secs.max(1))
+                        {
                             last_prune = std::time::Instant::now();
                             self.prune_corpus(ctx).await;
                         }
@@ -817,7 +811,14 @@ impl Adapter for StatusAdapter {
                     *self.state.status.write().expect("status lock") = Some(agg.clone());
 
                     // ── Flow A: rebuild the public roster from the OWN corpus. ──
-                    self.refresh_roster(ctx).await;
+                    // Flow A is a FULL SCAN of the corpus (dimension-prefix
+                    // filtering walks every row, signatures included). On this
+                    // node it returns nothing — no agents — so running it every
+                    // cycle spent ~26s of disk to re-derive an empty roster.
+                    if last_roster.elapsed() >= Duration::from_secs(cfg.roster_seconds.max(1)) {
+                        last_roster = std::time::Instant::now();
+                        self.refresh_roster(ctx).await;
+                    }
 
                     // ── Substrate CI, on its OWN (slower) cadence. Five GitHub
                     // calls must not ride the health poll: unauthenticated, the

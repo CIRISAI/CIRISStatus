@@ -114,6 +114,9 @@ baked CORS allow-list, and 60s cadence.
 | `status.poll_secs` | i64 | `60` | probe + roster-refresh + history poll cadence |
 | `status.observation_secs` | i64 | `900` | signed-observation **heartbeat** — the longest a target goes unattested while nothing about it changes. A CHANGED verdict is signed at probe speed regardless; `expires_at` is 2× this so one late cycle degrades freshness instead of blanking the subject. Floored at `status.poll_secs` |
 | `status.corpus_retention_hours` | i64 | `24` | how long our OWN expired observation rows are kept before they are deleted from the corpus. Expiry hides a row from readers; it does not reclaim anything |
+| `status.corpus_retention_budget` | i64 | `2000` | rows the retention pass deletes per pass |
+| `status.corpus_retention_secs` | i64 | `120` | how often that pass runs. Budget × cadence sets how fast a backlog drains, and every row still in the corpus is paid for again by every scan until it goes |
+| `status.roster_secs` | i64 | `300` | Flow A roster rebuild cadence. It is a FULL corpus scan (dimension-prefix filtering walks every row, signatures included), so on a node with no agents it costs disk to re-derive nothing. Floored at `status.poll_secs` |
 | `status.cors_origins` | list | baked `ciris.ai` set | CORS allow-list |
 | `status.ghcr_url` | str | `https://ghcr.io/v2/` | container registry (401 = up) |
 | `status.database_url` | str | — | local `postgresql` provider (TCP liveness) |

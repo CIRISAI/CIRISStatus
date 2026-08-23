@@ -111,6 +111,25 @@ pub struct Config {
     /// does not reclaim anything, and on a four-node mesh sharing one small box
     /// that difference is the whole ballgame.
     pub corpus_retention_hours: u64,
+    /// Rows the retention pass may delete per pass, and how often it runs.
+    ///
+    /// Sized against MEASURED I/O rather than a guess: the corpus scans this
+    /// node performs read ~15MB/s off a disk already carrying 55MB/s between
+    /// the two nodes, so a backlog left to drain at 400 rows every ten minutes
+    /// takes days — during which every scan keeps paying for the rows the pass
+    /// has not reached yet. Draining is the thing that makes the scans cheap,
+    /// so it should not be the slowest part of the loop.
+    pub corpus_retention_budget: usize,
+    pub corpus_retention_secs: u64,
+    /// How often Flow A rebuilds the public roster from the corpus.
+    ///
+    /// DECOUPLED from `poll_seconds` because it is a full scan: filtering by
+    /// dimension prefix walks every attestation row, signatures included. On a
+    /// monitor node with no agents that scan returns nothing, every cycle, at a
+    /// cost proportional to how much OTHER data the corpus holds. Paying ~26s
+    /// of disk to re-derive an empty roster once a minute is what turned a 60s
+    /// lap into minutes.
+    pub roster_seconds: u64,
     pub version: &'static str,
     pub grafana_url: Option<String>,
     pub database_url: Option<String>, // local "postgresql" provider (TCP liveness)
@@ -224,6 +243,29 @@ impl Config {
             .filter(|v| *v > 0)
             .unwrap_or(24) as u64;
 
+        let corpus_retention_budget =
+            graph_config::get_i64(engine, "status.corpus_retention_budget")
+                .await
+                .ok()
+                .flatten()
+                .filter(|v| *v > 0)
+                .unwrap_or(crate::retention::PRUNE_BUDGET_PER_PASS as i64) as usize;
+
+        let corpus_retention_secs = graph_config::get_i64(engine, "status.corpus_retention_secs")
+            .await
+            .ok()
+            .flatten()
+            .filter(|v| *v > 0)
+            .unwrap_or(120) as u64;
+
+        let roster_seconds = graph_config::get_i64(engine, "status.roster_secs")
+            .await
+            .ok()
+            .flatten()
+            .filter(|v| *v > 0)
+            .unwrap_or(300)
+            .max(poll_seconds as i64) as u64;
+
         let cors_origins = graph_config::get_str_list(engine, "status.cors_origins")
             .await
             .ok()
@@ -298,6 +340,9 @@ impl Config {
             poll_seconds,
             observation_seconds,
             corpus_retention_hours,
+            corpus_retention_budget,
+            corpus_retention_secs,
+            roster_seconds,
             version: env!("CARGO_PKG_VERSION"),
             grafana_url: get_str(engine, "status.grafana_url").await,
             database_url: get_str(engine, "status.database_url").await,
@@ -342,6 +387,9 @@ impl Config {
             poll_seconds: 60,
             observation_seconds: 900,
             corpus_retention_hours: 24,
+            corpus_retention_budget: crate::retention::PRUNE_BUDGET_PER_PASS,
+            corpus_retention_secs: 120,
+            roster_seconds: 300,
             version: env!("CARGO_PKG_VERSION"),
             grafana_url: None,
             database_url: None,
