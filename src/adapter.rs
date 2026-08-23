@@ -555,6 +555,7 @@ impl StatusAdapter {
                 refused = o.refused,
                 scanned = o.scanned,
                 more = o.more,
+                rebuilt = o.rebuilt,
                 retention_hours = hours,
                 "retention: pruned our own expired observation rows"
             ),
