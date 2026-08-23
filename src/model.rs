@@ -170,6 +170,36 @@ pub struct AggregatedStatus {
     pub internal_providers: BTreeMap<String, ProviderDetail>,
 }
 
+impl AggregatedStatus {
+    /// The answer before the first poll cycle has produced anything: we do not
+    /// know, said immediately.
+    ///
+    /// Exists so no request path ever probes. A handler that probes turns every
+    /// viewer into a load source at the exact moment the node is least able to
+    /// carry it, and answers after the caller's timeout anyway.
+    pub fn unknown(version: &str) -> Self {
+        let _ = version;
+        AggregatedStatus {
+            status: UNKNOWN.to_string(),
+            indicator: indicator_for(UNKNOWN),
+            capabilities: BTreeMap::new(),
+            vantage_failure: false,
+            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            age_seconds: 0,
+            // The age above is the age of THIS answer, which carries no
+            // observation — so it must not read as fresh data.
+            stale: true,
+            last_incident: None,
+            regions: BTreeMap::new(),
+            infrastructure: BTreeMap::new(),
+            llm_providers: BTreeMap::new(),
+            auth_providers: BTreeMap::new(),
+            database_providers: BTreeMap::new(),
+            internal_providers: BTreeMap::new(),
+        }
+    }
+}
+
 // ── Capabilities (FSD/CAPABILITY_MONITORING.md §2) ───────────────────────────
 /// One member of a capability, and the role it plays in the call path.
 #[derive(Serialize, Clone, PartialEq, Debug)]
@@ -374,4 +404,28 @@ pub struct HistoryResponse {
     pub days: i64,
     pub region: Option<String>,
     pub history: Vec<HistoryDay>,
+}
+
+#[cfg(test)]
+mod unknown_tests {
+    use super::*;
+
+    /// The pre-first-poll answer must be instant AND must not read as data.
+    /// The branch it replaces ran a live probe sweep, so a starved node served
+    /// 8-12s responses to every caller and the board timed out at 15s.
+    #[test]
+    fn the_unknown_answer_says_it_knows_nothing() {
+        let a = AggregatedStatus::unknown("0.0.0-test");
+        assert_eq!(a.status, UNKNOWN);
+        assert_eq!(a.indicator, indicator_for(UNKNOWN));
+        assert!(
+            a.stale,
+            "an answer with no observation behind it is not fresh"
+        );
+        // Not a vantage failure: that is a MEASURED verdict (every probe failed
+        // at transport). Claiming it here would invent evidence we never
+        // gathered.
+        assert!(!a.vantage_failure);
+        assert!(a.regions.is_empty() && a.capabilities.is_empty());
+    }
 }

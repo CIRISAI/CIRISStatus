@@ -162,12 +162,21 @@ async fn api_status(State(st): State<AppState>) -> impl IntoResponse {
             }
             Json(agg)
         }
-        // A fresh cycle: this is the pre-first-poll fallback, and a cache that
-        // outlived one request would hand a later caller a stale probe wearing a
-        // current timestamp.
-        None => {
-            Json(aggregate::aggregated_status(&cfg, &crate::probe::Cycle::new(&st.client)).await)
-        }
+        // NOTHING is probed on the request path — not even once, not even as a
+        // fallback.
+        //
+        // This branch used to run a full live sweep when no snapshot existed
+        // yet, which is how a starved node turned every caller into a probe
+        // amplifier: ~17 sequential requests, 8-12s per response, and the
+        // board's 15s fetch timing out while the process worked. Worse, it
+        // fired exactly when the node could least afford it — the snapshot is
+        // missing precisely when the poll loop is failing.
+        //
+        // An honest `unknown` in a millisecond beats a truthful answer that
+        // arrives after the caller has given up. `stale: true` says the age is
+        // not meaningful; a consumer that wants known-good data knows to keep
+        // its last reading.
+        None => Json(crate::model::AggregatedStatus::unknown(cfg.version)),
     }
 }
 
@@ -794,9 +803,18 @@ impl Adapter for StatusAdapter {
                     // Serve what we just recorded — unless we could not see, in
                     // which case the previous snapshot stands and ages into
                     // `stale` on its own.
-                    if !agg.vantage_failure {
-                        *self.state.status.write().expect("status lock") = Some(agg.clone());
-                    }
+                    // Installed on EVERY cycle, vantage failure included. The
+                    // snapshot already carries `vantage_failure: true` and a
+                    // status of `unknown`, so serving it is reporting what we
+                    // know — that we cannot see — rather than asserting health.
+                    //
+                    // Withholding it did not prevent a wrong answer; it left the
+                    // cache empty, which sent the handler down the live-probe
+                    // path above and made a blind node slow as well as blind.
+                    // Suppression still applies where it belongs: history and
+                    // transitions, which must not record outages we cannot
+                    // support.
+                    *self.state.status.write().expect("status lock") = Some(agg.clone());
 
                     // ── Flow A: rebuild the public roster from the OWN corpus. ──
                     self.refresh_roster(ctx).await;
