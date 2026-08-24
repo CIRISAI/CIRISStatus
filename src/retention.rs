@@ -63,9 +63,9 @@ pub struct PruneOutcome {
     pub refused: usize,
     /// More candidates remain past this pass's budget.
     pub more: bool,
-    /// Whether this pass rebuilt the signed wire index. Reported because it is
-    /// the expensive half and it must happen exactly once, at the end of a
-    /// drain — see the call site for what it costs on the runtime.
+    /// Whether the caller rebuilt the signed wire index after this pass. The
+    /// pass itself never does — see [`rebuild_wire_index`] for why the policy
+    /// lives with the caller.
     pub rebuilt: bool,
 }
 
@@ -188,35 +188,34 @@ pub async fn prune_own_observations(
         }
     }
 
-    // The V111 signed wire index is not maintained per row by the purge door, so
-    // it needs one rebuild — ONCE THE BACKLOG IS DRAINED, which is what
-    // persist's own migration does and what the first cut of this function got
-    // wrong by calling it per pass.
-    //
-    // The cost is not incidental. On the sqlite backend this walks every row
-    // into memory and then runs an upsert per row from an IMMEDIATELY-INVOKED
-    // closure — no `spawn_blocking` — while holding the shared connection
-    // mutex. At 52k rows that parks a tokio worker (one of two on this box) and
-    // blocks every other database user behind the mutex, including the read
-    // API's accept loop. Threads that are not on that runtime keep running, so
-    // the process looks alive while HTTP stops answering.
-    //
-    // Per pass, with a 30k backlog draining 400 at a time, that was ~75 of
-    // these. Once, at the end, is one.
-    if out.purged > 0 && !out.more {
-        match directory.rebuild_signed_wire_index().await {
-            Ok(n) => {
-                out.rebuilt = true;
-                tracing::info!(
-                    rows = n,
-                    "retention: signed wire index rebuilt (backlog drained)"
-                );
-            }
-            Err(e) => tracing::warn!(error = %e, "retention: wire-index rebuild failed"),
-        }
-    }
-
     Ok(out)
+}
+
+/// Repair the V111 signed wire index after purges.
+///
+/// **Separated from the pass that deletes, because the two have different
+/// economics.** Deleting is cheap and wants to run often; this walks every
+/// remaining row into memory and then upserts each one from an
+/// immediately-invoked closure — no `spawn_blocking` — while holding the shared
+/// connection mutex. At ~24k rows that parks a tokio worker and blocks every
+/// other database user behind the mutex, the read API included.
+///
+/// Tying it to "this pass finished the backlog" looked right while a backlog
+/// existed and became wrong the moment one did not: in steady state every pass
+/// purges a few expired rows AND finishes, so the condition fired every single
+/// time — a 24k-row rebuild every two minutes, which is how a fixed problem
+/// came back wearing different clothes.
+///
+/// The index is a lookup accelerator, not a correctness invariant: an entry for
+/// a purged row resolves to a miss. So the repair is owed eventually, not
+/// immediately, and the caller decides when enough has changed to be worth the
+/// stall.
+pub async fn rebuild_wire_index(engine: &Engine) -> Result<u64> {
+    engine
+        .federation_directory()
+        .rebuild_signed_wire_index()
+        .await
+        .map_err(|e| anyhow::anyhow!("rebuild signed wire index: {e}"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -358,11 +357,62 @@ mod tests {
         assert_eq!(count_own(&engine).await, 1);
     }
 
+    /// **The repair still has to WORK when the caller asks for it.**
+    ///
+    /// Splitting the rebuild out of the pass removed the only thing that
+    /// exercised it — every remaining assertion in this file is about the pass
+    /// NOT rebuilding, and a seam nothing calls is a seam nothing checks. This
+    /// covers the half that moved: purge rows the pass will not repair after,
+    /// then repair explicitly, and see the index reflect what actually
+    /// survived.
+    #[tokio::test]
+    async fn the_extracted_rebuild_repairs_the_index_when_the_caller_asks() {
+        let (engine, _s) = node().await;
+        for i in 0..4 {
+            crate::ceg::emit_observation(&engine, "unused", &env(&format!("service:x{i}")))
+                .await
+                .expect("emit");
+        }
+
+        // Measured as a DELTA, not against `count_own`: the index walks EVERY
+        // signed row in the store — genesis and seed rows included — while
+        // `count_own` is the filtered subset this retention pass can touch.
+        // The first cut of this test asserted the two were equal and read 8
+        // against 0, which is a two-different-populations mistake in the test
+        // rather than a defect in the rebuild.
+        let before = rebuild_wire_index(&engine).await.expect("rebuild");
+
+        let out = prune_own_observations(&engine, 0, 100)
+            .await
+            .expect("prune");
+        assert_eq!(out.purged, 4, "precondition: the rows went");
+        assert!(
+            !out.rebuilt,
+            "precondition: the pass leaves the index owed, which is the point"
+        );
+
+        // The caller's job, now explicit. It must succeed, and the index it
+        // rebuilds must have SHRUNK by exactly what the purge removed — a
+        // rebuild that silently no-opped would reset the adapter's debt counter
+        // against work that never happened.
+        let after = rebuild_wire_index(&engine)
+            .await
+            .expect("the extracted rebuild must still work when called");
+        assert_eq!(
+            before - after,
+            out.purged as u64,
+            "the repaired index must have lost exactly the purged rows \
+             (before={before}, after={after}, purged={})",
+            out.purged
+        );
+    }
+
     /// The regression this arm exists for: on the sqlite backend the rebuild is
-    /// 52k synchronous upserts on the async runtime, holding the shared
-    /// connection mutex. Doing it per pass while draining a backlog parks a
-    /// worker every few minutes and the read API stops accepting — the process
-    /// stays alive, so it reads as a hang rather than as load.
+    /// tens of thousands of synchronous upserts on the async runtime, holding
+    /// the shared connection mutex. Doing it per pass parks a worker every few
+    /// minutes and the read API stops answering — the process stays alive, so
+    /// it reads as a hang rather than as load. Deleting must never drag the
+    /// repair along with it.
     #[tokio::test]
     async fn a_budgeted_pass_does_not_rebuild_the_wire_index() {
         let (engine, _s) = node().await;
@@ -378,12 +428,28 @@ mod tests {
             "no rebuild while the backlog is still draining"
         );
 
-        // Drain the rest; the pass that finishes the job is the one that pays.
+        // AND THE PASS THAT FINISHES THE BACKLOG DOES NOT PAY EITHER.
+        //
+        // This assertion used to be its inverse, and the inversion is the whole
+        // lesson. "Rebuild once the backlog is drained" is correct exactly
+        // while a backlog exists — and in STEADY STATE every pass purges a
+        // handful of expired rows and finishes, so the condition fired every
+        // single time: a full-table walk holding the connection mutex, every
+        // two minutes, for seventeen deleted rows. The fixed problem came back
+        // wearing different clothes.
+        //
+        // Deleting never drags the repair along with it now. The caller owns
+        // that decision — see `rebuild_wire_index` and the adapter's purge
+        // debt.
         let last = prune_own_observations(&engine, 0, 100)
             .await
             .expect("prune");
         assert!(!last.more);
-        assert!(last.rebuilt, "the final pass rebuilds exactly once");
+        assert!(
+            !last.rebuilt,
+            "the pass that DRAINS the backlog must not rebuild either — a \
+             finished-the-backlog condition is true on every steady-state pass"
+        );
     }
 
     /// The boundary Codex caught on #61: a backlog that ends exactly on a
@@ -407,8 +473,9 @@ mod tests {
             "nothing is left, so the pass must not claim there is"
         );
         assert!(
-            out.rebuilt,
-            "the drain finished here, so the rebuild happens here"
+            !out.rebuilt,
+            "finishing the backlog is not a reason to rebuild — in steady state \
+             every pass finishes, so this is the condition that fired forever"
         );
         assert_eq!(count_own(&engine).await, 0);
     }

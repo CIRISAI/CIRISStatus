@@ -87,6 +87,10 @@ struct AppState {
     /// verdict is not new evidence, so this ledger lets the loop tell news from
     /// an echo (`ceg::emit_due`).
     emitted: Arc<RwLock<std::collections::BTreeMap<String, crate::ceg::EmitRecord>>>,
+    /// Rows purged since the signed wire index was last repaired. The repair is
+    /// a full-table walk on the runtime, so it is paid off in one lump rather
+    /// than owed a little at a time (see `retention::rebuild_wire_index`).
+    purge_debt: Arc<RwLock<usize>>,
     /// Live-push fan-out for roster + health deltas (the "extra website sockets").
     live_tx: broadcast::Sender<LiveDelta>,
 }
@@ -97,6 +101,14 @@ impl AppState {
         self.cfg.read().expect("cfg lock").clone()
     }
 }
+
+/// Rows that must be purged before the signed wire index is rebuilt.
+///
+/// The rebuild is a full-table walk holding the connection mutex, so it is
+/// amortised: 5,000 rows is roughly a day of steady-state churn at the current
+/// emit rate, and the index being briefly out of date costs a lookup miss, not
+/// a wrong answer.
+const REBUILD_AFTER_PURGES: usize = 5_000;
 
 /// How many missed poll cycles before a cached snapshot stops being served as
 /// current. Three, to match what the status board uses before it blues out.
@@ -403,6 +415,7 @@ impl StatusAdapter {
             status: Arc::new(RwLock::new(None)),
             prev_flat: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             emitted: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            purge_debt: Arc::new(RwLock::new(0)),
             live_tx,
         };
         Ok(StatusAdapter { state })
@@ -548,18 +561,99 @@ impl StatusAdapter {
     async fn prune_corpus(&self, ctx: &AdapterContext) {
         let hours = self.state.cfg().corpus_retention_hours as i64;
         let budget = self.state.cfg().corpus_retention_budget;
-        match crate::retention::prune_own_observations(&ctx.engine, hours, budget).await {
-            Ok(o) if o.did_anything() => tracing::info!(
+        let mut o = match crate::retention::prune_own_observations(&ctx.engine, hours, budget).await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(error = %e, "retention pass failed");
+                return;
+            }
+        };
+
+        // The index repair is owed EVENTUALLY, not per pass. Steady state
+        // purges a handful of rows every couple of minutes and finishes the
+        // backlog each time, so any "did we finish?" condition fires forever —
+        // a 24k-row walk holding the connection mutex, for seventeen deleted
+        // rows. Debt instead: pay once enough has changed to be worth one
+        // stall. An index entry for a purged row is a miss, not a wrong answer,
+        // so paying late costs a lookup and nothing else.
+        // THE DEBT IS DURABLE (codex review, PR #63). Held in memory alone it
+        // evaporates on restart, and `purge_attestation_v31` does not remove
+        // the index entries for the rows it deletes — so a process that
+        // restarts before paying forgets rows it already purged and their
+        // stale entries are never repaired. On a node with an OOM restart loop
+        // that is precisely the wrong direction: the more it restarts, the more
+        // it forgets it owes.
+        //
+        // The in-memory cell stays as the fast path and is seeded from the
+        // store on first use; the store is the record.
+        let db = self.state.db.read().ok().and_then(|g| g.clone());
+        let owed = {
+            let mut d = self.state.purge_debt.write().expect("purge debt lock");
+            if *d == 0 {
+                if let Some(db) = db.as_ref() {
+                    *d = crate::history::counter_get(db, crate::history::COUNTER_PURGE_DEBT)
+                        as usize;
+                }
+            }
+            *d += o.purged;
+            *d
+        };
+        if o.purged > 0 {
+            if let Some(db) = db.as_ref() {
+                crate::history::counter_set(db, crate::history::COUNTER_PURGE_DEBT, owed as u64);
+            }
+        }
+        // **BOTH BOUNDS, NOT EITHER** (codex review, PR #63). The debt alone
+        // reintroduces the stall it was written to prevent: with a 30,000-row
+        // backlog draining 2,000 a pass, the counter crosses 5,000 on pass
+        // three and again every two and a half passes after it — roughly six
+        // full-table rebuilds DURING the drain, each holding the connection
+        // mutex and blocking the read API. That is the production failure,
+        // reached by the fix for it.
+        //
+        // `!o.more` alone is the OTHER failure, the one this commit exists to
+        // remove: in steady state every pass finishes, so it fires forever.
+        //
+        // Together they are exactly right, because they bound different things.
+        // The debt says ENOUGH HAS CHANGED to be worth one stall; `!o.more`
+        // says THIS IS A QUIET MOMENT to take it. A drain is never a quiet
+        // moment, and a steady-state pass is never enough change on its own.
+        if owed >= REBUILD_AFTER_PURGES && !o.more {
+            match crate::retention::rebuild_wire_index(&ctx.engine).await {
+                Ok(rows) => {
+                    *self.state.purge_debt.write().expect("purge debt lock") = 0;
+                    // Zero the DURABLE record in the same breath. Clearing only
+                    // the in-memory cell would make a restart re-owe work that
+                    // was actually done — the mirror of the bug above, and just
+                    // as invisible.
+                    if let Some(db) = db.as_ref() {
+                        crate::history::counter_set(db, crate::history::COUNTER_PURGE_DEBT, 0);
+                    }
+                    o.rebuilt = true;
+                    tracing::info!(
+                        rows,
+                        purged_since_last = owed,
+                        "retention: signed wire index rebuilt"
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "retention: wire-index rebuild failed"),
+            }
+        }
+
+        if o.did_anything() {
+            tracing::info!(
                 purged = o.purged,
                 refused = o.refused,
                 scanned = o.scanned,
                 more = o.more,
                 rebuilt = o.rebuilt,
+                debt = owed,
                 retention_hours = hours,
                 "retention: pruned our own expired observation rows"
-            ),
-            Ok(_) => tracing::debug!("retention: nothing past the window"),
-            Err(e) => tracing::warn!(error = %e, "retention pass failed"),
+            );
+        } else {
+            tracing::debug!("retention: nothing past the window");
         }
     }
 }
