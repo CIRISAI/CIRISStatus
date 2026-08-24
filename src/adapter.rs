@@ -87,6 +87,10 @@ struct AppState {
     /// verdict is not new evidence, so this ledger lets the loop tell news from
     /// an echo (`ceg::emit_due`).
     emitted: Arc<RwLock<std::collections::BTreeMap<String, crate::ceg::EmitRecord>>>,
+    /// Rows purged since the signed wire index was last repaired. The repair is
+    /// a full-table walk on the runtime, so it is paid off in one lump rather
+    /// than owed a little at a time (see `retention::rebuild_wire_index`).
+    purge_debt: Arc<RwLock<usize>>,
     /// Live-push fan-out for roster + health deltas (the "extra website sockets").
     live_tx: broadcast::Sender<LiveDelta>,
 }
@@ -97,6 +101,14 @@ impl AppState {
         self.cfg.read().expect("cfg lock").clone()
     }
 }
+
+/// Rows that must be purged before the signed wire index is rebuilt.
+///
+/// The rebuild is a full-table walk holding the connection mutex, so it is
+/// amortised: 5,000 rows is roughly a day of steady-state churn at the current
+/// emit rate, and the index being briefly out of date costs a lookup miss, not
+/// a wrong answer.
+const REBUILD_AFTER_PURGES: usize = 5_000;
 
 /// How many missed poll cycles before a cached snapshot stops being served as
 /// current. Three, to match what the status board uses before it blues out.
@@ -403,6 +415,7 @@ impl StatusAdapter {
             status: Arc::new(RwLock::new(None)),
             prev_flat: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             emitted: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            purge_debt: Arc::new(RwLock::new(0)),
             live_tx,
         };
         Ok(StatusAdapter { state })
@@ -548,18 +561,55 @@ impl StatusAdapter {
     async fn prune_corpus(&self, ctx: &AdapterContext) {
         let hours = self.state.cfg().corpus_retention_hours as i64;
         let budget = self.state.cfg().corpus_retention_budget;
-        match crate::retention::prune_own_observations(&ctx.engine, hours, budget).await {
-            Ok(o) if o.did_anything() => tracing::info!(
+        let mut o = match crate::retention::prune_own_observations(&ctx.engine, hours, budget).await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(error = %e, "retention pass failed");
+                return;
+            }
+        };
+
+        // The index repair is owed EVENTUALLY, not per pass. Steady state
+        // purges a handful of rows every couple of minutes and finishes the
+        // backlog each time, so any "did we finish?" condition fires forever —
+        // a 24k-row walk holding the connection mutex, for seventeen deleted
+        // rows. Debt instead: pay once enough has changed to be worth one
+        // stall. An index entry for a purged row is a miss, not a wrong answer,
+        // so paying late costs a lookup and nothing else.
+        let owed = {
+            let mut d = self.state.purge_debt.write().expect("purge debt lock");
+            *d += o.purged;
+            *d
+        };
+        if owed >= REBUILD_AFTER_PURGES {
+            match crate::retention::rebuild_wire_index(&ctx.engine).await {
+                Ok(rows) => {
+                    *self.state.purge_debt.write().expect("purge debt lock") = 0;
+                    o.rebuilt = true;
+                    tracing::info!(
+                        rows,
+                        purged_since_last = owed,
+                        "retention: signed wire index rebuilt"
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "retention: wire-index rebuild failed"),
+            }
+        }
+
+        if o.did_anything() {
+            tracing::info!(
                 purged = o.purged,
                 refused = o.refused,
                 scanned = o.scanned,
                 more = o.more,
                 rebuilt = o.rebuilt,
+                debt = owed,
                 retention_hours = hours,
                 "retention: pruned our own expired observation rows"
-            ),
-            Ok(_) => tracing::debug!("retention: nothing past the window"),
-            Err(e) => tracing::warn!(error = %e, "retention pass failed"),
+            );
+        } else {
+            tracing::debug!("retention: nothing past the window");
         }
     }
 }
