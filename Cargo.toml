@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.54"
+version = "0.3.55"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -17,18 +17,31 @@ path = "src/main.rs"
 # ownership + safety + NAT-traversal — is ciris-server's `serve_with_adapter`,
 # and the status page is a `StatusAdapter: ciris_server::Adapter` folded onto the
 # SAME shared core. Default features (NOT python, NOT pkcs11).
-# Pinned to ciris-server v0.5.117 — the mobile-delivery cut: #264 fold reentrancy shield + edge v13.1.0 (#353 reply-over-inbound-link) + rust logs everywhere. Prior: v0.5.115 = TRACE-DELIVERY UNBLOCKED (mesh-works cut +
-# the #260 KEX fix: persist v17.3.0 ResolveEncryptionKeys via the proxy, edge
-# v13.0.9; harness-verified KEX PRESENT in 45s) + the 7 agent federation routes
-# (#261). Prior: v0.5.114 = THE MESH-WORKS CUT: coherent triple verify
-# v10.2.0 / persist v17.2.0 / edge v13.0.8, end-to-end PROVEN by CIRISServer's
-# harness/mesh-repro QA runner (#258 SUCCESS: both nodes root, anti-entropy
-# rounds complete all 3 kinds). Closes the responder seams (CIRISEdge#348) atop
-# the full 0.5.108-113 routing/identify/re-key saga — Node B moves with the
-# fleet (wire-coherent with Node A + agents on >=0.5.114). Also ships the full
-# edge event-bus logger, so Node B's logs now narrate announce/link/path
-# lifecycle. Zero-env boot unchanged (config-as-CEG via graph_config).
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.187" }
+# Pinned to ciris-server v0.5.188 — THE NODE SAYS WHEN IT IS IN TROUBLE. This
+# is the cut ciris-status has the most direct stake in: `GET /v1/health`
+# returned a hardcoded "status": "ok" while the canonical was SIGKILLed 193
+# times at 93% of its memory limit, and THIS crate is one of the watchers that
+# believed it. Health is now derived from a warning registry — memory (walking
+# the process's own cgroup, ancestors included), CPU and disk STALL from PSI
+# rather than utilisation, replication-round convergence over a WINDOW, and
+# retention — with every probe reporting WHY it cannot answer instead of a
+# comfortable zero. A folded pair is degraded if either half is.
+#
+# Directly relevant here: the operator surface now carries persist's
+# catalogue-enumerated table list, real per-table bytes and `dark_bytes`, so
+# the 389 MB this node once carried in tables nothing named is finally
+# attributable; and `RetentionOutcome::BoundUnenforceable` — measured on THIS
+# node, 52,125 attestations and ZERO traces reporting "inside every configured
+# bound" every hour — now alarms instead of reading as steady state.
+#
+# Substrate underneath: edge v18.7.0 (flat ~100 MiB advertise memory, the
+# production OOM's actual fix) + persist v38.4.0 (#767 catalogue + real SQLite
+# bytes, #768 WAL bound) + verify v13.6.1.
+#
+# Prior: v0.5.187 = backpressure you can trust. The record below this line had
+# drifted to v0.5.117 while the pin read v0.5.187 — a cut record that does not
+# track the pin is worse than none, so it is replaced rather than extended.
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.188" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
