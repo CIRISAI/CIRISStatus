@@ -577,15 +577,59 @@ impl StatusAdapter {
         // rows. Debt instead: pay once enough has changed to be worth one
         // stall. An index entry for a purged row is a miss, not a wrong answer,
         // so paying late costs a lookup and nothing else.
+        // THE DEBT IS DURABLE (codex review, PR #63). Held in memory alone it
+        // evaporates on restart, and `purge_attestation_v31` does not remove
+        // the index entries for the rows it deletes — so a process that
+        // restarts before paying forgets rows it already purged and their
+        // stale entries are never repaired. On a node with an OOM restart loop
+        // that is precisely the wrong direction: the more it restarts, the more
+        // it forgets it owes.
+        //
+        // The in-memory cell stays as the fast path and is seeded from the
+        // store on first use; the store is the record.
+        let db = self.state.db.read().ok().and_then(|g| g.clone());
         let owed = {
             let mut d = self.state.purge_debt.write().expect("purge debt lock");
+            if *d == 0 {
+                if let Some(db) = db.as_ref() {
+                    *d = crate::history::counter_get(db, crate::history::COUNTER_PURGE_DEBT)
+                        as usize;
+                }
+            }
             *d += o.purged;
             *d
         };
-        if owed >= REBUILD_AFTER_PURGES {
+        if o.purged > 0 {
+            if let Some(db) = db.as_ref() {
+                crate::history::counter_set(db, crate::history::COUNTER_PURGE_DEBT, owed as u64);
+            }
+        }
+        // **BOTH BOUNDS, NOT EITHER** (codex review, PR #63). The debt alone
+        // reintroduces the stall it was written to prevent: with a 30,000-row
+        // backlog draining 2,000 a pass, the counter crosses 5,000 on pass
+        // three and again every two and a half passes after it — roughly six
+        // full-table rebuilds DURING the drain, each holding the connection
+        // mutex and blocking the read API. That is the production failure,
+        // reached by the fix for it.
+        //
+        // `!o.more` alone is the OTHER failure, the one this commit exists to
+        // remove: in steady state every pass finishes, so it fires forever.
+        //
+        // Together they are exactly right, because they bound different things.
+        // The debt says ENOUGH HAS CHANGED to be worth one stall; `!o.more`
+        // says THIS IS A QUIET MOMENT to take it. A drain is never a quiet
+        // moment, and a steady-state pass is never enough change on its own.
+        if owed >= REBUILD_AFTER_PURGES && !o.more {
             match crate::retention::rebuild_wire_index(&ctx.engine).await {
                 Ok(rows) => {
                     *self.state.purge_debt.write().expect("purge debt lock") = 0;
+                    // Zero the DURABLE record in the same breath. Clearing only
+                    // the in-memory cell would make a restart re-owe work that
+                    // was actually done — the mirror of the bug above, and just
+                    // as invisible.
+                    if let Some(db) = db.as_ref() {
+                        crate::history::counter_set(db, crate::history::COUNTER_PURGE_DEBT, 0);
+                    }
                     o.rebuilt = true;
                     tracing::info!(
                         rows,

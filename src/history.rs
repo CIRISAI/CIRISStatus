@@ -46,7 +46,18 @@ pub fn init(path: &str) -> Result<Db> {
             to_status TEXT NOT NULL,
             capability TEXT
          );
-         CREATE INDEX IF NOT EXISTS idx_status_events_ts ON status_events(ts);",
+         CREATE INDEX IF NOT EXISTS idx_status_events_ts ON status_events(ts);
+         -- Small durable counters that must survive a restart. Currently one:
+         -- the signed-wire-index repair DEBT. It lives here rather than in
+         -- memory because a process that restarts before paying it would
+         -- otherwise forget rows it already purged, and the stale index entries
+         -- for them are never repaired — accumulating for as long as the node
+         -- keeps restarting, which on a node with an OOM restart loop is
+         -- exactly the wrong direction.
+         CREATE TABLE IF NOT EXISTS counters (
+            name  TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+         );",
     )?;
     // Additive column on an existing table; harmless when it already exists.
     let _ = conn.execute("ALTER TABLE status_events ADD COLUMN capability TEXT", []);
@@ -219,6 +230,43 @@ fn normalize_legacy_provider_names(conn: &Connection) {
 /// when this returns `Ok`. Swallowing the error and advancing anyway meant a
 /// failed write lost the transition *permanently* — the component stays in its
 /// new state, so the next cycle sees no diff and there is nothing left to retry.
+/// Read a durable counter, defaulting to 0.
+///
+/// A read failure returns 0 rather than propagating: these counters are
+/// accounting for work that is owed, and refusing to run retention because a
+/// counter could not be read would trade a lookup miss for a store that never
+/// gets pruned.
+#[must_use]
+pub fn counter_get(db: &Db, name: &str) -> u64 {
+    let Ok(conn) = db.lock() else {
+        return 0;
+    };
+    conn.query_row("SELECT value FROM counters WHERE name = ?1", [name], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|v| u64::try_from(v).unwrap_or(0))
+    .unwrap_or(0)
+}
+
+/// Write a durable counter.
+pub fn counter_set(db: &Db, name: &str, value: u64) {
+    let Ok(conn) = db.lock() else {
+        return;
+    };
+    let v = i64::try_from(value).unwrap_or(i64::MAX);
+    if let Err(e) = conn.execute(
+        "INSERT INTO counters(name, value) VALUES(?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+        rusqlite::params![name, v],
+    ) {
+        tracing::warn!(error = %e, counter = name, "counter write failed");
+    }
+}
+
+/// The signed-wire-index repair debt: rows purged since the index was last
+/// rebuilt. See `adapter::prune_corpus`.
+pub const COUNTER_PURGE_DEBT: &str = "purge_debt";
+
 pub fn record_events(db: &Db, events: &[StatusEvent]) -> Result<usize> {
     if events.is_empty() {
         return Ok(0);
@@ -1693,5 +1741,86 @@ mod event_tests {
             record_events(&db, &[ev("c"), ev("d")]).is_err(),
             "the caller must be able to tell that nothing was persisted"
         );
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    /// A unique path under the system temp dir, removed on drop.
+    ///
+    /// Deliberately not a new dev-dependency: this needs one file with a name
+    /// nothing else will pick, which is a counter and a pid.
+    struct TmpDb(std::path::PathBuf);
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "ciris-status-{tag}-{}-{n}.sqlite",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&p);
+            Self(p)
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().expect("utf8 temp path")
+        }
+    }
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// **The debt must survive a restart** (codex review, CIRISStatus#63).
+    ///
+    /// `purge_attestation_v31` does not remove the signed-wire-index entries
+    /// for the rows it deletes, so the repair is genuinely owed. Held only in
+    /// memory, a process that restarts before paying forgets rows it already
+    /// purged and those stale entries are never repaired — and on a node with
+    /// an OOM restart loop, the more it restarts the more it forgets it owes.
+    ///
+    /// "Restart" here is a fresh `init` against the same file, which is exactly
+    /// what the process does.
+    #[test]
+    fn a_counter_survives_reopening_the_database() {
+        let t = TmpDb::new("debt");
+        let db = init(t.path()).expect("init");
+        assert_eq!(
+            counter_get(&db, COUNTER_PURGE_DEBT),
+            0,
+            "a fresh store owes nothing"
+        );
+        counter_set(&db, COUNTER_PURGE_DEBT, 4_200);
+        drop(db);
+
+        let reopened = init(t.path()).expect("reopen");
+        assert_eq!(
+            counter_get(&reopened, COUNTER_PURGE_DEBT),
+            4_200,
+            "the debt evaporated across a restart, so the index entries for those \
+             4,200 purged rows would never be repaired"
+        );
+
+        // And paying it must clear the RECORD, not just the in-memory cell —
+        // otherwise a restart re-owes work that was actually done.
+        counter_set(&reopened, COUNTER_PURGE_DEBT, 0);
+        drop(reopened);
+        let again = init(t.path()).expect("reopen");
+        assert_eq!(counter_get(&again, COUNTER_PURGE_DEBT), 0);
+    }
+
+    /// An unreadable counter reads as 0 rather than refusing.
+    ///
+    /// These count work that is OWED. Refusing to run retention because a
+    /// counter could not be read would trade a lookup miss for a store that
+    /// never gets pruned at all — much the worse of the two.
+    #[test]
+    fn an_absent_counter_is_zero_not_an_error() {
+        let t = TmpDb::new("absent");
+        let db = init(t.path()).expect("init");
+        assert_eq!(counter_get(&db, "never.written"), 0);
     }
 }
