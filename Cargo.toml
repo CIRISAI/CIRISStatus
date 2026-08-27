@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.55"
+version = "0.3.56"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -17,31 +17,49 @@ path = "src/main.rs"
 # ownership + safety + NAT-traversal — is ciris-server's `serve_with_adapter`,
 # and the status page is a `StatusAdapter: ciris_server::Adapter` folded onto the
 # SAME shared core. Default features (NOT python, NOT pkcs11).
-# Pinned to ciris-server v0.5.188 — THE NODE SAYS WHEN IT IS IN TROUBLE. This
-# is the cut ciris-status has the most direct stake in: `GET /v1/health`
-# returned a hardcoded "status": "ok" while the canonical was SIGKILLed 193
-# times at 93% of its memory limit, and THIS crate is one of the watchers that
-# believed it. Health is now derived from a warning registry — memory (walking
-# the process's own cgroup, ancestors included), CPU and disk STALL from PSI
-# rather than utilisation, replication-round convergence over a WINDOW, and
-# retention — with every probe reporting WHY it cannot answer instead of a
-# comfortable zero. A folded pair is degraded if either half is.
+# Pinned to ciris-server v0.5.189 — THE MESH RELIABILITY CUT, and the one this
+# crate has a direct operational stake in twice over.
 #
-# Directly relevant here: the operator surface now carries persist's
-# catalogue-enumerated table list, real per-table bytes and `dark_bytes`, so
-# the 389 MB this node once carried in tables nothing named is finally
-# attributable; and `RetentionOutcome::BoundUnenforceable` — measured on THIS
-# node, 52,125 attestations and ZERO traces reporting "inside every configured
-# bound" every hour — now alarms instead of reading as steady state.
+# 1. THE DUPLICATE STORM IS FIXED (CIRISPersist#771). This node's own canonical
+#    peer refused 7,536 attestation envelopes in a six-hour window — 428 distinct
+#    rows re-sent up to 82 times each — because `put_attestation` reported an
+#    already-held row as `federation_backend`, a backend ERROR, so the sender
+#    never learned it had landed and retried forever. 58% of all refusals on that
+#    node, and pure churn on the transport ciris-status watches. persist v38.6.0
+#    returns `AlreadyHeld`; edge routes it to `ApplyOutcome::Duplicate` — counted,
+#    not swallowed.
 #
-# Substrate underneath: edge v18.7.0 (flat ~100 MiB advertise memory, the
-# production OOM's actual fix) + persist v38.4.0 (#767 catalogue + real SQLite
-# bytes, #768 WAL bound) + verify v13.6.1.
+# 2. THE ACTOR/NODE KEY SPLIT (CC 3.4.7.3, CIRISConstitution#95). A node's
+#    substrate identity was whatever key the host handed it, and in the embedded
+#    fold that is an `identity_type = agent` key. So the Reticulum transport
+#    identity, `self_key_id` and the de-admission self all named a key carrying
+#    AGENCY — and persist's agency gate constrains only a NODE-ONLY recipient, so
+#    the fusion did not blur "infrastructure must not have agency", it switched
+#    the rule off.
 #
-# Prior: v0.5.187 = backpressure you can trust. The record below this line had
-# drifted to v0.5.117 while the pin read v0.5.187 — a cut record that does not
-# track the pin is worse than none, so it is replaced rather than extended.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.188" }
+#    A node now mints its own `<alias>-node` key, registers it `identity_type =
+#    node`, takes the owner-binding, and authors its replication consent with its
+#    own signer. Provisioning is a READINESS GATE: edge must not start on a half
+#    identity. ciris-status is a fabric node, so this is its identity too.
+#
+# The client is a PACKAGE, not a tree (CIRISServer#471): `client/` is deleted —
+# 1,813 files, 764k lines — and `ciris-client==0.5.189` comes from PyPI. Server
+# and client versions now move together, gated: a node shipping an older client
+# greets its own operator with "Update recommended" against the dependency it was
+# built with.
+#
+# Substrate underneath: edge v18.10.0 (CIRISEdge#541 — `use_node_identity`, and
+# the advertised id split from the transport-identity STORAGE key, which is what
+# stops a keystore-backed node silently regenerating its destination hash and
+# invalidating every saved peer route) + persist v38.6.0 (#771 AlreadyHeld, #773
+# CC 3.4.7.3 graduation: membership-test agency gate + `may_act_through`) +
+# verify v13.6.1.
+#
+# Prior: v0.5.188 = THE NODE SAYS WHEN IT IS IN TROUBLE — health derived from a
+# warning registry (memory via the process's own cgroup, CPU/disk STALL from PSI
+# rather than utilisation, replication convergence over a window, retention),
+# every probe reporting WHY it cannot answer instead of a comfortable zero.
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.189" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
