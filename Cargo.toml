@@ -48,6 +48,17 @@ path = "src/main.rs"
 # greets its own operator with "Update recommended" against the dependency it was
 # built with.
 #
+# 0.5.190 rides along and changes nothing operationally for a fabric node: it is
+# the ANDROID INSTALL FIX (CIRISServer#493). 0.5.189's unconditional
+# `ciris-client==` pin met a client wheel matrix with no `py3-none-any`, so a pip
+# targeting Android matched no tag and the `==` pin rejected the fallback —
+# `pip install ciris-server` failed outright there. Fixed by splitting the
+# ARTIFACT rather than the dependency: the client's platform wheels carry the
+# desktop uber-jar, `py3-none-any` carries none (3.14 MiB against the 63 MiB it
+# used to be). ciris-status installs the manylinux wheel and never sees `any`, so
+# this cut is inherited, not consumed — recorded because the pin moved and a
+# record that skips a version is a record that has started drifting.
+#
 # Substrate underneath: edge v18.10.0 (CIRISEdge#541 — `use_node_identity`, and
 # the advertised id split from the transport-identity STORAGE key, which is what
 # stops a keystore-backed node silently regenerating its destination hash and
@@ -59,7 +70,7 @@ path = "src/main.rs"
 # warning registry (memory via the process's own cgroup, CPU/disk STALL from PSI
 # rather than utilisation, replication convergence over a window, retention),
 # every probe reporting WHY it cannot answer instead of a comfortable zero.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.189" }
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.190" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
