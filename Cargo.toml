@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.56"
+version = "0.3.57"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -48,29 +48,56 @@ path = "src/main.rs"
 # greets its own operator with "Update recommended" against the dependency it was
 # built with.
 #
-# 0.5.190 rides along and changes nothing operationally for a fabric node: it is
-# the ANDROID INSTALL FIX (CIRISServer#493). 0.5.189's unconditional
-# `ciris-client==` pin met a client wheel matrix with no `py3-none-any`, so a pip
-# targeting Android matched no tag and the `==` pin rejected the fallback —
-# `pip install ciris-server` failed outright there. Fixed by splitting the
-# ARTIFACT rather than the dependency: the client's platform wheels carry the
-# desktop uber-jar, `py3-none-any` carries none (3.14 MiB against the 63 MiB it
-# used to be). ciris-status installs the manylinux wheel and never sees `any`, so
-# this cut is inherited, not consumed — recorded because the pin moved and a
-# record that skips a version is a record that has started drifting.
+# 0.5.194 IS THE REASON FOR THIS CUT, and it is not inherited by embedding —
+# it had to be adopted in this repo's own `main`. A default tokio runtime sizes to
+# core count, so on the 2-vCPU canonical this binary got TWO workers: a two-slot
+# budget for the accept loop, replication, the scorer and every request at once.
+# One blocking task and HTTP is unschedulable — the socket stays LISTEN while
+# `Recv-Q` climbs and userspace never calls `accept()`. Measured on that host with
+# one worker pegged at 99.9% and five threads idle (CIRISServer#501, which
+# reproduced on 0.5.192 and was NOT a .193 regression).
 #
-# Substrate underneath: edge v18.10.0 (CIRISEdge#541 — `use_node_identity`, and
-# the advertised id split from the transport-identity STORAGE key, which is what
-# stops a keystore-backed node silently regenerating its destination hash and
-# invalidating every saved peer route) + persist v38.6.0 (#771 AlreadyHeld, #773
-# CC 3.4.7.3 graduation: membership-test agency gate + `may_act_through`) +
-# verify v13.6.1.
+# ciris-status calls `serve_with_adapter`, so it inherits every fix INSIDE the
+# server and none of the floor, which lives in the runtime the binary builds for
+# itself. `#[tokio::main]` is therefore replaced with
+# `ciris_server::node_runtime::build` — floor of 4, never a cap, and a deliberate
+# `TOKIO_WORKER_THREADS` still honoured. It shares the canonical with six other
+# containers, so this is the difference between degrading and disappearing.
 #
-# Prior: v0.5.188 = THE NODE SAYS WHEN IT IS IN TROUBLE — health derived from a
-# warning registry (memory via the process's own cgroup, CPU/disk STALL from PSI
-# rather than utilisation, replication convergence over a window, retention),
-# every probe reporting WHY it cannot answer instead of a comfortable zero.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.190" }
+# The other half of #501 IS inherited: boot prime was awaited inline while
+# `read_api_bind` sat ~180 lines below, so time-to-serving scaled with the
+# directory — 11,034 transport_destinations against 748 keys on the canonical, 33s
+# of boot with the socket bound and nothing accepted. Now spawned and yielding per
+# batch. Plus `announced_peers` bounded at 30 days; `transport_destinations`
+# deliberately NOT pruned, because all 11,034 rows are assertions rather than
+# observations and pruning would strand a node on a canonical route it cannot
+# relearn.
+#
+# 0.5.193 — the unregistered actor key stops being fatal. A node carrying an agent
+# whose actor key was absent from `federation_keys` had every row it authored
+# refused at every peer (1,943 refusals in one 30-minute window). .192 diagnosed
+# that and BAILED, which only moved the failure somewhere readable; .193 registers
+# instead, needing no new key material since the actor key IS the engine's own
+# identity. ciris-status carries no agent, so it takes the fix as insurance rather
+# than as a cure — but it also takes the OCCURRENCE model: occurrences are
+# independent by default, and nothing here is joined to anything.
+#
+# 0.5.192 — the client version DECOUPLED: `ciris-client>=0.5.190,<0.6` replaces
+# `==<this cut>`, so the client can ship for the agent team without a paired server
+# cut. The range is tested at BOTH ends, and 0.5.190 is the floor because the WHEEL
+# MATRIX sets it, not the API. 0.5.191 paired with client 0.5.191 and closed the
+# gate that let #493 ship at all.
+#
+# Substrate underneath is UNCHANGED across all four: edge v18.11.0 + persist
+# v38.6.0 + verify v13.6.1. Every one of these cuts is server-side only.
+#
+# Prior: v0.5.189 = THE NODE/ACTOR KEY SPLIT — a node mints its own `<alias>-node`
+# key, registers it `identity_type = node`, takes the owner-binding, and authors
+# its replication consent with its own signer. Provisioning is a READINESS GATE:
+# edge must not start on a half identity. ciris-status is a fabric node, so this is
+# its identity too.
+#
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.194" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
