@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.56"
+version = "0.3.57"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -70,7 +70,7 @@ path = "src/main.rs"
 # warning registry (memory via the process's own cgroup, CPU/disk STALL from PSI
 # rather than utilisation, replication convergence over a window, retention),
 # every probe reporting WHY it cannot answer instead of a comfortable zero.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.190" }
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.194" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
