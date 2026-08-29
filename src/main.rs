@@ -40,8 +40,26 @@ const DEFAULT_HOME: &str = "/var/lib/ciris";
 /// The federation key label default for the status node.
 const DEFAULT_KEY_ID: &str = "ciris-status";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// The floored node runtime, not `#[tokio::main]`.
+///
+/// A default runtime sizes to core count, so on the 2-vCPU canonical this binary
+/// got TWO workers — a two-slot budget for the accept loop, replication, the
+/// scorer and every request at once. One blocking task and HTTP becomes
+/// unschedulable: the socket stays LISTEN, `Recv-Q` climbs as the kernel completes
+/// handshakes, and userspace never calls `accept()`. That is CIRISServer#501,
+/// measured on that host with one worker pegged at 99.9% and five threads idle.
+///
+/// ciris-status runs on that same box, alongside six other containers, and calls
+/// `serve_with_adapter` — so it inherits every fix INSIDE the server and none of
+/// the floor, which lives in the runtime the binary builds for itself.
+/// `node_runtime::build` is the shared one: floor of 4, never a cap, and it
+/// honours a deliberate `TOKIO_WORKER_THREADS`.
+fn main() -> anyhow::Result<()> {
+    let runtime = ciris_server::node_runtime::build("ciris-status")?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
