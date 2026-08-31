@@ -592,8 +592,13 @@ mod config_ceg {
             .expect("sign to obtain the pubkeys");
         let ed = B64.encode(&sig.classical.public_key);
         let pqc = B64.encode(&sig.pqc.public_key);
-        let envelope =
-            serde_json::Value::Object(subject_binding(key_id, "node", &ed, Some(pqc.as_str())));
+        let envelope = serde_json::Value::Object(subject_binding(
+            key_id,
+            "node",
+            &ed,
+            Some(pqc.as_str()),
+            None,
+        ));
         let canonical = ceg_produce_canonicalize(&envelope).unwrap();
         let och = hex::encode(Sha256::digest(&canonical));
         let sig = engine.sign_hybrid(&canonical).await.unwrap();
