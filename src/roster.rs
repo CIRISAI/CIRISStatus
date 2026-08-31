@@ -353,8 +353,13 @@ mod flow_a_real_data {
             .expect("sign to obtain the pubkeys");
         let ed = B64.encode(&probe.classical.public_key);
         let pqc = B64.encode(&probe.pqc.public_key);
-        let envelope =
-            serde_json::Value::Object(subject_binding(key_id, id_type, &ed, Some(pqc.as_str())));
+        let envelope = serde_json::Value::Object(subject_binding(
+            key_id,
+            id_type,
+            &ed,
+            Some(pqc.as_str()),
+            None,
+        ));
         let canonical = ceg_produce_canonicalize(&envelope).unwrap();
         let och = hex::encode(Sha256::digest(&canonical));
         let sig = attester.sign_hybrid(&canonical).await.unwrap();
