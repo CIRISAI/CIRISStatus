@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.58"
+version = "0.3.59"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -140,7 +140,21 @@ path = "src/main.rs"
 # edge must not start on a half identity. ciris-status is a fabric node, so this is
 # its identity too.
 #
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.196" }
+# 0.5.197 IS THE REASON FOR THIS CUT: the fabric stops authoring other people's
+# claims. persist v40.0.0 / edge v20.1.1 / verify v14.1.0, all TRANSITIVE through
+# this one pin. `attestation_promote` is GONE upstream — the two motions are
+# `enter_mesh` (tier crossing over the same bytes, node co-scrub only) and
+# `widen_audience` (a `supersedes` the ACTOR signs at the wider audience) — and
+# ciris-status inherits the composed crossing the same way it inherits `serve`.
+# Two things this node gets by being a node: the ANNOUNCE now logs and returns the
+# identity bundle federation discovery walks (3 rows for a fabric node like this
+# one) with `federation_discoverable`, and a node that has not announced is named
+# as P2P-only in its own logs instead of surfacing three stages later as a
+# withheld row. Both mesh ladders (traceflow + cross-node chat) are green in
+# CIRISServer's CI on two sovereign nodes for the first time. The client floor
+# moved to ciris-client 0.5.202 (the first bundle that defines the chat handshake
+# ids); this node greets its operator against that floor.
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.197" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
