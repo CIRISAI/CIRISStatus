@@ -56,17 +56,24 @@ const DEFAULT_KEY_ID: &str = "ciris-status";
 /// `node_runtime::build` is the shared one: floor of 4, never a cap, and it
 /// honours a deliberate `TOKIO_WORKER_THREADS`.
 fn main() -> anyhow::Result<()> {
+    // BEFORE the runtime exists: lowering the arena cap does not reclaim arenas
+    // already created, so this only works while this thread is the only one
+    // allocating. See `diag::cap_malloc_arenas` for the 205-minute A/B that
+    // sized it (-847MB committed, live memory identical).
+    let arena_cap = diag::cap_malloc_arenas();
     let runtime = ciris_server::node_runtime::build("ciris-status")?;
-    runtime.block_on(async_main())
+    runtime.block_on(async_main(arena_cap))
 }
 
-async fn async_main() -> anyhow::Result<()> {
+async fn async_main(arena_cap: diag::ArenaCap) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    // Applied before the runtime existed; reported now that a subscriber does.
+    arena_cap.log();
 
     let mut args = std::env::args().skip(1);
     let first = args.next();
