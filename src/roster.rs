@@ -9,8 +9,8 @@
 //!
 //! The public endpoints serve from an in-memory [`RosterCache`] so the request
 //! path never blocks on the corpus; the StatusAdapter's `run_lifecycle` loop
-//! repopulates it from `engine.sqlite_backend()` (the `ReadEngine` handle) at the
-//! poll cadence.
+//! repopulates it from the node's own corpus at the poll cadence, through
+//! persist's indexed `list_scores` seek rather than a full-corpus scan.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -101,25 +101,35 @@ pub mod read {
     use anyhow::Result;
 
     use ciris_server::ciris_persist::ceg::list::federation::AttestationFilter;
-    use ciris_server::ciris_persist::ceg::ReadEngine;
     use ciris_server::ciris_persist::federation::types::Attestation;
-    use ciris_server::ciris_persist::scope::CallerScope;
+    use ciris_server::ciris_persist::federation::FederationDirectory;
 
-    /// Read all currently-valid `capacity:*` `scores` rows from this node's own
-    /// corpus, gated to the public/opted-in projection, and fold them into the
-    /// roster.
+    /// Read every currently-valid `capacity:*` row from this node's OWN corpus
+    /// and fold it into the public roster.
     ///
-    /// `reader` is the persist backend handle (`SqliteBackend`), which impls
-    /// [`ReadEngine`] — `Engine` itself does not, so callers pass
-    /// `engine.sqlite_backend()`.
+    /// # Why this reads through `list_scores` and not `list_attestations`
     ///
-    /// `scope` MUST be the public/consent caller scope so the substrate's §4.3
-    /// cohort_scope predicate filters to what subjects opted in to surfacing.
-    pub async fn build_roster<R>(reader: &R, scope: CallerScope) -> Result<Roster>
-    where
-        R: ReadEngine,
-    {
-        let engine = reader;
+    /// Same filter, same `Vec<Attestation>` back — and a completely different
+    /// query underneath.
+    ///
+    /// `list_attestations` applies a dimension prefix as
+    /// `json_extract(attestation_envelope, '$.dimension') LIKE ?`: a JSON parse
+    /// per row that no index can serve. This query names no key, so there is
+    /// nothing to seek on either — every rebuild was a full scan of the whole
+    /// corpus, parsing every envelope, to return nothing on a node with no
+    /// agents. Measured on the US node it read ~15MB/s and left the heap full
+    /// of transient attestation-shaped strings (CIRISStatus#69).
+    ///
+    /// `list_scores` is persist's V106 read surface for exactly this shape: an
+    /// ordered seek over the `attestation_subjects` projection — where
+    /// `dimension` is a PLAIN column, not JSON — joined back to the
+    /// attestations. The projection also only holds rows that NAME a subject,
+    /// so our own subject-less observation rows are not in it at all: the scan
+    /// no longer walks past tens of thousands of rows it can never return.
+    ///
+    /// The caller key is empty on purpose — unauthenticated, broad tiers only,
+    /// which is the public projection this roster is.
+    pub async fn build_roster(dir: &dyn FederationDirectory) -> Result<Roster> {
         let now = chrono::Utc::now();
         // persist v17.5.0 made `AttestationFilter` `#[non_exhaustive]` (additive
         // fields, #456) — a struct literal is forbidden across the crate boundary
@@ -134,10 +144,10 @@ pub mod read {
         let mut cursor = None;
         let mut rows: Vec<Attestation> = Vec::new();
         loop {
-            let page = engine
-                .list_attestations(filter.clone(), cursor, 500, scope.clone())
+            let page = dir
+                .list_scores("", filter.clone(), cursor, 500)
                 .await
-                .map_err(|e| anyhow::anyhow!("list capacity:* attestations: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("list capacity:* scores: {e}"))?;
             rows.extend(page.items);
             match page.next_cursor {
                 Some(c) => cursor = Some(c),
@@ -252,7 +262,7 @@ mod tests {
 // Seeds an in-memory persist corpus with `capacity:*:v1` `scores` rows for a
 // couple of opted-in agents (REAL hybrid-signed by a separate detector engine,
 // the way A's replicated `capacity:*` lands when the inbound replication bridge
-// calls `put_attestation`), then asserts `read::build_roster(reader,
+// calls `put_attestation`), then asserts `read::build_roster(dir,
 // CallerScope::Unauthenticated)` returns the expected roster from the node's OWN
 // corpus. Proves Flow A serves REAL substrate data, not the empty default cache.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -269,7 +279,6 @@ mod flow_a_real_data {
     };
     use ciris_server::ciris_persist::federation::{Error as FederationError, FederationDirectory};
     use ciris_server::ciris_persist::prelude::{Engine, LocalSigner, LocalSignerConfig};
-    use ciris_server::ciris_persist::scope::CallerScope;
     use ciris_server::ciris_persist::verify::canonical::ceg_produce_canonicalize;
     use sha2::{Digest, Sha256};
 
@@ -617,7 +626,7 @@ mod flow_a_real_data {
         )
         .await;
 
-        let roster = build_roster(dir.as_ref(), CallerScope::Unauthenticated)
+        let roster = build_roster(dir.as_ref())
             .await
             .expect("build_roster must succeed");
 
@@ -678,9 +687,7 @@ mod flow_a_real_data {
         )
         .await;
 
-        let roster = build_roster(dir.as_ref(), CallerScope::Unauthenticated)
-            .await
-            .expect("build_roster");
+        let roster = build_roster(dir.as_ref()).await.expect("build_roster");
         assert!(roster.agents.is_empty(), "expired rows must not surface");
     }
 }
