@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-status"
-version = "0.3.60"
+version = "0.3.61"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1119,6 +1119,7 @@ dependencies = [
  "ciris-server",
  "futures",
  "hex",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

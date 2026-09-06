@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.60"
+version = "0.3.61"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -11,6 +11,11 @@ name = "ciris-status"
 path = "src/main.rs"
 
 [dependencies]
+# glibc's own allocator accounting, for the one question a scan of
+# /proc/<pid>/mem cannot answer: live (`uordblks`) vs freed-but-held
+# (`fordblks`). Freed chunks keep their bytes, so only the allocator knows.
+# See `src/diag.rs` / CIRISStatus#69.
+libc = "0.2"
 # ── The fabric node ──────────────────────────────────────────────────────────
 # ciris-status IS a ciris-server node now (no optional `fabric` feature): the
 # whole node — engine + edge + consent:replication + read API + NodeCode +

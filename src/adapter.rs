@@ -47,7 +47,6 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use ciris_server::ciris_persist::scope::CallerScope;
 use ciris_server::{Adapter, AdapterConfig, AdapterContext, AdapterStatus};
 
 use crate::config::Config;
@@ -283,6 +282,21 @@ async fn scoring(State(st): State<AppState>) -> impl IntoResponse {
     Json(st.roster.snapshot())
 }
 
+/// `GET /api/v1/debug/memory` — the allocator's own accounting.
+///
+/// Exists because the question CIRISStatus#69 turns on cannot be answered from
+/// outside the process: glibc does not zero on `free()`, so a scan of the
+/// arenas finds the same bytes whether they are a live working set or churn the
+/// allocator has not handed back. `uordblks` vs `fordblks` settles it, and only
+/// code running inside this process can ask.
+///
+/// Read-only and allocation-free in the sense that matters — it reports, it
+/// does not trim. Deciding to release memory is a separate act from measuring
+/// it, and this endpoint deliberately does not take that decision.
+async fn debug_memory() -> impl IntoResponse {
+    Json(crate::diag::memory_report())
+}
+
 /// `GET /api/v1/ci` — the substrate's last-N build states per repo, served from
 /// the cache so a microcontroller gets one small, instant response.
 async fn ci(State(st): State<AppState>) -> impl IntoResponse {
@@ -444,15 +458,11 @@ impl StatusAdapter {
     /// cache + the live channel. The reader is `engine.sqlite_backend()` (the
     /// `ReadEngine` handle); the scope is `Unauthenticated` (the public projection).
     async fn refresh_roster(&self, ctx: &AdapterContext) {
-        let reader = match ctx.engine.sqlite_backend() {
-            Some(b) => b,
-            None => {
-                tracing::warn!("roster refresh: non-sqlite backend; cannot read own corpus");
-                return;
-            }
-        };
-        match crate::roster::read::build_roster(reader.as_ref(), CallerScope::Unauthenticated).await
-        {
+        // The directory handle, not the raw `ReadEngine`: Flow A now reads
+        // through persist's indexed `list_scores` seek, which is declared on
+        // `FederationDirectory` so the whole gate runs inside persist.
+        let directory = ctx.engine.federation_directory();
+        match crate::roster::read::build_roster(directory.as_ref()).await {
             Ok(roster) => {
                 self.state.roster.replace(roster.clone());
                 let _ = self.state.live_tx.send(LiveDelta {
@@ -705,6 +715,7 @@ impl Adapter for StatusAdapter {
             .route("/api/v1/history", get(history))
             .route("/api/v1/scoring", get(scoring))
             .route("/api/v1/ci", get(ci))
+            .route("/api/v1/debug/memory", get(debug_memory))
             .route("/api/v1/scoring/live", get(live_sse))
             .route("/api/v1/status/live", get(live_sse))
             .route("/api/v1/status/ws", get(live_ws))

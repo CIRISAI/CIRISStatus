@@ -24,6 +24,7 @@ mod capability;
 mod ceg;
 mod ci;
 mod config;
+mod diag;
 mod history;
 mod model;
 mod probe;
