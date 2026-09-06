@@ -149,3 +149,153 @@ mod tests {
             .unwrap_or(0)
     }
 }
+
+/// Cap glibc's per-arena free lists, unless the operator has already said
+/// otherwise.
+///
+/// # The measurement this encodes
+///
+/// A 205-minute A/B on the US node, `v0.3.61` against the same build with
+/// `MALLOC_ARENA_MAX=2` (CIRISStatus#69):
+///
+/// ```text
+///                  default      arena cap     delta
+///   committed      1458 MB      611 MB        -847 MB (-58%)
+///   live           44.3 MB      44.5 MB       unchanged
+///   swap           ~336 MB      37 MB         -299 MB
+///   64MB regions   5-8          1
+/// ```
+///
+/// **Live memory is identical across both arms.** Same work, same data, so the
+/// entire 847MB was allocator free-list held per arena — not a working set, not
+/// a leak (the floor did not move in 3.4 hours). glibc grows arenas on
+/// allocator lock CONTENTION, so a node with a handful of threads and a busy
+/// poll loop accumulates one 64MB region per contended thread and keeps them.
+///
+/// `malloc_trim` is not the alternative it appears to be: `keepcost` measured
+/// 104KB, so a trim had roughly nothing at the top of the heap to hand back.
+/// The memory is not above the break; it is spread across arenas.
+///
+/// # Why in the binary and not only in compose
+///
+/// Because a deployment file is a place a fix can quietly stop being applied —
+/// a stack redeploy, a new host, a second node someone stands up from the
+/// image. The measurement belongs with the code that produced the behaviour.
+///
+/// **An explicit `MALLOC_ARENA_MAX` in the environment still wins**: glibc has
+/// already read it by the time this runs, and re-deciding underneath an
+/// operator who stated a value would be the wrong kind of helpful. This only
+/// fills a vacuum.
+/// What [`cap_malloc_arenas`] did, so it can be REPORTED later.
+///
+/// The cap has to be applied before any other thread allocates — which is
+/// before the tracing subscriber exists. Logging from in there would write into
+/// a subscriber that has not been installed and vanish, so the outcome is
+/// returned and logged once there is somewhere for it to go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArenaCap {
+    /// The operator set `MALLOC_ARENA_MAX`; we left it alone.
+    OperatorSet(String),
+    Applied(i32),
+    Refused(i32),
+    /// Not a glibc target, so there are no arenas to cap. Unreachable on the
+    /// image we ship (debian/glibc) — kept so a musl or macOS build compiles
+    /// without the call site sprouting a `cfg`.
+    #[cfg_attr(target_env = "gnu", allow(dead_code))]
+    NotGlibc,
+}
+
+impl ArenaCap {
+    pub fn log(&self) {
+        match self {
+            ArenaCap::OperatorSet(v) => tracing::info!(
+                value = %v,
+                "MALLOC_ARENA_MAX set in the environment — leaving the operator's value alone"
+            ),
+            ArenaCap::Applied(n) => tracing::info!(
+                arena_max = n,
+                "capped glibc malloc arenas (CIRISStatus#69: -847MB committed, live unchanged)"
+            ),
+            // Not fatal: it costs memory, not correctness.
+            ArenaCap::Refused(rc) => {
+                tracing::warn!(
+                    rc,
+                    "mallopt(M_ARENA_MAX) refused; running with glibc defaults"
+                )
+            }
+            ArenaCap::NotGlibc => tracing::debug!("not a glibc target; no arena cap to apply"),
+        }
+    }
+}
+
+#[cfg(target_env = "gnu")]
+pub fn cap_malloc_arenas() -> ArenaCap {
+    if let Some(v) = std::env::var_os("MALLOC_ARENA_MAX") {
+        return ArenaCap::OperatorSet(v.to_string_lossy().into_owned());
+    }
+    // SAFETY: `mallopt` is glibc's own tuning entry point, takes two ints and
+    // touches only allocator state. Called before the runtime is built, so no
+    // other thread of ours exists yet — which is also when it is most
+    // effective, since arenas already created are not reclaimed by lowering
+    // the cap.
+    let rc = unsafe { libc::mallopt(libc::M_ARENA_MAX, DEFAULT_ARENA_MAX) };
+    if rc == 1 {
+        ArenaCap::Applied(DEFAULT_ARENA_MAX)
+    } else {
+        ArenaCap::Refused(rc)
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
+pub fn cap_malloc_arenas() -> ArenaCap {
+    ArenaCap::NotGlibc
+}
+
+/// Two, from the A/B above. Not one: a single arena serialises every allocating
+/// thread on one lock, and this process has a poll loop, an HTTP surface and
+/// the substrate's own tasks running concurrently. Two keeps the pathological
+/// growth away while leaving a second lock for the contention that created the
+/// arenas in the first place.
+#[cfg(target_env = "gnu")]
+const DEFAULT_ARENA_MAX: libc::c_int = 2;
+
+#[cfg(test)]
+mod arena_tests {
+    use super::*;
+
+    /// An operator who states a value owns it. The A/B that justified the
+    /// default does not license overriding someone who has already decided —
+    /// and on this box, where the value came from compose first, silently
+    /// re-deciding underneath it would make the deployment and the binary
+    /// disagree about a number they both set.
+    #[test]
+    fn an_explicit_env_value_is_left_alone() {
+        // SAFETY: single-threaded test process for this variable; restored below.
+        let prev = std::env::var_os("MALLOC_ARENA_MAX");
+        std::env::set_var("MALLOC_ARENA_MAX", "4");
+        let outcome = cap_malloc_arenas();
+        match prev {
+            Some(v) => std::env::set_var("MALLOC_ARENA_MAX", v),
+            None => std::env::remove_var("MALLOC_ARENA_MAX"),
+        }
+        assert_eq!(outcome, ArenaCap::OperatorSet("4".to_string()));
+    }
+
+    /// With no operator value, the cap is applied — and reported, because a
+    /// tuning knob nobody can see is one nobody can rule out later.
+    #[cfg(target_env = "gnu")]
+    #[test]
+    fn with_no_env_value_the_cap_is_applied() {
+        let prev = std::env::var_os("MALLOC_ARENA_MAX");
+        std::env::remove_var("MALLOC_ARENA_MAX");
+        let outcome = cap_malloc_arenas();
+        if let Some(v) = prev {
+            std::env::set_var("MALLOC_ARENA_MAX", v);
+        }
+        assert_eq!(
+            outcome,
+            ArenaCap::Applied(DEFAULT_ARENA_MAX),
+            "mallopt(M_ARENA_MAX) should be accepted on glibc"
+        );
+    }
+}
