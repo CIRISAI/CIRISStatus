@@ -119,6 +119,51 @@ the internet. Turn it on for a reading, turn it back off.
 > with the lens node or bind-mount the lens node's `data/`. Node A's `capacity:*`
 > arrives **only** by the consent:replication leg below.
 
+### Memory: what the ansible role should and should NOT set
+
+**Do not set `MALLOC_ARENA_MAX` in compose.** The binary caps glibc's arenas
+itself, before it builds its runtime (`diag::cap_malloc_arenas`). That keeps the
+zero-env contract above intact: the one knob this process needs is not a CIRIS
+env var, and a deployment file is a place a fix can quietly stop being applied —
+a stack redeploy, a new host, a second node stood up from the same image.
+
+An explicit value in the environment still wins, because glibc reads it before
+we run and re-deciding underneath an operator who stated a number would make
+compose and the binary disagree about the same setting. Which path ran is in the
+log at boot, so it is checkable rather than assumed:
+
+```text
+capped glibc malloc arenas (CIRISStatus#69: -847MB committed, live unchanged)
+MALLOC_ARENA_MAX set in the environment — leaving the operator's value alone
+```
+
+**Size `mem_limit` from a measurement, not from history.** The 1.5GB the US node
+carries was sized against an UNCAPPED process holding ~1.46GB committed, of
+which ~1.4GB was allocator free-list and ~44MB was live. With the cap the same
+work settles near ~611MB. After deploying, read the actual figure rather than
+guessing:
+
+```sh
+curl -s localhost:4253/api/v1/debug/memory | jq '{
+  live: .mallinfo2.uordblks, held: .mallinfo2.fordblks,
+  live_fraction, rss: .proc.RssAnon, swap: .proc.VmSwap }'
+```
+
+Then set `mem_limit` to roughly 1.5x the settled `RssAnon`, and confirm the
+cgroup is not fighting it:
+
+```sh
+cat /sys/fs/cgroup/system.slice/docker-$(docker inspect -f '{{.Id}}' ciris-status).scope/memory.events
+# `max` climbing = the limit is being enforced continuously; raise it.
+```
+
+Headroom returned here is not free money — it is headroom `ciris-server` needs
+on the same host (CIRISServer#551), so it is worth reclaiming deliberately.
+
+**Do not copy the arena cap to `ciris-server` expecting this result.** Same
+pathology, different composition: its largest single region is a ~706MB brk
+`[heap]`, which an arena cap does not consolidate.
+
 ### Adapter config:* (probe targets, poll cadence, CORS) — owner-authored
 
 The StatusAdapter's own config is `config:*` CEG under the `status.` namespace,
