@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.63"
+version = "0.3.64"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -187,7 +187,20 @@ libc = "0.2"
 # are read with one ruler. Client floor 0.5.203. Substrate UNCHANGED through
 # this pin: persist v41.2.0 / edge v20.3.0 / verify v14.2.0 /
 # leviculum v0.25.0+ciris.1.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.199" }
+#
+# 0.5.200 — THE PASS THAT STREAMS (2026-09-07). What the canonical's own
+# numbers asked for once 0.5.199 landed with the instrument: the read API had
+# stopped accepting for 8–40 s every 15 minutes because two node constants
+# fired in the same second (CIRISServer#553) — the equivocation pass now
+# streams a page at a time into a claim index, walks the tier from a persisted
+# cursor (it used to rescan the same 4,096 rows forever), digests off the
+# workers and logs its cost; the two timers are de-phased; the capacity scorer
+# skips its pass while the corpus is unchanged (it was 30–43 s of every 60 s,
+# authoring nothing). The server now also caps the glibc arenas in-process —
+# the same move 0.3.63 made in this binary — with a loopback-only trim door
+# behind `--diagnostics` (CIRISServer#552). Substrate UNCHANGED through this
+# pin: persist v41.2.0 / edge v20.3.0 / verify v14.2.0 / leviculum v0.25.0+ciris.1.
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.200" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
