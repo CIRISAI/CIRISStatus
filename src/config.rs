@@ -130,6 +130,14 @@ pub struct Config {
     /// of disk to re-derive an empty roster once a minute is what turned a 60s
     /// lap into minutes.
     pub roster_seconds: u64,
+    /// How often to call `malloc_trim(0)`, or `0` to leave the allocator alone.
+    ///
+    /// **Off by default, on purpose.** Trim reaches the fragmented free lists
+    /// the arena cap does not, but the pages it returns fault back in on reuse
+    /// — a real cost for a churn workload. Which way that trade lands on this
+    /// node has not been measured, and the cap was not adopted on a guess
+    /// either (CIRISStatus#69).
+    pub malloc_trim_seconds: u64,
     pub version: &'static str,
     pub grafana_url: Option<String>,
     pub database_url: Option<String>, // local "postgresql" provider (TCP liveness)
@@ -334,6 +342,11 @@ impl Config {
             .filter(|v| *v > 0)
             .unwrap_or(120) as u64;
 
+        let malloc_trim_seconds = cfg
+            .i64("status.malloc_trim_secs")
+            .filter(|v| *v >= 0)
+            .unwrap_or(0) as u64;
+
         let roster_seconds = cfg
             .i64("status.roster_secs")
             .filter(|v| *v > 0)
@@ -405,6 +418,7 @@ impl Config {
             corpus_retention_budget,
             corpus_retention_secs,
             roster_seconds,
+            malloc_trim_seconds,
             version: env!("CARGO_PKG_VERSION"),
             grafana_url: cfg.str("status.grafana_url"),
             database_url: cfg.str("status.database_url"),
@@ -450,6 +464,7 @@ impl Config {
             corpus_retention_budget: crate::retention::PRUNE_BUDGET_PER_PASS,
             corpus_retention_secs: 120,
             roster_seconds: 300,
+            malloc_trim_seconds: 0,
             version: env!("CARGO_PKG_VERSION"),
             grafana_url: None,
             database_url: None,

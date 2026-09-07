@@ -118,6 +118,7 @@ baked CORS allow-list, and 60s cadence.
 | `status.corpus_retention_budget` | i64 | `2000` | rows the retention pass deletes per pass |
 | `status.corpus_retention_secs` | i64 | `120` | how often that pass runs. Budget × cadence sets how fast a backlog drains, and every row still in the corpus is paid for again by every scan until it goes |
 | `status.roster_secs` | i64 | `300` | Flow A roster rebuild cadence. It is a FULL corpus scan (dimension-prefix filtering walks every row, signatures included), so on a node with no agents it costs disk to re-derive nothing. Floored at `status.poll_secs` |
+| `status.malloc_trim_secs` | i64 | `0` (off) | how often to call `malloc_trim(0)`. Off by default: trim reaches the fragmented free lists the arena cap does not (`keepcost` does NOT bound it — since glibc 2.8 trim `MADV_DONTNEED`s free pages inside every arena), but the pages fault back in on reuse, which is a real cost for a churn workload. Enabling it logs `fordblks`/`RssAnon` either side so it is an A/B, not a leap |
 | `status.cors_origins` | list | baked `ciris.ai` set | CORS allow-list |
 | `status.ghcr_url` | str | `https://ghcr.io/v2/` | container registry (401 = up) |
 | `status.database_url` | str | — | local `postgresql` provider (TCP liveness) |

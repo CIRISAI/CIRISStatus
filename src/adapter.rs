@@ -762,6 +762,9 @@ impl Adapter for StatusAdapter {
         let mut last_prune = std::time::Instant::now() - Duration::from_secs(86_400);
         // Roster likewise: built on the first cycle, then on its own cadence.
         let mut last_roster = std::time::Instant::now() - Duration::from_secs(86_400);
+        // Trim, when enabled at all, waits a full interval first — there is
+        // nothing to reclaim from a process that has not run yet.
+        let mut last_trim = std::time::Instant::now();
         tracing::info!(
             poll_s = last_poll,
             observation_s = self.state.cfg().observation_seconds,
@@ -822,6 +825,25 @@ impl Adapter for StatusAdapter {
                         // here would have delayed news by up to the heartbeat,
                         // which is the opposite of what a status plane is for.
                         self.emit_observations(ctx, &agg).await;
+
+                        // Optional, off unless an operator turned it on: the
+                        // reclaim the arena cap cannot reach. Reports both
+                        // sides so enabling it is an A/B rather than an act of
+                        // faith (CIRISStatus#69).
+                        if cfg.malloc_trim_seconds > 0
+                            && last_trim.elapsed() >= Duration::from_secs(cfg.malloc_trim_seconds)
+                        {
+                            last_trim = std::time::Instant::now();
+                            let r = crate::diag::trim_malloc();
+                            tracing::info!(
+                                rc = %r["rc"],
+                                fordblks_before = %r["fordblks_before"],
+                                fordblks_after = %r["fordblks_after"],
+                                rss_anon_before = %r["rss_anon_before"],
+                                rss_anon_after = %r["rss_anon_after"],
+                                "malloc_trim"
+                            );
+                        }
 
                         // Retention on its own slow cadence: bounded work, and
                         // nothing about it is urgent.

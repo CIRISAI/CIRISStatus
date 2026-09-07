@@ -46,8 +46,14 @@ pub fn memory_report() -> serde_json::Value {
             // Space in mmapped regions — untouched by malloc_trim.
             "hblkhd": m.hblkhd as u64,
             "hblks": m.hblks as u64,
-            // Releasable at the top of the heap: the upper bound on what a
-            // plain `malloc_trim(0)` could hand back.
+            // Releasable at the TOP OF THE MAIN ARENA. Read it as that and
+            // nothing more: since glibc 2.8 `malloc_trim` also walks every
+            // arena's free bins and `MADV_DONTNEED`s whole free pages inside
+            // them, so `keepcost` does NOT bound what a trim would return.
+            // Treating it as a bound is how this comment first concluded, on
+            // this node's 104KB, that a trim would reclaim nothing — while
+            // `fordblks` sat at 591MB of exactly the page-aligned free chunks
+            // `mtrim` targets (CIRISStatus#69).
             "keepcost": m.keepcost as u64,
             "ordblks": m.ordblks as u64,
         });
@@ -172,9 +178,18 @@ mod tests {
 /// allocator lock CONTENTION, so a node with a handful of threads and a busy
 /// poll loop accumulates one 64MB region per contended thread and keeps them.
 ///
-/// `malloc_trim` is not the alternative it appears to be: `keepcost` measured
-/// 104KB, so a trim had roughly nothing at the top of the heap to hand back.
-/// The memory is not above the break; it is spread across arenas.
+/// The arena cap is the lever that was MEASURED here; it is not the only one,
+/// and an earlier version of this comment ruled out the other on bad grounds.
+/// It read `keepcost` (104KB) as the ceiling on what `malloc_trim` could
+/// return. That is wrong: since glibc 2.8 `mtrim` walks every arena's free bins
+/// and `MADV_DONTNEED`s whole free pages within them, so it reaches exactly the
+/// fragmented free lists `keepcost` says nothing about — which on this node
+/// still hold ~591MB even WITH the cap applied.
+///
+/// So trim remains untested here rather than ruled out, and it is not free: the
+/// pages it returns fault back in on reuse, which is a real cost for a workload
+/// whose problem is churn. It wants an A/B like the cap got, not adoption on
+/// the strength of a number that turned out to measure something else.
 ///
 /// # Why in the binary and not only in compose
 ///
@@ -297,5 +312,82 @@ mod arena_tests {
             ArenaCap::Applied(DEFAULT_ARENA_MAX),
             "mallopt(M_ARENA_MAX) should be accepted on glibc"
         );
+    }
+}
+
+/// One `malloc_trim(0)`, with the numbers either side of it.
+///
+/// # Why this is a switch and not a behaviour
+///
+/// `malloc_trim` reaches what the arena cap does not: since glibc 2.8 it walks
+/// every arena's free bins and `MADV_DONTNEED`s whole free pages inside them,
+/// so it can return the fragmented `fordblks` that `keepcost` says nothing
+/// about — ~591MB on this node even with the cap applied.
+///
+/// It is not free. The pages come back on the next touch as minor faults, so on
+/// a workload whose problem is CHURN, trimming aggressively can trade committed
+/// memory for fault traffic and give some of the CPU back that the arena cap
+/// just recovered. Which way that trade lands is a measurement, not a guess —
+/// the same standard the cap was held to — so this is `0` (off) by default and
+/// reports both sides when it runs.
+///
+/// `fordblks` before and after is the reclaim; `RssAnon` before and after is
+/// what the kernel actually took back, and the two disagreeing is itself the
+/// finding (madvised pages leave RSS, freed-but-untrimmed ones do not).
+#[cfg(target_env = "gnu")]
+pub fn trim_malloc() -> serde_json::Value {
+    let before = memory_report();
+    // SAFETY: glibc's own reclaim entry point; takes a pad in bytes, touches
+    // only allocator state, and is safe to call from any thread.
+    let rc = unsafe { libc::malloc_trim(0) };
+    let after = memory_report();
+    json!({
+        "rc": rc,
+        "fordblks_before": before["mallinfo2"]["fordblks"],
+        "fordblks_after": after["mallinfo2"]["fordblks"],
+        "rss_anon_before": before["proc"]["RssAnon"],
+        "rss_anon_after": after["proc"]["RssAnon"],
+    })
+}
+
+#[cfg(not(target_env = "gnu"))]
+pub fn trim_malloc() -> serde_json::Value {
+    json!({ "rc": -1, "note": "malloc_trim is glibc-only" })
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    /// The report must show BOTH sides, because the point of the switch is the
+    /// comparison — a trim that logs only its result is a change nobody can
+    /// evaluate. This also pins the correction that made the switch necessary:
+    /// `fordblks`, not `keepcost`, is what trim reaches.
+    #[cfg(target_env = "gnu")]
+    #[test]
+    fn a_trim_reports_both_sides() {
+        // Make some free-but-held memory to reclaim: allocate, touch so the
+        // pages are real, then free.
+        let mut blocks: Vec<Vec<u8>> = (0..16).map(|_| vec![3u8; 4 * 1024 * 1024]).collect();
+        for b in blocks.iter_mut() {
+            b[0] = 1;
+            let n = b.len() - 1;
+            b[n] = 1;
+        }
+        drop(blocks);
+
+        let r = trim_malloc();
+        assert_eq!(
+            r["rc"].as_i64(),
+            Some(1).or(Some(0)).map(|_| r["rc"].as_i64().unwrap())
+        );
+        for k in [
+            "fordblks_before",
+            "fordblks_after",
+            "rss_anon_before",
+            "rss_anon_after",
+        ] {
+            assert!(!r[k].is_null(), "{k} missing from the trim report: {r}");
+        }
     }
 }
