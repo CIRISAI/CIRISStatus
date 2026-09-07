@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.64"
+version = "0.3.65"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -200,7 +200,28 @@ libc = "0.2"
 # the same move 0.3.63 made in this binary — with a loopback-only trim door
 # behind `--diagnostics` (CIRISServer#552). Substrate UNCHANGED through this
 # pin: persist v41.2.0 / edge v20.3.0 / verify v14.2.0 / leviculum v0.25.0+ciris.1.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.200" }
+#
+# 0.5.202 — THE TRIPLE, AND EACH CONFIG KEY IS ITS OWN LEAF (2026-09-07). The
+# substrate MOVES through this pin, a MAJOR on both: persist v42.0.0 / edge
+# v21.0.0 / verify v15.0.0 (CIRISServer#559; leviculum v0.25.0+ciris.1
+# unchanged). persist v42 admits ONE live `config:` row per (subject, scope,
+# leaf) and requires a renewal to be a `supersedes` naming the row it replaces
+# (CIRISPersist#814 part 3, CC 3.4.5.1); the server had kept every config key
+# on one leaf `config:v1`, so the second key's write was refused — each key now
+# rides its own leaf `config:{key}:v1`, the first write a `scores` row and every
+# later write a `supersedes` of the leaf head, rows written before 0.5.201 on
+# the legacy leaf still read and are shadowed by version when next written. So
+# THIS node's config plane (the wizard's keys, `node.alias`, the retention
+# knobs) keeps reading across the upgrade with no migration step; the first
+# write of each key after the restart opens its leaf. Also: `registry` and
+# `verify` are gated co-stewards now (a self-asserted one is refused at the
+# door), and `license` / `grant` join the delegated-duty scopes. verify v15
+# makes `FedCode` / `OwnedNode` `#[non_exhaustive]` — this crate mints no
+# code, so nothing here changes shape. (v0.5.201 exists as a tag but never
+# published: its Windows wheel failed on a one-line type break; v0.5.202 is
+# the same release plus that cast and a CRLF fix in one gate — pin the tag
+# that shipped.)
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.202" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
