@@ -201,7 +201,7 @@ libc = "0.2"
 # behind `--diagnostics` (CIRISServer#552). Substrate UNCHANGED through this
 # pin: persist v41.2.0 / edge v20.3.0 / verify v14.2.0 / leviculum v0.25.0+ciris.1.
 #
-# 0.5.201 — THE TRIPLE, AND EACH CONFIG KEY IS ITS OWN LEAF (2026-09-07). The
+# 0.5.202 — THE TRIPLE, AND EACH CONFIG KEY IS ITS OWN LEAF (2026-09-07). The
 # substrate MOVES through this pin, a MAJOR on both: persist v42.0.0 / edge
 # v21.0.0 / verify v15.0.0 (CIRISServer#559; leviculum v0.25.0+ciris.1
 # unchanged). persist v42 admits ONE live `config:` row per (subject, scope,
@@ -217,8 +217,11 @@ libc = "0.2"
 # `verify` are gated co-stewards now (a self-asserted one is refused at the
 # door), and `license` / `grant` join the delegated-duty scopes. verify v15
 # makes `FedCode` / `OwnedNode` `#[non_exhaustive]` — this crate mints no
-# code, so nothing here changes shape.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.201" }
+# code, so nothing here changes shape. (v0.5.201 exists as a tag but never
+# published: its Windows wheel failed on a one-line type break; v0.5.202 is
+# the same release plus that cast and a CRLF fix in one gate — pin the tag
+# that shipped.)
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.202" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
