@@ -209,6 +209,93 @@ pub fn db_path_for(data_dir: &Path) -> String {
     data_dir.join("status.db").to_string_lossy().into_owned()
 }
 
+/// Every `config:*` value this node has, fetched ONCE.
+///
+/// # Why this exists
+///
+/// `graph_config::get_i64(engine, key)` reads as a keyed lookup and is a full
+/// scan: `get_config` calls `live_config_rows`, which lists every attestation
+/// this node authored and JSON-parses each envelope to find the dozen whose
+/// dimension starts with `config:`. Per key. With no cache.
+///
+/// `Config::resolve` reads ~50 keys — scalars, per-region URLs, per-provider
+/// settings, per-capability members, per-auth targets — so a cycle was ~50 full
+/// scans of everything this node has ever signed. Measured on the US canonical:
+/// 334,399 `pread64`s in 25s, all on `ciris_engine.db`, and ~20s of every
+/// 60s cycle pinned at 100% of a core on a node whose corpus holds no traces
+/// and whose roster is empty. It also got worse with every observation emitted,
+/// because those rows share the attester key the scan seeks on.
+///
+/// The user-visible end of it: with four workers sitting in synchronous SQLite
+/// reads, an arriving request waits for one to come free. Typical response was
+/// 1.2ms and the outliers were 1-2 SECONDS — which is what made
+/// `https://ciris.ai/status/` feel like it was not loading.
+///
+/// `list_configs` runs the same scan once and returns the lot, so this is one
+/// scan per resolve instead of fifty. The shape of the underlying API is
+/// CIRISServer#557; this is the consumer-side fix that does not wait for it.
+struct Snapshot {
+    entries: std::collections::BTreeMap<String, graph_config::ConfigEntry>,
+}
+
+impl Snapshot {
+    async fn load(engine: &Arc<Engine>) -> Self {
+        // `None` prefix: one fetch for every key. Filtering by prefix here would
+        // not save a scan — `live_config_rows` reads them all either way — it
+        // would only hide keys from a later reader.
+        let entries = graph_config::list_configs(engine, None)
+            .await
+            .unwrap_or_default();
+        Snapshot { entries }
+    }
+
+    fn i64(&self, key: &str) -> Option<i64> {
+        self.entries.get(key).and_then(|e| e.value.as_i64())
+    }
+
+    fn bool(&self, key: &str) -> Option<bool> {
+        self.entries.get(key).and_then(|e| match e.value {
+            graph_config::ConfigValue::Bool(b) => Some(b),
+            _ => None,
+        })
+    }
+
+    /// A string key, treating empty as unset — so an owner can clear a probe
+    /// target with `""` as well as by omitting it.
+    fn str(&self, key: &str) -> Option<String> {
+        self.entries
+            .get(key)
+            .and_then(|e| match &e.value {
+                graph_config::ConfigValue::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// The raw string, empty INCLUDED. `""` is a real value for a key whose
+    /// contract gives it meaning — `status.auth.<id>.url` set to empty disables
+    /// that probe, and folding it to `None` here would silently re-enable it
+    /// with the baked endpoint.
+    fn str_raw(&self, key: &str) -> Option<String> {
+        self.entries.get(key).and_then(|e| match &e.value {
+            graph_config::ConfigValue::Str(s) => Some(s.clone()),
+            _ => None,
+        })
+    }
+
+    fn str_list(&self, key: &str) -> Option<Vec<String>> {
+        self.entries.get(key).and_then(|e| match &e.value {
+            graph_config::ConfigValue::List(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
+    }
+}
+
 impl Config {
     /// Resolve the adapter config from this node's OWN corpus (`config:*` CEG),
     /// with baked defaults for every unset key. `db_path` is derived by the
@@ -217,82 +304,62 @@ impl Config {
     /// Re-callable each poll cycle so an owner-authored config change is picked
     /// up live without a restart.
     pub async fn resolve(engine: &Arc<Engine>, db_path: String) -> Self {
-        let poll_seconds = graph_config::get_i64(engine, "status.poll_secs")
-            .await
-            .ok()
-            .flatten()
-            .filter(|v| *v > 0)
-            .unwrap_or(60) as u64;
+        // ONE corpus read for the whole resolve. See `Snapshot`.
+        let cfg = Snapshot::load(engine).await;
+
+        let poll_seconds = cfg.i64("status.poll_secs").filter(|v| *v > 0).unwrap_or(60) as u64;
 
         // Never faster than the probe cadence: emitting an observation more
         // often than we observe would re-sign the same measurement under a new
         // instant, which is what an equivocation check is built to catch.
-        let observation_seconds = graph_config::get_i64(engine, "status.observation_secs")
-            .await
-            .ok()
-            .flatten()
+        let observation_seconds = cfg
+            .i64("status.observation_secs")
             .filter(|v| *v > 0)
             .map(|v| v as u64)
             .unwrap_or(900)
             .max(poll_seconds);
 
-        let corpus_retention_hours = graph_config::get_i64(engine, "status.corpus_retention_hours")
-            .await
-            .ok()
-            .flatten()
+        let corpus_retention_hours = cfg
+            .i64("status.corpus_retention_hours")
             .filter(|v| *v > 0)
             .unwrap_or(24) as u64;
 
         let corpus_retention_budget =
-            graph_config::get_i64(engine, "status.corpus_retention_budget")
-                .await
-                .ok()
-                .flatten()
+            cfg.i64("status.corpus_retention_budget")
                 .filter(|v| *v > 0)
                 .unwrap_or(crate::retention::PRUNE_BUDGET_PER_PASS as i64) as usize;
 
-        let corpus_retention_secs = graph_config::get_i64(engine, "status.corpus_retention_secs")
-            .await
-            .ok()
-            .flatten()
+        let corpus_retention_secs = cfg
+            .i64("status.corpus_retention_secs")
             .filter(|v| *v > 0)
             .unwrap_or(120) as u64;
 
-        let roster_seconds = graph_config::get_i64(engine, "status.roster_secs")
-            .await
-            .ok()
-            .flatten()
+        let roster_seconds = cfg
+            .i64("status.roster_secs")
             .filter(|v| *v > 0)
             .unwrap_or(300)
             .max(poll_seconds as i64) as u64;
 
-        let cors_origins = graph_config::get_str_list(engine, "status.cors_origins")
-            .await
-            .ok()
-            .flatten()
+        let cors_origins = cfg
+            .str_list("status.cors_origins")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(default_cors_origins);
 
         let mut regions = Vec::new();
         for (key, label, provider) in REGION_SPECS {
-            let name = get_str(engine, &format!("status.region.{key}.name"))
-                .await
+            let name = cfg
+                .str(&format!("status.region.{key}.name"))
                 .unwrap_or_else(|| (*label).to_string());
             regions.push(Region {
                 key,
                 name,
-                latency_baseline_ms: graph_config::get_i64(
-                    engine,
-                    &format!("status.region.{key}.latency_baseline_ms"),
-                )
-                .await
-                .ok()
-                .flatten()
-                .filter(|v| *v >= 0)
-                .unwrap_or(0),
-                billing_url: get_str(engine, &format!("status.region.{key}.billing_url")).await,
-                proxy_url: get_str(engine, &format!("status.region.{key}.proxy_url")).await,
-                infra_url: get_str(engine, &format!("status.region.{key}.infra_url")).await,
+                latency_baseline_ms: cfg
+                    .i64(&format!("status.region.{key}.latency_baseline_ms"))
+                    .filter(|v| *v >= 0)
+                    .unwrap_or(0),
+                billing_url: cfg.str(&format!("status.region.{key}.billing_url")),
+                proxy_url: cfg.str(&format!("status.region.{key}.proxy_url")),
+                infra_url: cfg.str(&format!("status.region.{key}.infra_url")),
                 infra_provider: provider,
             });
         }
@@ -300,18 +367,15 @@ impl Config {
         let mut external = Vec::new();
         for (key, display, header, expected) in EXTERNAL_SPECS {
             // A provider is probed only when its url is configured.
-            if let Some(url) = get_str(engine, &format!("status.external.{key}.url")).await {
-                let authenticated =
-                    graph_config::get_bool(engine, &format!("status.external.{key}.auth"))
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or(false);
+            if let Some(url) = cfg.str(&format!("status.external.{key}.url")) {
+                let authenticated = cfg
+                    .bool(&format!("status.external.{key}.auth"))
+                    .unwrap_or(false);
                 external.push(ExternalProvider {
                     key,
                     display,
                     url,
-                    api_key: get_str(engine, &format!("status.external.{key}.api_key")).await,
+                    api_key: cfg.str(&format!("status.external.{key}.api_key")),
                     header,
                     expected_text: *expected,
                     authenticated,
@@ -319,14 +383,12 @@ impl Config {
             }
         }
 
-        let ghcr_url = get_str(engine, "status.ghcr_url")
-            .await
+        let ghcr_url = cfg
+            .str("status.ghcr_url")
             .unwrap_or_else(|| "https://ghcr.io/v2/".into());
 
-        let ci_repos = graph_config::get_str_list(engine, "status.ci.repos")
-            .await
-            .ok()
-            .flatten()
+        let ci_repos = cfg
+            .str_list("status.ci.repos")
             .filter(|v: &Vec<String>| !v.is_empty())
             .unwrap_or_else(|| {
                 crate::ci::DEFAULT_REPOS
@@ -344,23 +406,21 @@ impl Config {
             corpus_retention_secs,
             roster_seconds,
             version: env!("CARGO_PKG_VERSION"),
-            grafana_url: get_str(engine, "status.grafana_url").await,
-            database_url: get_str(engine, "status.database_url").await,
+            grafana_url: cfg.str("status.grafana_url"),
+            database_url: cfg.str("status.database_url"),
             ghcr_url,
             regions,
             external,
             cors_origins,
-            ci_owner: get_str(engine, "status.ci.owner")
-                .await
+            ci_owner: cfg
+                .str("status.ci.owner")
                 .unwrap_or_else(|| crate::ci::DEFAULT_OWNER.into()),
             ci_repos,
-            ci_token: get_str(engine, "status.ci.token").await,
-            capabilities: resolve_capabilities(engine).await,
-            auth_targets: resolve_auth_targets(engine).await,
-            ci_poll_seconds: graph_config::get_i64(engine, "status.ci.poll_secs")
-                .await
-                .ok()
-                .flatten()
+            ci_token: cfg.str("status.ci.token"),
+            capabilities: resolve_capabilities(&cfg),
+            auth_targets: resolve_auth_targets(&cfg),
+            ci_poll_seconds: cfg
+                .i64("status.ci.poll_secs")
                 .filter(|v| *v > 0)
                 .unwrap_or(300) as u64,
         }
@@ -417,34 +477,26 @@ impl Config {
 /// list in call-path order, `*` marking the primary (`deepinfra*,openrouter`);
 /// `status.capability.<id>.min_available` is the threshold. Unset → the baked
 /// default, so a fresh node still declares what it expects to measure.
-async fn resolve_capabilities(engine: &Arc<Engine>) -> Vec<crate::capability::CapabilitySpec> {
+fn resolve_capabilities(cfg: &Snapshot) -> Vec<crate::capability::CapabilitySpec> {
     let mut out = Vec::new();
     for spec in crate::capability::default_specs() {
-        let members =
-            graph_config::get_str_list(engine, &format!("status.capability.{}.members", spec.id))
-                .await
-                .ok()
-                .flatten()
-                .filter(|v: &Vec<String>| !v.is_empty())
-                .map(|v| {
-                    v.iter()
-                        .map(|m| {
-                            let primary = m.ends_with('*');
-                            (m.trim_end_matches('*').trim().to_string(), primary)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or(spec.members);
-        let min_available = graph_config::get_i64(
-            engine,
-            &format!("status.capability.{}.min_available", spec.id),
-        )
-        .await
-        .ok()
-        .flatten()
-        .filter(|v| *v > 0)
-        .map(|v| v as usize)
-        .unwrap_or(spec.min_available);
+        let members = cfg
+            .str_list(&format!("status.capability.{}.members", spec.id))
+            .filter(|v: &Vec<String>| !v.is_empty())
+            .map(|v| {
+                v.iter()
+                    .map(|m| {
+                        let primary = m.ends_with('*');
+                        (m.trim_end_matches('*').trim().to_string(), primary)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or(spec.members);
+        let min_available = cfg
+            .i64(&format!("status.capability.{}.min_available", spec.id))
+            .filter(|v| *v > 0)
+            .map(|v| v as usize)
+            .unwrap_or(spec.min_available);
         out.push(crate::capability::CapabilitySpec {
             id: spec.id,
             label: spec.label,
@@ -458,29 +510,22 @@ async fn resolve_capabilities(engine: &Arc<Engine>) -> Vec<crate::capability::Ca
 /// Direct identity-provider probes. `status.auth.<id>.url` overrides the baked
 /// endpoint; setting it to `""` disables that probe and falls back to billing's
 /// report alone.
-async fn resolve_auth_targets(engine: &Arc<Engine>) -> Vec<(String, String)> {
+fn resolve_auth_targets(cfg: &Snapshot) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (id, default_url) in AUTH_SPECS {
-        let url = graph_config::get_str(engine, &format!("status.auth.{id}.url"))
-            .await
-            .ok()
-            .flatten()
+        // RAW, not `str()`: an empty value here is meaningful. The docs above
+        // promise that setting the key to `""` disables the probe, and the
+        // `is_empty` test below is what delivers that — filtering empty to
+        // `None` first would fall through to the baked endpoint and turn the
+        // probe back on.
+        let url = cfg
+            .str_raw(&format!("status.auth.{id}.url"))
             .unwrap_or_else(|| (*default_url).to_string());
         if !url.trim().is_empty() {
             out.push(((*id).to_string(), url));
         }
     }
     out
-}
-
-/// Read a `config:*` string key, treating an empty string as unset (so an owner
-/// can clear a probe target by setting it to `""` as well as by omitting it).
-async fn get_str(engine: &Arc<Engine>, key: &str) -> Option<String> {
-    graph_config::get_str(engine, key)
-        .await
-        .ok()
-        .flatten()
-        .filter(|v| !v.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -635,6 +680,48 @@ mod config_ceg {
             Ok(()) | Err(FederationError::Conflict(_)) => {}
             Err(e) => panic!("self-register node key: {e}"),
         }
+    }
+
+    /// `status.auth.<id>.url = ""` DISABLES that probe. The batched resolve
+    /// nearly lost this: the old code read the raw value and tested `is_empty`
+    /// below, so folding empty to `None` first would have fallen through to the
+    /// baked endpoint and turned the probe back ON — the exact inverse of what
+    /// the operator asked for, and silent.
+    #[tokio::test]
+    async fn an_empty_auth_url_disables_that_probe() {
+        const ALIAS: &str = "ciris-status";
+        let (engine, _seeds) = node(ALIAS).await;
+        let node_kid = engine
+            .local_derived_key_id()
+            .await
+            .expect("derive node key_id");
+        let node = node_kid.as_str();
+        register_self_key(&engine, node).await;
+
+        let baked = Config::defaults(String::new());
+        assert!(
+            baked.auth_targets.iter().any(|(k, _)| k == "google_play"),
+            "precondition: google_play is probed by default"
+        );
+
+        set_config(
+            &engine,
+            "status.auth.google_play.url",
+            ConfigValue::Str(String::new()),
+            node,
+            ConfigScope::Local,
+        )
+        .await
+        .expect("set empty google_play url");
+
+        let cfg = Config::resolve(&engine, String::new()).await;
+        assert!(
+            !cfg.auth_targets.iter().any(|(k, _)| k == "google_play"),
+            "an empty url must disable the probe, not fall back to the baked one: {:?}",
+            cfg.auth_targets
+        );
+        // The other target is untouched — disabling one is not disabling all.
+        assert!(cfg.auth_targets.iter().any(|(k, _)| k == "google_oauth"));
     }
 
     #[tokio::test]
