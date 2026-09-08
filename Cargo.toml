@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.65"
+version = "0.3.66"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -221,7 +221,19 @@ libc = "0.2"
 # published: its Windows wheel failed on a one-line type break; v0.5.202 is
 # the same release plus that cast and a CRLF fix in one gate — pin the tag
 # that shipped.)
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.202" }
+#
+# 0.5.203 — A SPLIT NODE SIGNS ITS CONSENT AS ITSELF (2026-09-08,
+# CIRISServer#563). On an agent-hosted node the engine signs as the ACTOR and
+# boot mints the node its own key; the consent guard compared that signer's
+# keystore alias to the node's derived id and refused every re-author, so a
+# split node whose actor peered at setup died on its next boot. Now the guard
+# reads both signer conventions, the process holds the node's pen and its key
+# record, and every consent surface authors and serves as the node. THIS node
+# is standalone (its configured key IS the node, `SubstrateOnly`), so none of
+# that path runs here — the pin moves so the two nodes on the canonical host
+# run one server build. Substrate unchanged: persist v42.0.0 / edge v21.0.0 /
+# verify v15.0.0 / leviculum v0.25.0+ciris.1.
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.203" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
