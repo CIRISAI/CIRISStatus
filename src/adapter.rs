@@ -698,6 +698,27 @@ impl Adapter for StatusAdapter {
         let cors_layer = cors(&cfg);
         *self.state.cfg.write().expect("cfg lock") = cfg;
 
+        // The memory diagnostic is NOT mounted unless the operator asked for it
+        // (CIRISStatus#73). It answered unauthenticated on the published port,
+        // while ciris-server gates the identical report on the same host behind
+        // `CIRIS_DIAGNOSTICS` and binds it to loopback — so the two nodes
+        // disagreed about whether allocator internals are public. They share a
+        // host and a ruler; they should share the switch.
+        //
+        // `ciris_server::diag::enabled()` IS that switch, read from the same
+        // process, so one `CIRIS_DIAGNOSTICS=1` turns both on and nothing here
+        // invents a second control to drift from it. Off, the route is not
+        // mounted at all: a 404 that looks like every other absent path, rather
+        // than a 403 advertising that there is something to ask for.
+        //
+        // What this does NOT do is bind to loopback. ciris-server pairs the gate
+        // with `require_loopback` on its own listener; an adapter router cannot
+        // — the guard is not exported and the read-API listener does not hand us
+        // `ConnectInfo`. So with diagnostics ON, this is still reachable from
+        // wherever the port is, and the edge (Caddy) remains the thing keeping it
+        // off the internet. Said plainly rather than implied, because "gated"
+        // and "gated and loopback-only" are different promises.
+        let diagnostics_on = ciris_server::diag::enabled();
         let router = Router::new()
             .route("/", get(root))
             // NB: NO `/health` here. Since ciris-server v0.5.32 the embedded node
@@ -715,12 +736,22 @@ impl Adapter for StatusAdapter {
             .route("/api/v1/history", get(history))
             .route("/api/v1/scoring", get(scoring))
             .route("/api/v1/ci", get(ci))
-            .route("/api/v1/debug/memory", get(debug_memory))
             .route("/api/v1/scoring/live", get(live_sse))
             .route("/api/v1/status/live", get(live_sse))
             .route("/api/v1/status/ws", get(live_ws))
             .layer(cors_layer)
             .with_state(self.state.clone());
+        let router = if diagnostics_on {
+            tracing::warn!(
+                "diagnostics ENABLED — /api/v1/debug/memory is mounted and is NOT                  loopback-gated here; keep it off the public edge"
+            );
+            router.route(
+                "/api/v1/debug/memory",
+                get(debug_memory).with_state(self.state.clone()),
+            )
+        } else {
+            router
+        };
         vec![router]
     }
 
@@ -762,6 +793,9 @@ impl Adapter for StatusAdapter {
         let mut last_prune = std::time::Instant::now() - Duration::from_secs(86_400);
         // Roster likewise: built on the first cycle, then on its own cadence.
         let mut last_roster = std::time::Instant::now() - Duration::from_secs(86_400);
+        // Trim, when enabled at all, waits a full interval first — there is
+        // nothing to reclaim from a process that has not run yet.
+        let mut last_trim = std::time::Instant::now();
         tracing::info!(
             poll_s = last_poll,
             observation_s = self.state.cfg().observation_seconds,
@@ -822,6 +856,25 @@ impl Adapter for StatusAdapter {
                         // here would have delayed news by up to the heartbeat,
                         // which is the opposite of what a status plane is for.
                         self.emit_observations(ctx, &agg).await;
+
+                        // Optional, off unless an operator turned it on: the
+                        // reclaim the arena cap cannot reach. Reports both
+                        // sides so enabling it is an A/B rather than an act of
+                        // faith (CIRISStatus#69).
+                        if cfg.malloc_trim_seconds > 0
+                            && last_trim.elapsed() >= Duration::from_secs(cfg.malloc_trim_seconds)
+                        {
+                            last_trim = std::time::Instant::now();
+                            let r = crate::diag::trim_malloc();
+                            tracing::info!(
+                                rc = %r["rc"],
+                                fordblks_before = %r["fordblks_before"],
+                                fordblks_after = %r["fordblks_after"],
+                                rss_anon_before = %r["rss_anon_before"],
+                                rss_anon_after = %r["rss_anon_after"],
+                                "malloc_trim"
+                            );
+                        }
 
                         // Retention on its own slow cadence: bounded work, and
                         // nothing about it is urgent.
