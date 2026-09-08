@@ -132,27 +132,42 @@ mod tests {
         }
     }
 
-    /// A held allocation must move `uordblks`. This is the sanity check that
-    /// the numbers are this process's and not a constant.
+    /// A held allocation must move the in-use figure. This is the sanity check
+    /// that the numbers are this process's and not a constant.
+    ///
+    /// Two glibc facts shape it, and the first version of this test tripped on
+    /// both — ciris-server hit the identical flake in its copy of this module
+    /// and fixed it in 0.5.200; this is that fix, because the two nodes are
+    /// deliberately one instrument and a test that is flaky in one of them is
+    /// flaky in both.
+    ///
+    /// A block past the mmap threshold is NOT in `uordblks` — it is mmapped and
+    /// counted in `hblkhd`. And in a test binary this size, other threads free
+    /// arena memory in the same millisecond, so `uordblks` alone can FALL while
+    /// this thread holds its block. So: 64 MiB (past the 32 MiB ceiling of
+    /// glibc's dynamic mmap threshold, hence always mmapped), and the in-use
+    /// figure is `uordblks + hblkhd`, which only an mmapped free of tens of MiB
+    /// elsewhere could pull back down; half the block is the slack for that.
+    #[cfg(target_env = "gnu")]
     #[test]
     fn live_bytes_track_a_real_allocation() {
-        let before = live_bytes();
-        // Big enough to clear allocator noise from other test threads, and
-        // touched so it cannot be optimised away.
-        let mut v: Vec<u8> = vec![7; 32 * 1024 * 1024];
-        v[16 * 1024 * 1024] = 9;
-        let during = live_bytes();
+        const BLOCK: usize = 64 * 1024 * 1024;
+        fn in_use() -> u64 {
+            let m = &memory_report()["mallinfo2"];
+            m["uordblks"].as_u64().unwrap() + m["hblkhd"].as_u64().unwrap()
+        }
+        let before = in_use();
+        // Touched so it cannot be optimised away and the pages are real.
+        let mut v: Vec<u8> = vec![7; BLOCK];
+        v[BLOCK / 2] = 9;
+        std::hint::black_box(&v);
+        let during = in_use();
         assert!(
-            during >= before,
-            "holding 32MB should not shrink the live figure ({before} -> {during})"
+            during >= before + (BLOCK as u64) / 2,
+            "in-use bytes (uordblks + hblkhd) should rise by ~64 MiB while the block is held: \
+             before={before} during={during}"
         );
         drop(v);
-    }
-
-    fn live_bytes() -> u64 {
-        memory_report()["mallinfo2"]["uordblks"]
-            .as_u64()
-            .unwrap_or(0)
     }
 }
 
