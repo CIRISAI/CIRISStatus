@@ -41,12 +41,13 @@ resolves everything else from **signed CEG objects in its own corpus**, authored
 by the OWNER at runtime. `.env.example` documents this (there is nothing to put
 in a `.env`).
 
-### Boot inputs (CLI flags — the ONLY two)
+### Boot inputs (CLI flags — two that shape the node, one that opens a door)
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--home <path>` | `/var/lib/ciris` | the data root. `data_dir = <home>/data`; the corpus is `<data_dir>/ciris_engine.db`, the minted Ed25519 + ML-DSA-65 identity lives under `<home>`, and the uptime-history DB is **derived** as `<data_dir>/status.db`. The docker-compose deploy passes `--home /data` (the mounted volume). |
 | `--key-id <name>` | `ciris-status` | this node's federation `key_id` — the observation attester. `serve_with_adapter` self-registers it at boot, so Flow B rows admit with no extra step. |
+| `--diagnostics` | off | mount `GET /api/v1/debug/memory` (the `mallinfo2` live/free split). `CIRIS_DIAGNOSTICS=1` does the same thing — ciris-server's own switch, read through its own parser so the truthy set cannot drift. See below. |
 
 ```sh
 ciris-status --home /data --key-id ciris-status   # docker-compose passes this as command:
@@ -54,7 +55,33 @@ ciris-status --home /data --key-id ciris-status   # docker-compose passes this a
 
 The listen address, transport/NAT-traversal toggles, replication cadence, and
 mode are themselves the **node's** `config:*` CEG (resolved at boot, hot-applied)
-— see `ciris-server`'s `src/config.rs`. There is no `CIRIS_*` env any more.
+— see `ciris-server`'s `src/config.rs`. No `CIRIS_*` env configures the NODE;
+`CIRIS_DIAGNOSTICS` is the substrate's own debug switch, not adapter config.
+
+#### Diagnostics — off by default, and there ARE two ways to open it
+
+`GET /api/v1/debug/memory` is not mounted unless asked for, because it answered
+unauthenticated on the published port (CIRISStatus#73):
+
+```yaml
+command: ["--home", "/data", "--key-id", "ciris-status", "--diagnostics"]
+# or
+environment:
+  CIRIS_DIAGNOSTICS: "1"
+```
+
+Boot says which opener fired, so it is checkable rather than assumed.
+
+**It is NOT loopback-bound here.** ciris-server pairs its gate with
+`require_loopback`; an adapter router cannot — that guard is not exported and
+the read-API listener does not hand us `ConnectInfo`. With diagnostics on the
+route answers from wherever the port reaches, and the edge is what keeps it off
+the internet. Turn it on for a reading, turn it back off.
+
+> **0.3.69 and 0.3.70 shipped the gate with NO opener.** `diag::enable()` is
+> called from ciris-server's own binary entry point, which this binary does not
+> run, so the switch was permanently false: the route was gone, not gated, and
+> no flag or env could bring it back. Fixed in 0.3.71.
 
 > **The corpus is its OWN** — `<home>/data/ciris_engine.db`. Never share `--home`
 > with the lens node or bind-mount the lens node's `data/`. Node A's `capacity:*`
