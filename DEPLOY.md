@@ -71,9 +71,14 @@ environment:
   CIRIS_DIAGNOSTICS: "1"
 ```
 
-**The window closes itself.** `--diagnostics` opens for 120 minutes by default
-(`--diagnostics=30` for less); after that the route answers 404 — the same thing
-a caller sees when it was never mounted. Nothing has to be remembered, and a
+**The window closes itself.** `--diagnostics` opens for 120 minutes by default;
+`--diagnostics=<5..240>` sets it. After that the route answers 404 — the same
+thing a caller sees when it was never mounted.
+
+> `--diagnostics=1` is REFUSED with a migration error. 0.3.71 accepted that
+> spelling and ignored the value, so it meant "on"; here a number is minutes,
+> and silently turning it into a one-minute window would close the endpoint
+> during boot. Use bare `--diagnostics`. Nothing has to be remembered, and a
 session that ends early takes no exposure with it. Boot logs which opener fired
 and how long the window is, so both are checkable rather than assumed.
 

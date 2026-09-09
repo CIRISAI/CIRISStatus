@@ -422,13 +422,34 @@ pub const DEFAULT_WINDOW_MINS: u64 = 120;
 // for half a day and it stops being a window at all, which is the failure this
 // whole mechanism exists to prevent (a measurement that ended at 16:37 against
 // an endpoint that answered until 20:31).
-const _: () = assert!(DEFAULT_WINDOW_MINS >= 30 && DEFAULT_WINDOW_MINS <= 240);
+const _: () = assert!(DEFAULT_WINDOW_MINS >= 30 && DEFAULT_WINDOW_MINS <= MAX_WINDOW_MINS);
+
+/// The longest window an operator may ask for.
+///
+/// An expiry that can be set to 3,000 minutes is not an expiry — it is the
+/// forgotten-switch failure with extra steps, which is the thing this mechanism
+/// exists to remove. Four hours is past any single reading and still inside a
+/// working day, so an over-long window is a typo caught at boot rather than an
+/// exposure discovered later.
+pub const MAX_WINDOW_MINS: u64 = 240;
+
+/// The shortest. Below this a window is almost certainly a misread flag rather
+/// than a deliberate choice — see the `--diagnostics=1` case in
+/// `parse_diagnostics_window`.
+pub const MIN_WINDOW_MINS: u64 = 5;
 
 static CLOSES_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Start the clock. Called once, beside `diag::enable`.
 pub fn open_window(mins: u64) {
-    let _ = CLOSES_AT.set(std::time::Instant::now() + std::time::Duration::from_secs(mins * 60));
+    // Saturating, though the parser already bounds this: arithmetic that can
+    // panic or wrap has no business inside a control whose whole job is to
+    // shut something off.
+    let secs = mins.saturating_mul(60);
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(secs))
+        .unwrap_or_else(std::time::Instant::now);
+    let _ = CLOSES_AT.set(deadline);
 }
 
 /// Is the window still open?

@@ -241,6 +241,54 @@ fn parse_config_value(raw: &str) -> ciris_server::ConfigValue {
 /// Parse `--home <path>` / `--key-id <name>` (both optional; `--flag=value` also
 /// accepted). Unknown args are an error — fail loud, never silently ignore a
 /// misspelled flag on the boot path. Mirrors ciris-server's `parse_serve_flags`.
+/// `--diagnostics` / `--diagnostics=<minutes>` → the window length.
+///
+/// # Two things this refuses, both on purpose
+///
+/// **An unbounded window.** `--diagnostics=3000` is fifty hours, which is not an
+/// expiry — it is the forgotten-switch failure with extra steps, and this route
+/// is not loopback-bound. Bounded at [`diag::MAX_WINDOW_MINS`], which also puts
+/// the value far inside the range where `mins * 60` cannot overflow.
+///
+/// **The 0.3.71 boolean spelling.** That release accepted `--diagnostics=1` and
+/// IGNORED the value, so it meant "on, for as long as the process lives". Here
+/// a number means minutes, so the same string would silently become a
+/// one-minute window — most of which a node spends booting, leaving an operator
+/// who copied a working command with an endpoint that vanished before they
+/// could read it. A meaning change that small and that quiet is worse than an
+/// error, so anything under [`diag::MIN_WINDOW_MINS`] is refused by name.
+fn parse_diagnostics_window(value: Option<&str>) -> anyhow::Result<u64> {
+    let Some(raw) = value else {
+        return Ok(diag::DEFAULT_WINDOW_MINS);
+    };
+    let mins: u64 = raw.trim().parse().map_err(|_| {
+        anyhow::anyhow!(
+            "--diagnostics takes minutes, e.g. --diagnostics=30, or bare --diagnostics for {} \
+             (got {raw:?})",
+            diag::DEFAULT_WINDOW_MINS
+        )
+    })?;
+    if mins < diag::MIN_WINDOW_MINS {
+        return Err(anyhow::anyhow!(
+            "--diagnostics={mins} is {mins} MINUTE(S), not a boolean. 0.3.71 accepted \
+             `--diagnostics=1` and ignored the value; here a number is the window length, so that \
+             spelling would open for one minute and close during boot. Use bare `--diagnostics` \
+             for {} minutes, or --diagnostics=<{}..{}>",
+            diag::DEFAULT_WINDOW_MINS,
+            diag::MIN_WINDOW_MINS,
+            diag::MAX_WINDOW_MINS
+        ));
+    }
+    if mins > diag::MAX_WINDOW_MINS {
+        return Err(anyhow::anyhow!(
+            "--diagnostics={mins} exceeds the {} minute maximum. This route is not loopback-bound; \
+             a window you can forget for two days is the failure the expiry exists to remove",
+            diag::MAX_WINDOW_MINS
+        ));
+    }
+    Ok(mins)
+}
+
 /// Returns `(home, key_id, diagnostics_window_mins)`. `None` for the window
 /// means diagnostics stay closed.
 fn parse_args(
@@ -271,16 +319,7 @@ fn parse_args(
             // `--diagnostics` opens for the default, `--diagnostics=30` for
             // thirty minutes. The value is optional via `=` only, so a bare
             // `--diagnostics` never swallows the argument after it.
-            "--diagnostics" => {
-                diagnostics = Some(match eq_value.as_deref() {
-                    None => diag::DEFAULT_WINDOW_MINS,
-                    Some(v) => v.trim().parse::<u64>().map_err(|_| {
-                        anyhow::anyhow!(
-                            "--diagnostics takes minutes, e.g. --diagnostics=30 (got {v:?})"
-                        )
-                    })?,
-                });
-            }
+            "--diagnostics" => diagnostics = Some(parse_diagnostics_window(eq_value.as_deref())?),
             other => {
                 return Err(anyhow::anyhow!(
                     "unknown arg: {other} (usage: ciris-status [--home <path>] [--key-id <name>] \
@@ -335,14 +374,55 @@ mod tests {
     }
 
     /// The window is the point: an operator who wants a short exposure gets to
-    /// ask for one, and a typo does not silently become "open for the default
-    /// two hours".
+    /// ask for one, and a typo does not silently become something else.
     #[test]
     fn the_diagnostics_window_is_settable_and_a_bad_value_is_refused() {
         let (_, _, w) = parse(&["--diagnostics=30"]).unwrap();
         assert_eq!(w, Some(30));
         assert!(parse(&["--diagnostics=soon"]).is_err());
         assert!(parse(&["--diagnostics="]).is_err());
+    }
+
+    /// Codex on #82: an expiry that accepts 3000 minutes is not an expiry. The
+    /// bound also keeps the value far below where `mins * 60` could overflow.
+    #[test]
+    fn an_over_long_window_is_refused() {
+        assert_eq!(
+            parse(&["--diagnostics=240"]).unwrap().2,
+            Some(diag::MAX_WINDOW_MINS)
+        );
+        for absurd in [
+            "--diagnostics=241",
+            "--diagnostics=3000",
+            "--diagnostics=18446744073709551615",
+        ] {
+            let e = parse(&[absurd]).unwrap_err().to_string();
+            assert!(
+                e.contains("maximum") || e.contains("minutes"),
+                "{absurd} must be refused with a reason: {e}"
+            );
+        }
+    }
+
+    /// Codex on #82: 0.3.71 accepted `--diagnostics=1` and ignored the value,
+    /// so it meant "on". Here a number is minutes — the same string would open
+    /// a one-minute window that closes during boot, and an operator who copied
+    /// a working command would find the endpoint gone before they could read
+    /// it. Refused by name rather than silently reinterpreted.
+    #[test]
+    fn the_0_3_71_boolean_spelling_is_refused_not_reinterpreted() {
+        for legacy in ["--diagnostics=1", "--diagnostics=0", "--diagnostics=4"] {
+            let e = parse(&[legacy]).unwrap_err().to_string();
+            assert!(
+                e.contains("0.3.71") && e.contains("bare `--diagnostics`"),
+                "{legacy} must name the meaning change and the fix: {e}"
+            );
+        }
+        // And the spelling it points at works.
+        assert_eq!(
+            parse(&["--diagnostics"]).unwrap().2,
+            Some(diag::DEFAULT_WINDOW_MINS)
+        );
     }
 
     #[test]
