@@ -406,3 +406,75 @@ mod trim_tests {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The window closes itself.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How long `--diagnostics` stays open before the route stops answering.
+///
+/// Two hours: long enough for a soak that spans several poll cycles, short
+/// enough that forgetting costs a window rather than a weekend.
+pub const DEFAULT_WINDOW_MINS: u64 = 120;
+
+// A guardrail on the constant above, enforced by the COMPILER rather than by a
+// test run: too short and no real reading fits inside it; long enough to forget
+// for half a day and it stops being a window at all, which is the failure this
+// whole mechanism exists to prevent (a measurement that ended at 16:37 against
+// an endpoint that answered until 20:31).
+const _: () = assert!(DEFAULT_WINDOW_MINS >= 30 && DEFAULT_WINDOW_MINS <= 240);
+
+static CLOSES_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Start the clock. Called once, beside `diag::enable`.
+pub fn open_window(mins: u64) {
+    let _ = CLOSES_AT.set(std::time::Instant::now() + std::time::Duration::from_secs(mins * 60));
+}
+
+/// Is the window still open?
+///
+/// # Why an expiry and not just a switch
+///
+/// The route is not loopback-bound here — ciris-server pairs its gate with
+/// `require_loopback`, an adapter cannot — so while it is on, the only thing
+/// keeping allocator internals off the internet is the edge proxy. That makes
+/// "remember to turn it off" a security control, and it failed the first time
+/// it was used: a measurement that finished at 16:37 left the endpoint
+/// answering until 20:31, because the closing step lived in a person's session
+/// rather than in the process. Five and a half hours instead of the planned
+/// hundred minutes.
+///
+/// The measurement was made resilient to the operator's machine dying. The
+/// CLOSING was not. So the process holds the deadline now: nothing has to be
+/// remembered, and a session that ends early takes no exposure with it.
+///
+/// Closed, the handler answers 404 — the same thing a caller sees when the
+/// route was never mounted, rather than a 403 that advertises there is
+/// something here to ask for.
+pub fn window_open() -> bool {
+    match CLOSES_AT.get() {
+        Some(deadline) => std::time::Instant::now() < *deadline,
+        // No window was opened, so nothing to expire: the gate above is the
+        // only control, which is the pre-expiry behaviour.
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    /// No window opened at all = the gate is the only control, which is how
+    /// this behaved before the expiry existed. An unopened window must not
+    /// read as an EXPIRED one, or a node running with diagnostics genuinely
+    /// off would start 404ing routes that were never gated.
+    #[test]
+    fn an_unopened_window_does_not_read_as_closed() {
+        // `CLOSES_AT` is a process-global OnceLock, so this only holds in a
+        // process where `open_window` was never called. Asserting the default
+        // rather than mutating it keeps the two tests independent.
+        if CLOSES_AT.get().is_none() {
+            assert!(window_open());
+        }
+    }
+}

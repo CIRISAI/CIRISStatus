@@ -97,7 +97,7 @@ async fn async_main(arena_cap: diag::ArenaCap) -> anyhow::Result<()> {
 
     // Default: serve the node + StatusAdapter. Reconstruct the arg iterator
     // (`first` was consumed by the subcommand peek).
-    let (home, key_id, diagnostics_flag) = parse_args(first.into_iter().chain(args))?;
+    let (home, key_id, diagnostics_window) = parse_args(first.into_iter().chain(args))?;
 
     // THE OPENER. 0.3.69 gated `/api/v1/debug/memory` on
     // `ciris_server::diag::enabled()` (CIRISStatus#73) — correct switch, and it
@@ -112,10 +112,27 @@ async fn async_main(arena_cap: diag::ArenaCap) -> anyhow::Result<()> {
     // `CIRIS_DIAGNOSTICS=1` (its env, read through its own parser so the truthy
     // set cannot drift from theirs). Before `serve_with_adapter`, because
     // `routers()` asks `enabled()` while building.
-    if diagnostics_flag {
-        ciris_server::diag::enable("ciris-status --diagnostics");
-    } else if ciris_server::diag::env_requests() {
-        ciris_server::diag::enable("ciris-status CIRIS_DIAGNOSTICS");
+    let diagnostics_mins = diagnostics_window
+        .or_else(|| ciris_server::diag::env_requests().then_some(diag::DEFAULT_WINDOW_MINS));
+    if let Some(diagnostics_mins) = diagnostics_mins {
+        let source = if diagnostics_window.is_some() {
+            "ciris-status --diagnostics"
+        } else {
+            "ciris-status CIRIS_DIAGNOSTICS"
+        };
+        ciris_server::diag::enable(source);
+        // And it closes itself. The route is not loopback-bound here, so while
+        // it is open the edge proxy is the only thing between allocator
+        // internals and the internet — which makes "remember to turn it off" a
+        // security control, and it has already failed once: a reading that
+        // finished at 16:37 left the endpoint answering until 20:31.
+        diag::open_window(diagnostics_mins);
+        tracing::warn!(
+            source,
+            window_mins = diagnostics_mins,
+            "diagnostics OPEN — /api/v1/debug/memory answers until the window \
+             expires, then 404s; it is NOT loopback-gated here"
+        );
     }
 
     // Zero-env node config: derived entirely from `--home`/`--key-id` + config:*.
@@ -224,10 +241,14 @@ fn parse_config_value(raw: &str) -> ciris_server::ConfigValue {
 /// Parse `--home <path>` / `--key-id <name>` (both optional; `--flag=value` also
 /// accepted). Unknown args are an error — fail loud, never silently ignore a
 /// misspelled flag on the boot path. Mirrors ciris-server's `parse_serve_flags`.
-fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, String, bool)> {
+/// Returns `(home, key_id, diagnostics_window_mins)`. `None` for the window
+/// means diagnostics stay closed.
+fn parse_args(
+    args: impl Iterator<Item = String>,
+) -> anyhow::Result<(PathBuf, String, Option<u64>)> {
     let mut home: Option<String> = None;
     let mut key_id: Option<String> = None;
-    let mut diagnostics = false;
+    let mut diagnostics: Option<u64> = None;
 
     let mut it = args;
     while let Some(arg) = it.next() {
@@ -246,10 +267,20 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, St
         match name.as_str() {
             "--home" => home = Some(take("--home")?),
             "--key-id" => key_id = Some(take("--key-id")?),
-            // Mirrors ciris-server's own flag. Takes no value; `--diagnostics=1`
-            // is accepted too so an operator who types it either way gets what
-            // they meant rather than "needs a value".
-            "--diagnostics" => diagnostics = true,
+            // Mirrors ciris-server's own flag, plus an optional window:
+            // `--diagnostics` opens for the default, `--diagnostics=30` for
+            // thirty minutes. The value is optional via `=` only, so a bare
+            // `--diagnostics` never swallows the argument after it.
+            "--diagnostics" => {
+                diagnostics = Some(match eq_value.as_deref() {
+                    None => diag::DEFAULT_WINDOW_MINS,
+                    Some(v) => v.trim().parse::<u64>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "--diagnostics takes minutes, e.g. --diagnostics=30 (got {v:?})"
+                        )
+                    })?,
+                });
+            }
             other => {
                 return Err(anyhow::anyhow!(
                     "unknown arg: {other} (usage: ciris-status [--home <path>] [--key-id <name>] \
@@ -270,7 +301,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, St
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> anyhow::Result<(PathBuf, String, bool)> {
+    fn parse(args: &[&str]) -> anyhow::Result<(PathBuf, String, Option<u64>)> {
         parse_args(args.iter().map(|s| s.to_string()))
     }
 
@@ -279,7 +310,10 @@ mod tests {
         let (home, key_id, diagnostics) = parse(&[]).unwrap();
         assert_eq!(home, PathBuf::from(DEFAULT_HOME));
         assert_eq!(key_id, DEFAULT_KEY_ID);
-        assert!(!diagnostics, "diagnostics stay OFF unless asked for");
+        assert!(
+            diagnostics.is_none(),
+            "diagnostics stay OFF unless asked for"
+        );
     }
 
     /// CIRISStatus#73 gated the memory route on the server's switch; 0.3.69
@@ -289,14 +323,26 @@ mod tests {
     /// not gated, it is gone.
     #[test]
     fn diagnostics_flag_is_accepted_and_off_by_default() {
-        let (_, _, on) = parse(&["--diagnostics"]).unwrap();
-        assert!(on);
-        // Takes no value, and does not swallow the next argument.
-        let (home, key_id, on) =
+        let (_, _, w) = parse(&["--diagnostics"]).unwrap();
+        assert_eq!(w, Some(diag::DEFAULT_WINDOW_MINS));
+
+        // Bare form takes no value, so it must not swallow the next argument.
+        let (home, key_id, w) =
             parse(&["--diagnostics", "--home", "/data", "--key-id", "node-b"]).unwrap();
-        assert!(on);
+        assert_eq!(w, Some(diag::DEFAULT_WINDOW_MINS));
         assert_eq!(home, PathBuf::from("/data"));
         assert_eq!(key_id, "node-b");
+    }
+
+    /// The window is the point: an operator who wants a short exposure gets to
+    /// ask for one, and a typo does not silently become "open for the default
+    /// two hours".
+    #[test]
+    fn the_diagnostics_window_is_settable_and_a_bad_value_is_refused() {
+        let (_, _, w) = parse(&["--diagnostics=30"]).unwrap();
+        assert_eq!(w, Some(30));
+        assert!(parse(&["--diagnostics=soon"]).is_err());
+        assert!(parse(&["--diagnostics="]).is_err());
     }
 
     #[test]

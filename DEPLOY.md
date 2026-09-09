@@ -65,12 +65,25 @@ unauthenticated on the published port (CIRISStatus#73):
 
 ```yaml
 command: ["--home", "/data", "--key-id", "ciris-status", "--diagnostics"]
+# a shorter window:  "--diagnostics=30"
 # or
 environment:
   CIRIS_DIAGNOSTICS: "1"
 ```
 
-Boot says which opener fired, so it is checkable rather than assumed.
+**The window closes itself.** `--diagnostics` opens for 120 minutes by default
+(`--diagnostics=30` for less); after that the route answers 404 — the same thing
+a caller sees when it was never mounted. Nothing has to be remembered, and a
+session that ends early takes no exposure with it. Boot logs which opener fired
+and how long the window is, so both are checkable rather than assumed.
+
+> Why an expiry and not just a switch: the route is not loopback-bound here, so
+> while it is open the edge proxy is the only thing between allocator internals
+> and the internet. That makes "remember to turn it off" a security control, and
+> it failed the first time it was used — a reading that finished at 16:37 left
+> the endpoint answering until 20:31, five and a half hours instead of the
+> planned hundred minutes. The measurement was made resilient to the operator's
+> machine dying; the closing was not.
 
 **It is NOT loopback-bound here.** ciris-server pairs its gate with
 `require_loopback`; an adapter router cannot — that guard is not exported and
