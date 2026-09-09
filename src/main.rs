@@ -97,7 +97,26 @@ async fn async_main(arena_cap: diag::ArenaCap) -> anyhow::Result<()> {
 
     // Default: serve the node + StatusAdapter. Reconstruct the arg iterator
     // (`first` was consumed by the subcommand peek).
-    let (home, key_id) = parse_args(first.into_iter().chain(args))?;
+    let (home, key_id, diagnostics_flag) = parse_args(first.into_iter().chain(args))?;
+
+    // THE OPENER. 0.3.69 gated `/api/v1/debug/memory` on
+    // `ciris_server::diag::enabled()` (CIRISStatus#73) — correct switch, and it
+    // could never be flipped here: `diag::enable()` is called from
+    // ciris-server's OWN binary entry point, which this binary does not run. We
+    // call `serve_with_adapter` as a library, so the atomic stayed false
+    // forever and the route was not "gated", it was gone, with no way for an
+    // operator to get it back. A gate whose only opener lives in a `main` you
+    // do not execute is a removal wearing a switch's clothes.
+    //
+    // Both doors, matching the sibling: `--diagnostics` (its flag) and
+    // `CIRIS_DIAGNOSTICS=1` (its env, read through its own parser so the truthy
+    // set cannot drift from theirs). Before `serve_with_adapter`, because
+    // `routers()` asks `enabled()` while building.
+    if diagnostics_flag {
+        ciris_server::diag::enable("ciris-status --diagnostics");
+    } else if ciris_server::diag::env_requests() {
+        ciris_server::diag::enable("ciris-status CIRIS_DIAGNOSTICS");
+    }
 
     // Zero-env node config: derived entirely from `--home`/`--key-id` + config:*.
     let cfg = ciris_server::ServerConfig::from_home(home, key_id)?;
@@ -205,9 +224,10 @@ fn parse_config_value(raw: &str) -> ciris_server::ConfigValue {
 /// Parse `--home <path>` / `--key-id <name>` (both optional; `--flag=value` also
 /// accepted). Unknown args are an error — fail loud, never silently ignore a
 /// misspelled flag on the boot path. Mirrors ciris-server's `parse_serve_flags`.
-fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, String)> {
+fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, String, bool)> {
     let mut home: Option<String> = None;
     let mut key_id: Option<String> = None;
+    let mut diagnostics = false;
 
     let mut it = args;
     while let Some(arg) = it.next() {
@@ -226,9 +246,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, St
         match name.as_str() {
             "--home" => home = Some(take("--home")?),
             "--key-id" => key_id = Some(take("--key-id")?),
+            // Mirrors ciris-server's own flag. Takes no value; `--diagnostics=1`
+            // is accepted too so an operator who types it either way gets what
+            // they meant rather than "needs a value".
+            "--diagnostics" => diagnostics = true,
             other => {
                 return Err(anyhow::anyhow!(
-                    "unknown arg: {other} (usage: ciris-status [--home <path>] [--key-id <name>])"
+                    "unknown arg: {other} (usage: ciris-status [--home <path>] [--key-id <name>] \
+                     [--diagnostics])"
                 ))
             }
         }
@@ -237,6 +262,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, St
     Ok((
         PathBuf::from(home.unwrap_or_else(|| DEFAULT_HOME.to_string())),
         key_id.unwrap_or_else(|| DEFAULT_KEY_ID.to_string()),
+        diagnostics,
     ))
 }
 
@@ -244,24 +270,42 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, St
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> anyhow::Result<(PathBuf, String)> {
+    fn parse(args: &[&str]) -> anyhow::Result<(PathBuf, String, bool)> {
         parse_args(args.iter().map(|s| s.to_string()))
     }
 
     #[test]
     fn defaults_when_no_flags() {
-        let (home, key_id) = parse(&[]).unwrap();
+        let (home, key_id, diagnostics) = parse(&[]).unwrap();
         assert_eq!(home, PathBuf::from(DEFAULT_HOME));
         assert_eq!(key_id, DEFAULT_KEY_ID);
+        assert!(!diagnostics, "diagnostics stay OFF unless asked for");
+    }
+
+    /// CIRISStatus#73 gated the memory route on the server's switch; 0.3.69
+    /// shipped that gate with no way to open it from THIS binary, because
+    /// `diag::enable()` is called from ciris-server's own `main`, which we do
+    /// not run. The flag is one of the two openers — without it the route is
+    /// not gated, it is gone.
+    #[test]
+    fn diagnostics_flag_is_accepted_and_off_by_default() {
+        let (_, _, on) = parse(&["--diagnostics"]).unwrap();
+        assert!(on);
+        // Takes no value, and does not swallow the next argument.
+        let (home, key_id, on) =
+            parse(&["--diagnostics", "--home", "/data", "--key-id", "node-b"]).unwrap();
+        assert!(on);
+        assert_eq!(home, PathBuf::from("/data"));
+        assert_eq!(key_id, "node-b");
     }
 
     #[test]
     fn space_and_eq_forms_parse() {
-        let (home, key_id) = parse(&["--home", "/data", "--key-id", "ciris-status"]).unwrap();
+        let (home, key_id, _) = parse(&["--home", "/data", "--key-id", "ciris-status"]).unwrap();
         assert_eq!(home, PathBuf::from("/data"));
         assert_eq!(key_id, "ciris-status");
 
-        let (home, key_id) = parse(&["--home=/data", "--key-id=node-b"]).unwrap();
+        let (home, key_id, _) = parse(&["--home=/data", "--key-id=node-b"]).unwrap();
         assert_eq!(home, PathBuf::from("/data"));
         assert_eq!(key_id, "node-b");
     }
