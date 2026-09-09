@@ -137,11 +137,19 @@ capped glibc malloc arenas (CIRISStatus#69: -847MB committed, live unchanged)
 MALLOC_ARENA_MAX set in the environment — leaving the operator's value alone
 ```
 
-**Size `mem_limit` from a measurement, not from history.** The 1.5GB the US node
-carries was sized against an UNCAPPED process holding ~1.46GB committed, of
-which ~1.4GB was allocator free-list and ~44MB was live. With the cap the same
-work settles near ~611MB. After deploying, read the actual figure rather than
-guessing:
+**Size `mem_limit` from a measurement, not from history — and be ready to raise
+it.** The US node's original 1536m was sized against an UNCAPPED process holding
+~1.46GB committed, of which ~1.4GB was allocator free-list and ~44MB was live.
+Capped, the same work settles near ~611MB, so the limit was cut to 896m — and
+that turned out to be too tight: `memory.events max` climbed to 6,821 in 43
+minutes of steady state, with swap at only 40MB. **That was CACHE reclaim, not
+anon thrashing** — never an OOM risk, but this node reads its corpus constantly
+and evicting those pages repeatedly is the same class of cost as the first-load
+latency the status page is judged on. It now runs at 1216m with `max` back to 0.
+
+The rule that catches this is below, and it fired against the person who wrote
+it: **if `max` climbs, the limit goes UP.** After deploying, read the figure
+rather than guessing:
 
 ```sh
 curl -s localhost:4253/api/v1/debug/memory | jq '{
@@ -159,6 +167,20 @@ cat /sys/fs/cgroup/system.slice/docker-$(docker inspect -f '{{.Id}}' ciris-statu
 
 Headroom returned here is not free money — it is headroom `ciris-server` needs
 on the same host (CIRISServer#551), so it is worth reclaiming deliberately.
+
+**`malloc_trim` is a separate lever, and `keepcost` does NOT predict it.**
+`status.malloc_trim_secs` (default 0, off) calls `malloc_trim(0)` on a cadence.
+Measured on the canonical: `keepcost` was 3.9KB and the trim returned **172MB**
+of residency — `RssAnon` 271MB → 113MB — while `fordblks` and `arena` did not
+move at all. Since glibc 2.8 trim also `MADV_DONTNEED`s free pages INSIDE every
+arena, so it reaches what `keepcost` (top of the main arena only) says nothing
+about. It is off by default because the pages fault back in on reuse, which is a
+real cost for a churn workload; turn it on as an A/B, with the before/after in
+the log line it emits.
+
+Related, and worth not misreading: `fordblks` is address space, not resident
+memory. A node showing 769MB of free list against 313MB committed is not holding
+769MB.
 
 **Do not copy the arena cap to `ciris-server` expecting this result.** Same
 pathology, different composition: its largest single region is a ~706MB brk
