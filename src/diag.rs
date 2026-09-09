@@ -439,6 +439,16 @@ pub const MAX_WINDOW_MINS: u64 = 240;
 pub const MIN_WINDOW_MINS: u64 = 5;
 
 static CLOSES_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// The same deadline as WALL CLOCK seconds.
+///
+/// `Instant` is `CLOCK_MONOTONIC`, which does NOT advance while a host is
+/// suspended — so a machine suspended for a day resumes with almost the whole
+/// window left, past the deadline actually recorded on disk. The wall clock
+/// does advance across suspension, and the monotonic one is immune to the
+/// clock being moved backwards. Neither is sufficient alone, so the window is
+/// open only while BOTH say so: whichever expires first wins, and every failure
+/// mode of one is covered by the other (codex on #82).
+static CLOSES_AT_WALL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// Start the clock. Called once, beside `diag::enable`.
 /// The marker that makes the deadline survive a restart.
@@ -505,10 +515,28 @@ pub fn open_persisted_window(dir: &std::path::Path, mins: u64) -> WindowDecision
     match std::fs::read_to_string(&marker) {
         Ok(contents) => {
             return match contents.trim().parse::<u64>() {
-                Ok(deadline) if deadline > now => {
+                // A future deadline is not automatically a trustworthy one.
+                // If this host's clock is BEHIND the one that wrote the marker
+                // — a restored snapshot, a boot before NTP — the remaining time
+                // can be days. Anything beyond the maximum a window may be is
+                // evidence the two clocks disagree, not a long window
+                // (codex on #82).
+                Ok(deadline)
+                    if deadline > now && deadline - now <= MAX_WINDOW_MINS.saturating_mul(60) =>
+                {
                     let secs_left = deadline - now;
                     set_deadline(std::time::Duration::from_secs(secs_left));
                     WindowDecision::Resumed { secs_left }
+                }
+                Ok(deadline) if deadline > now => {
+                    tracing::warn!(
+                        marker = %marker.display(),
+                        secs_left = deadline - now,
+                        max_secs = MAX_WINDOW_MINS * 60,
+                        "diagnostics window marker is further ahead than any window may be — \
+                         clock skew, not a long window; staying closed"
+                    );
+                    WindowDecision::Spent
                 }
                 // Expired. The marker stays in place ON PURPOSE: it is the
                 // record saying "this window is over", and removing it is how
@@ -545,8 +573,15 @@ pub fn open_persisted_window(dir: &std::path::Path, mins: u64) -> WindowDecision
     // is the state the read arm above now has to defend against.
     let tmp = dir.join(format!("{WINDOW_MARKER}.tmp"));
     let deadline = now.saturating_add(secs);
-    if std::fs::write(&tmp, deadline.to_string()).is_err()
+    // Written, SYNCED, renamed, then the directory entry synced. Atomic
+    // visibility is not durability: without the syncs a power loss just after
+    // this returns can leave no marker at all, and recovery would read that as
+    // permission to open a fresh window — renewing the exposure this file
+    // exists to bound (codex on #82). Two fsyncs per window opened, which is
+    // once per operator action.
+    if write_durably(&tmp, &deadline.to_string()).is_err()
         || std::fs::rename(&tmp, &marker).is_err()
+        || sync_dir(dir).is_err()
     {
         let _ = std::fs::remove_file(&tmp);
         tracing::warn!(
@@ -559,7 +594,31 @@ pub fn open_persisted_window(dir: &std::path::Path, mins: u64) -> WindowDecision
     WindowDecision::Opened { mins }
 }
 
+/// Write and `fsync` the file itself, so the bytes are on the medium before the
+/// rename makes them visible.
+fn write_durably(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(contents.as_bytes())?;
+    f.sync_all()
+}
+
+/// `fsync` the DIRECTORY, so the rename itself survives a power loss. A synced
+/// file reachable only through an unsynced directory entry is still a file that
+/// can disappear.
+fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+fn now_wall() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn set_deadline(remaining: std::time::Duration) {
+    let _ = CLOSES_AT_WALL.set(now_wall().saturating_add(remaining.as_secs()));
     // Saturating, though the parser bounds this: arithmetic that can panic has
     // no business inside a control whose job is shutting something off.
     let deadline = std::time::Instant::now()
@@ -589,6 +648,12 @@ fn set_deadline(remaining: std::time::Duration) {
 /// route was never mounted, rather than a 403 that advertises there is
 /// something here to ask for.
 pub fn window_open() -> bool {
+    // Wall clock first: it is the one that notices a suspended host.
+    if let Some(wall_deadline) = CLOSES_AT_WALL.get() {
+        if now_wall() >= *wall_deadline {
+            return false;
+        }
+    }
     match CLOSES_AT.get() {
         Some(deadline) => std::time::Instant::now() < *deadline,
         // No window was opened, so nothing to expire: the gate above is the
@@ -736,6 +801,44 @@ mod persisted_window_tests {
             "the temp file must be renamed, not left"
         );
         assert!(marker_secs(&d) > 0);
+    }
+
+    /// A deadline further ahead than any window may be is CLOCK SKEW, not a
+    /// long window (codex on #82). A restored snapshot or a boot before NTP can
+    /// leave this host's clock behind the one that wrote the marker, and
+    /// converting that gap into a monotonic duration would hold the route open
+    /// for days — with a later clock correction unable to shorten it.
+    #[test]
+    fn a_deadline_beyond_the_maximum_is_skew_not_a_window() {
+        let d = Dir::new("skew");
+        let far = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + MAX_WINDOW_MINS * 60
+            + 60;
+        std::fs::write(d.0.join(WINDOW_MARKER), far.to_string()).unwrap();
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+    }
+
+    /// The boundary the arm above turns on: exactly at the maximum still
+    /// resumes, so an ordinary window written by a peer with a slightly fast
+    /// clock is not thrown away.
+    #[test]
+    fn a_deadline_at_exactly_the_maximum_still_resumes() {
+        let d = Dir::new("edge");
+        let at_max = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + MAX_WINDOW_MINS * 60;
+        std::fs::write(d.0.join(WINDOW_MARKER), at_max.to_string()).unwrap();
+        match open_persisted_window(&d.0, 120) {
+            WindowDecision::Resumed { secs_left } => {
+                assert!(secs_left <= MAX_WINDOW_MINS * 60);
+            }
+            other => panic!("the boundary must resume, not refuse: {other:?}"),
+        }
     }
 
     /// If the deadline cannot be recorded it cannot be enforced across a
