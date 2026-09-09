@@ -78,7 +78,11 @@ thing a caller sees when it was never mounted.
 **A restart does not renew it.** The deadline is absolute and lives on the data
 volume (`<data_dir>/diagnostics-window`), so a crash or `restart: unless-stopped`
 bounce inside the window RESUMES the original deadline, and a restart after it
-stays closed. Opening a new window is a deliberate act — remove the marker file.
+stays closed. Opening a new window is a deliberate act — remove the marker file. A marker that
+exists but is empty, malformed or unreadable keeps diagnostics CLOSED rather
+than being treated as absent: it is written atomically (temp + rename), so an
+unreadable one means something went wrong, and something-went-wrong is not
+permission to reopen an unauthenticated route.
 Restarting is not consent, and a container that bounces on its own must not be
 able to hold an unauthenticated route open.
 

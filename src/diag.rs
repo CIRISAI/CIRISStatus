@@ -491,26 +491,68 @@ pub fn open_persisted_window(dir: &std::path::Path, mins: u64) -> WindowDecision
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    if let Some(deadline) = std::fs::read_to_string(&marker)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-    {
-        if deadline > now {
-            let secs_left = deadline - now;
-            set_deadline(std::time::Duration::from_secs(secs_left));
-            return WindowDecision::Resumed { secs_left };
+    // THREE states, not two (codex on #82). `read_to_string(..).ok()` collapsed
+    // "absent", "unreadable" and "malformed" into the same `None`, and only the
+    // first of those is permission to open a window. The other two are a marker
+    // that EXISTS and cannot be trusted — treating them as absent lets a
+    // restart mint a fresh deadline, which is the hole this file was added to
+    // close.
+    //
+    // The malformed case is not hypothetical: `fs::write` truncates before
+    // writing, so a kill between those two steps leaves an empty marker. The
+    // automatic restart then reads nothing, decides the window is unopened, and
+    // renews it.
+    match std::fs::read_to_string(&marker) {
+        Ok(contents) => {
+            return match contents.trim().parse::<u64>() {
+                Ok(deadline) if deadline > now => {
+                    let secs_left = deadline - now;
+                    set_deadline(std::time::Duration::from_secs(secs_left));
+                    WindowDecision::Resumed { secs_left }
+                }
+                // Expired. The marker stays in place ON PURPOSE: it is the
+                // record saying "this window is over", and removing it is how
+                // an operator asks for another.
+                Ok(_) => WindowDecision::Spent,
+                // Unparseable — including the empty file a crashed write
+                // leaves. A marker we cannot read is not a marker we may
+                // ignore.
+                Err(_) => {
+                    tracing::warn!(
+                        marker = %marker.display(),
+                        "diagnostics window marker is unreadable — staying closed; remove it to \
+                         open a new window"
+                    );
+                    WindowDecision::Spent
+                }
+            };
         }
-        // A spent marker is left in place ON PURPOSE: it is the record that
-        // says "this window is over", and removing it is how an operator asks
-        // for another one.
-        return WindowDecision::Spent;
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                marker = %marker.display(),
+                error = %e,
+                "cannot read the diagnostics window marker — staying closed"
+            );
+            return WindowDecision::Spent;
+        }
     }
 
     let secs = mins.saturating_mul(60);
-    // If the marker cannot be written the window is not enforceable across a
-    // restart, so do not pretend it is — fail closed.
-    if std::fs::write(&marker, (now.saturating_add(secs)).to_string()).is_err() {
-        tracing::warn!(marker = %marker.display(), "cannot record the diagnostics window — staying closed");
+    // ATOMIC: write a temp file, then rename. A rename within one directory is
+    // atomic on POSIX, so a crash leaves either no marker or a complete one —
+    // never the truncated-empty file that `fs::write` can leave behind, which
+    // is the state the read arm above now has to defend against.
+    let tmp = dir.join(format!("{WINDOW_MARKER}.tmp"));
+    let deadline = now.saturating_add(secs);
+    if std::fs::write(&tmp, deadline.to_string()).is_err()
+        || std::fs::rename(&tmp, &marker).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(
+            marker = %marker.display(),
+            "cannot record the diagnostics window — staying closed"
+        );
         return WindowDecision::Spent;
     }
     set_deadline(std::time::Duration::from_secs(secs));
@@ -644,6 +686,56 @@ mod persisted_window_tests {
             open_persisted_window(&d.0, 30),
             WindowDecision::Opened { mins: 30 }
         );
+    }
+
+    /// The empty marker a crashed write leaves behind (codex on #82).
+    /// `fs::write` truncates before writing, so a kill between those steps
+    /// leaves a zero-byte file. Reading that as "no marker" would let the
+    /// automatic restart renew the window the marker exists to preserve.
+    #[test]
+    fn an_empty_marker_is_untrustworthy_not_absent() {
+        let d = Dir::new("empty");
+        std::fs::write(d.0.join(WINDOW_MARKER), "").unwrap();
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+        // Still empty: a marker we refused to trust is not one we overwrite.
+        assert_eq!(
+            std::fs::read_to_string(d.0.join(WINDOW_MARKER)).unwrap(),
+            ""
+        );
+    }
+
+    /// Same for garbage — a partial write, a corrupted volume, a human edit.
+    #[test]
+    fn a_malformed_marker_is_untrustworthy_not_absent() {
+        let d = Dir::new("garbage");
+        std::fs::write(d.0.join(WINDOW_MARKER), "soon-ish").unwrap();
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+    }
+
+    /// A marker that exists but cannot be READ is not permission either. A
+    /// directory in its place is the portable way to produce an I/O error that
+    /// is not NotFound (and unlike chmod, it holds when tests run as root).
+    #[test]
+    fn an_unreadable_marker_is_untrustworthy_not_absent() {
+        let d = Dir::new("unreadable");
+        std::fs::create_dir(d.0.join(WINDOW_MARKER)).unwrap();
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+    }
+
+    /// The write is atomic, so the truncated-empty state above cannot be
+    /// produced by a normal open: temp file, then rename, and no leftovers.
+    #[test]
+    fn opening_leaves_no_temp_file_behind() {
+        let d = Dir::new("atomic");
+        assert_eq!(
+            open_persisted_window(&d.0, 45),
+            WindowDecision::Opened { mins: 45 }
+        );
+        assert!(
+            !d.0.join(format!("{WINDOW_MARKER}.tmp")).exists(),
+            "the temp file must be renamed, not left"
+        );
+        assert!(marker_secs(&d) > 0);
     }
 
     /// If the deadline cannot be recorded it cannot be enforced across a
