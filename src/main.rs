@@ -114,29 +114,48 @@ async fn async_main(arena_cap: diag::ArenaCap) -> anyhow::Result<()> {
     // `routers()` asks `enabled()` while building.
     let diagnostics_mins = diagnostics_window
         .or_else(|| ciris_server::diag::env_requests().then_some(diag::DEFAULT_WINDOW_MINS));
-    if let Some(diagnostics_mins) = diagnostics_mins {
+
+    // Zero-env node config: derived entirely from `--home`/`--key-id` + config:*.
+    let cfg = ciris_server::ServerConfig::from_home(home, key_id)?;
+
+    // The window is decided HERE — after `data_dir` is known, because the
+    // deadline lives on the volume rather than in this process, and before
+    // `serve_with_adapter`, because `routers()` asks `enabled()` while building.
+    if let Some(mins) = diagnostics_mins {
         let source = if diagnostics_window.is_some() {
             "ciris-status --diagnostics"
         } else {
             "ciris-status CIRIS_DIAGNOSTICS"
         };
-        ciris_server::diag::enable(source);
-        // And it closes itself. The route is not loopback-bound here, so while
-        // it is open the edge proxy is the only thing between allocator
-        // internals and the internet — which makes "remember to turn it off" a
-        // security control, and it has already failed once: a reading that
-        // finished at 16:37 left the endpoint answering until 20:31.
-        diag::open_window(diagnostics_mins);
-        tracing::warn!(
-            source,
-            window_mins = diagnostics_mins,
-            "diagnostics OPEN — /api/v1/debug/memory answers until the window \
-             expires, then 404s; it is NOT loopback-gated here"
-        );
+        match diag::open_persisted_window(&cfg.data_dir, mins) {
+            diag::WindowDecision::Opened { mins } => {
+                ciris_server::diag::enable(source);
+                tracing::warn!(
+                    source,
+                    window_mins = mins,
+                    "diagnostics OPEN — /api/v1/debug/memory answers until the window expires, \
+                     then 404s. NOT loopback-gated here; keep it off the public edge"
+                );
+            }
+            diag::WindowDecision::Resumed { secs_left } => {
+                ciris_server::diag::enable(source);
+                tracing::warn!(
+                    source,
+                    secs_left,
+                    "diagnostics RESUMED — restarting does not extend the window; the original \
+                     deadline stands"
+                );
+            }
+            diag::WindowDecision::Spent => {
+                // Deliberately NOT enabled: a restart is not consent.
+                tracing::info!(
+                    marker = %cfg.data_dir.join(diag::WINDOW_MARKER).display(),
+                    "diagnostics requested but the window is SPENT — remove the marker to open a \
+                     new one; a restart alone will not"
+                );
+            }
+        }
     }
-
-    // Zero-env node config: derived entirely from `--home`/`--key-id` + config:*.
-    let cfg = ciris_server::ServerConfig::from_home(home, key_id)?;
     // The status page, as an adapter folded onto the node's shared core. It
     // resolves its own config:* at runtime from the AdapterContext; here it just
     // primes the HTTP client + live channel (no env, no corpus read yet).

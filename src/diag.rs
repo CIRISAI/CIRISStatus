@@ -441,13 +441,87 @@ pub const MIN_WINDOW_MINS: u64 = 5;
 static CLOSES_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Start the clock. Called once, beside `diag::enable`.
-pub fn open_window(mins: u64) {
-    // Saturating, though the parser already bounds this: arithmetic that can
-    // panic or wrap has no business inside a control whose whole job is to
-    // shut something off.
+/// The marker that makes the deadline survive a restart.
+///
+/// Lives in the data dir, so it shares the lifetime of the volume rather than
+/// the process.
+pub const WINDOW_MARKER: &str = "diagnostics-window";
+
+/// What [`open_persisted_window`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowDecision {
+    /// A new window was opened and recorded.
+    Opened { mins: u64 },
+    /// A restart landed inside a window someone else opened; the ORIGINAL
+    /// deadline stands, so restarting cannot extend it.
+    Resumed { secs_left: u64 },
+    /// The window is spent. Diagnostics stay closed until an operator clears
+    /// the marker — restarting is not consent.
+    Spent,
+}
+
+/// Open a window that a restart cannot renew.
+///
+/// # The hole this closes (codex on #82)
+///
+/// The first cut minted the deadline from `Instant::now()` at every process
+/// start. The canonical runs `restart: unless-stopped` with the flag in the
+/// container command, so:
+///
+/// * a crash inside the window reopened it,
+/// * repeated restarts extended it indefinitely, and
+/// * a restart AFTER expiry reopened a window that had already closed —
+///
+/// all without an operator asking for any of it. An expiry that any restart
+/// renews is not an expiry, which is the same criticism that produced the
+/// bound on the value: the mechanism has to hold when nobody is watching, and
+/// "nobody is watching" is exactly when a container restarts.
+///
+/// So the deadline is ABSOLUTE and on disk. A restart inside the window resumes
+/// the original one; a restart after it stays shut. Opening a new window is a
+/// deliberate act — remove the marker — rather than a side effect of the
+/// process dying.
+///
+/// Wall clock on disk (the deadline must outlive the process), monotonic in
+/// memory (the check must not care what the clock does afterwards).
+pub fn open_persisted_window(dir: &std::path::Path, mins: u64) -> WindowDecision {
+    let marker = dir.join(WINDOW_MARKER);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if let Some(deadline) = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        if deadline > now {
+            let secs_left = deadline - now;
+            set_deadline(std::time::Duration::from_secs(secs_left));
+            return WindowDecision::Resumed { secs_left };
+        }
+        // A spent marker is left in place ON PURPOSE: it is the record that
+        // says "this window is over", and removing it is how an operator asks
+        // for another one.
+        return WindowDecision::Spent;
+    }
+
     let secs = mins.saturating_mul(60);
+    // If the marker cannot be written the window is not enforceable across a
+    // restart, so do not pretend it is — fail closed.
+    if std::fs::write(&marker, (now.saturating_add(secs)).to_string()).is_err() {
+        tracing::warn!(marker = %marker.display(), "cannot record the diagnostics window — staying closed");
+        return WindowDecision::Spent;
+    }
+    set_deadline(std::time::Duration::from_secs(secs));
+    WindowDecision::Opened { mins }
+}
+
+fn set_deadline(remaining: std::time::Duration) {
+    // Saturating, though the parser bounds this: arithmetic that can panic has
+    // no business inside a control whose job is shutting something off.
     let deadline = std::time::Instant::now()
-        .checked_add(std::time::Duration::from_secs(secs))
+        .checked_add(remaining)
         .unwrap_or_else(std::time::Instant::now);
     let _ = CLOSES_AT.set(deadline);
 }
@@ -478,6 +552,106 @@ pub fn window_open() -> bool {
         // No window was opened, so nothing to expire: the gate above is the
         // only control, which is the pre-expiry behaviour.
         None => true,
+    }
+}
+
+#[cfg(test)]
+mod persisted_window_tests {
+    use super::*;
+
+    struct Dir(std::path::PathBuf);
+    impl Dir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let d =
+                std::env::temp_dir().join(format!("ciris-window-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            Dir(d)
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn marker_secs(d: &Dir) -> u64 {
+        std::fs::read_to_string(d.0.join(WINDOW_MARKER))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// A restart INSIDE the window resumes the original deadline. The canonical
+    /// runs `restart: unless-stopped` with the flag in the container command,
+    /// so if each start minted a fresh deadline a crashloop would hold an
+    /// unauthenticated route open indefinitely (codex on #82).
+    #[test]
+    fn a_restart_inside_the_window_does_not_extend_it() {
+        let d = Dir::new("resume");
+        assert_eq!(
+            open_persisted_window(&d.0, 60),
+            WindowDecision::Opened { mins: 60 }
+        );
+        let first_deadline = marker_secs(&d);
+
+        // Every subsequent start resumes; the deadline on disk never moves.
+        for _ in 0..3 {
+            match open_persisted_window(&d.0, 60) {
+                WindowDecision::Resumed { secs_left } => {
+                    assert!(secs_left <= 3600, "cannot exceed the original window");
+                }
+                other => panic!("a restart must resume, not reopen: {other:?}"),
+            }
+            assert_eq!(marker_secs(&d), first_deadline, "the deadline moved");
+        }
+    }
+
+    /// A restart AFTER expiry leaves it shut. Restarting is not consent, and a
+    /// process dying must not reopen a window that already closed.
+    #[test]
+    fn a_restart_after_expiry_stays_closed() {
+        let d = Dir::new("spent");
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 1;
+        std::fs::write(d.0.join(WINDOW_MARKER), past.to_string()).unwrap();
+
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+        // And it stays spent however many times the container bounces.
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+    }
+
+    /// Opening a NEW window is a deliberate act: clear the marker.
+    #[test]
+    fn clearing_the_marker_is_how_a_new_window_is_asked_for() {
+        let d = Dir::new("reopen");
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 1;
+        std::fs::write(d.0.join(WINDOW_MARKER), past.to_string()).unwrap();
+        assert_eq!(open_persisted_window(&d.0, 30), WindowDecision::Spent);
+
+        std::fs::remove_file(d.0.join(WINDOW_MARKER)).unwrap();
+        assert_eq!(
+            open_persisted_window(&d.0, 30),
+            WindowDecision::Opened { mins: 30 }
+        );
+    }
+
+    /// If the deadline cannot be recorded it cannot be enforced across a
+    /// restart, so the window does not open at all — fail closed.
+    #[test]
+    fn an_unwritable_marker_fails_closed() {
+        let missing = std::path::Path::new("/nonexistent-ciris-window-dir");
+        assert_eq!(open_persisted_window(missing, 60), WindowDecision::Spent);
     }
 }
 

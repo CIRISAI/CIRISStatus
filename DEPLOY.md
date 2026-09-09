@@ -75,6 +75,16 @@ environment:
 `--diagnostics=<5..240>` sets it. After that the route answers 404 — the same
 thing a caller sees when it was never mounted.
 
+**A restart does not renew it.** The deadline is absolute and lives on the data
+volume (`<data_dir>/diagnostics-window`), so a crash or `restart: unless-stopped`
+bounce inside the window RESUMES the original deadline, and a restart after it
+stays closed. Opening a new window is a deliberate act — remove the marker file.
+Restarting is not consent, and a container that bounces on its own must not be
+able to hold an unauthenticated route open.
+
+Boot says which happened: `diagnostics OPEN`, `diagnostics RESUMED` with the
+seconds left, or `diagnostics requested but the window is SPENT`.
+
 > `--diagnostics=1` is REFUSED with a migration error. 0.3.71 accepted that
 > spelling and ignored the value, so it meant "on"; here a number is minutes,
 > and silently turning it into a one-minute window would close the endpoint
