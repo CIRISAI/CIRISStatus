@@ -406,3 +406,465 @@ mod trim_tests {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The window closes itself.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How long `--diagnostics` stays open before the route stops answering.
+///
+/// Two hours: long enough for a soak that spans several poll cycles, short
+/// enough that forgetting costs a window rather than a weekend.
+pub const DEFAULT_WINDOW_MINS: u64 = 120;
+
+// A guardrail on the constant above, enforced by the COMPILER rather than by a
+// test run: too short and no real reading fits inside it; long enough to forget
+// for half a day and it stops being a window at all, which is the failure this
+// whole mechanism exists to prevent (a measurement that ended at 16:37 against
+// an endpoint that answered until 20:31).
+const _: () = assert!(DEFAULT_WINDOW_MINS >= 30 && DEFAULT_WINDOW_MINS <= MAX_WINDOW_MINS);
+
+/// The longest window an operator may ask for.
+///
+/// An expiry that can be set to 3,000 minutes is not an expiry — it is the
+/// forgotten-switch failure with extra steps, which is the thing this mechanism
+/// exists to remove. Four hours is past any single reading and still inside a
+/// working day, so an over-long window is a typo caught at boot rather than an
+/// exposure discovered later.
+pub const MAX_WINDOW_MINS: u64 = 240;
+
+/// The shortest. Below this a window is almost certainly a misread flag rather
+/// than a deliberate choice — see the `--diagnostics=1` case in
+/// `parse_diagnostics_window`.
+pub const MIN_WINDOW_MINS: u64 = 5;
+
+static CLOSES_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// The same deadline as WALL CLOCK seconds.
+///
+/// `Instant` is `CLOCK_MONOTONIC`, which does NOT advance while a host is
+/// suspended — so a machine suspended for a day resumes with almost the whole
+/// window left, past the deadline actually recorded on disk. The wall clock
+/// does advance across suspension, and the monotonic one is immune to the
+/// clock being moved backwards. Neither is sufficient alone, so the window is
+/// open only while BOTH say so: whichever expires first wins, and every failure
+/// mode of one is covered by the other (codex on #82).
+static CLOSES_AT_WALL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Start the clock. Called once, beside `diag::enable`.
+/// The marker that makes the deadline survive a restart.
+///
+/// Lives in the data dir, so it shares the lifetime of the volume rather than
+/// the process.
+pub const WINDOW_MARKER: &str = "diagnostics-window";
+
+/// What [`open_persisted_window`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowDecision {
+    /// A new window was opened and recorded.
+    Opened { mins: u64 },
+    /// A restart landed inside a window someone else opened; the ORIGINAL
+    /// deadline stands, so restarting cannot extend it.
+    Resumed { secs_left: u64 },
+    /// The window is spent. Diagnostics stay closed until an operator clears
+    /// the marker — restarting is not consent.
+    Spent,
+}
+
+/// Open a window that a restart cannot renew.
+///
+/// # The hole this closes (codex on #82)
+///
+/// The first cut minted the deadline from `Instant::now()` at every process
+/// start. The canonical runs `restart: unless-stopped` with the flag in the
+/// container command, so:
+///
+/// * a crash inside the window reopened it,
+/// * repeated restarts extended it indefinitely, and
+/// * a restart AFTER expiry reopened a window that had already closed —
+///
+/// all without an operator asking for any of it. An expiry that any restart
+/// renews is not an expiry, which is the same criticism that produced the
+/// bound on the value: the mechanism has to hold when nobody is watching, and
+/// "nobody is watching" is exactly when a container restarts.
+///
+/// So the deadline is ABSOLUTE and on disk. A restart inside the window resumes
+/// the original one; a restart after it stays shut. Opening a new window is a
+/// deliberate act — remove the marker — rather than a side effect of the
+/// process dying.
+///
+/// Wall clock on disk (the deadline must outlive the process), monotonic in
+/// memory (the check must not care what the clock does afterwards).
+pub fn open_persisted_window(dir: &std::path::Path, mins: u64) -> WindowDecision {
+    let marker = dir.join(WINDOW_MARKER);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // THREE states, not two (codex on #82). `read_to_string(..).ok()` collapsed
+    // "absent", "unreadable" and "malformed" into the same `None`, and only the
+    // first of those is permission to open a window. The other two are a marker
+    // that EXISTS and cannot be trusted — treating them as absent lets a
+    // restart mint a fresh deadline, which is the hole this file was added to
+    // close.
+    //
+    // The malformed case is not hypothetical: `fs::write` truncates before
+    // writing, so a kill between those two steps leaves an empty marker. The
+    // automatic restart then reads nothing, decides the window is unopened, and
+    // renews it.
+    match std::fs::read_to_string(&marker) {
+        Ok(contents) => {
+            return match contents.trim().parse::<u64>() {
+                // A future deadline is not automatically a trustworthy one.
+                // If this host's clock is BEHIND the one that wrote the marker
+                // — a restored snapshot, a boot before NTP — the remaining time
+                // can be days. Anything beyond the maximum a window may be is
+                // evidence the two clocks disagree, not a long window
+                // (codex on #82).
+                Ok(deadline)
+                    if deadline > now && deadline - now <= MAX_WINDOW_MINS.saturating_mul(60) =>
+                {
+                    let secs_left = deadline - now;
+                    set_deadline(std::time::Duration::from_secs(secs_left));
+                    WindowDecision::Resumed { secs_left }
+                }
+                Ok(deadline) if deadline > now => {
+                    tracing::warn!(
+                        marker = %marker.display(),
+                        secs_left = deadline - now,
+                        max_secs = MAX_WINDOW_MINS * 60,
+                        "diagnostics window marker is further ahead than any window may be — \
+                         clock skew, not a long window; staying closed"
+                    );
+                    WindowDecision::Spent
+                }
+                // Expired. The marker stays in place ON PURPOSE: it is the
+                // record saying "this window is over", and removing it is how
+                // an operator asks for another.
+                Ok(_) => WindowDecision::Spent,
+                // Unparseable — including the empty file a crashed write
+                // leaves. A marker we cannot read is not a marker we may
+                // ignore.
+                Err(_) => {
+                    tracing::warn!(
+                        marker = %marker.display(),
+                        "diagnostics window marker is unreadable — staying closed; remove it to \
+                         open a new window"
+                    );
+                    WindowDecision::Spent
+                }
+            };
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                marker = %marker.display(),
+                error = %e,
+                "cannot read the diagnostics window marker — staying closed"
+            );
+            return WindowDecision::Spent;
+        }
+    }
+
+    let secs = mins.saturating_mul(60);
+    // ATOMIC: write a temp file, then rename. A rename within one directory is
+    // atomic on POSIX, so a crash leaves either no marker or a complete one —
+    // never the truncated-empty file that `fs::write` can leave behind, which
+    // is the state the read arm above now has to defend against.
+    let tmp = dir.join(format!("{WINDOW_MARKER}.tmp"));
+    let deadline = now.saturating_add(secs);
+    // Written, SYNCED, renamed, then the directory entry synced. Atomic
+    // visibility is not durability: without the syncs a power loss just after
+    // this returns can leave no marker at all, and recovery would read that as
+    // permission to open a fresh window — renewing the exposure this file
+    // exists to bound (codex on #82). Two fsyncs per window opened, which is
+    // once per operator action.
+    if write_durably(&tmp, &deadline.to_string()).is_err()
+        || std::fs::rename(&tmp, &marker).is_err()
+        || sync_dir(dir).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(
+            marker = %marker.display(),
+            "cannot record the diagnostics window — staying closed"
+        );
+        return WindowDecision::Spent;
+    }
+    set_deadline(std::time::Duration::from_secs(secs));
+    WindowDecision::Opened { mins }
+}
+
+/// Write and `fsync` the file itself, so the bytes are on the medium before the
+/// rename makes them visible.
+fn write_durably(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(contents.as_bytes())?;
+    f.sync_all()
+}
+
+/// `fsync` the DIRECTORY, so the rename itself survives a power loss. A synced
+/// file reachable only through an unsynced directory entry is still a file that
+/// can disappear.
+fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+fn now_wall() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn set_deadline(remaining: std::time::Duration) {
+    let _ = CLOSES_AT_WALL.set(now_wall().saturating_add(remaining.as_secs()));
+    // Saturating, though the parser bounds this: arithmetic that can panic has
+    // no business inside a control whose job is shutting something off.
+    let deadline = std::time::Instant::now()
+        .checked_add(remaining)
+        .unwrap_or_else(std::time::Instant::now);
+    let _ = CLOSES_AT.set(deadline);
+}
+
+/// Is the window still open?
+///
+/// # Why an expiry and not just a switch
+///
+/// The route is not loopback-bound here — ciris-server pairs its gate with
+/// `require_loopback`, an adapter cannot — so while it is on, the only thing
+/// keeping allocator internals off the internet is the edge proxy. That makes
+/// "remember to turn it off" a security control, and it failed the first time
+/// it was used: a measurement that finished at 16:37 left the endpoint
+/// answering until 20:31, because the closing step lived in a person's session
+/// rather than in the process. Five and a half hours instead of the planned
+/// hundred minutes.
+///
+/// The measurement was made resilient to the operator's machine dying. The
+/// CLOSING was not. So the process holds the deadline now: nothing has to be
+/// remembered, and a session that ends early takes no exposure with it.
+///
+/// Closed, the handler answers 404 — the same thing a caller sees when the
+/// route was never mounted, rather than a 403 that advertises there is
+/// something here to ask for.
+pub fn window_open() -> bool {
+    // Wall clock first: it is the one that notices a suspended host.
+    if let Some(wall_deadline) = CLOSES_AT_WALL.get() {
+        if now_wall() >= *wall_deadline {
+            return false;
+        }
+    }
+    match CLOSES_AT.get() {
+        Some(deadline) => std::time::Instant::now() < *deadline,
+        // No window was opened, so nothing to expire: the gate above is the
+        // only control, which is the pre-expiry behaviour.
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod persisted_window_tests {
+    use super::*;
+
+    struct Dir(std::path::PathBuf);
+    impl Dir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let d =
+                std::env::temp_dir().join(format!("ciris-window-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            Dir(d)
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn marker_secs(d: &Dir) -> u64 {
+        std::fs::read_to_string(d.0.join(WINDOW_MARKER))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// A restart INSIDE the window resumes the original deadline. The canonical
+    /// runs `restart: unless-stopped` with the flag in the container command,
+    /// so if each start minted a fresh deadline a crashloop would hold an
+    /// unauthenticated route open indefinitely (codex on #82).
+    #[test]
+    fn a_restart_inside_the_window_does_not_extend_it() {
+        let d = Dir::new("resume");
+        assert_eq!(
+            open_persisted_window(&d.0, 60),
+            WindowDecision::Opened { mins: 60 }
+        );
+        let first_deadline = marker_secs(&d);
+
+        // Every subsequent start resumes; the deadline on disk never moves.
+        for _ in 0..3 {
+            match open_persisted_window(&d.0, 60) {
+                WindowDecision::Resumed { secs_left } => {
+                    assert!(secs_left <= 3600, "cannot exceed the original window");
+                }
+                other => panic!("a restart must resume, not reopen: {other:?}"),
+            }
+            assert_eq!(marker_secs(&d), first_deadline, "the deadline moved");
+        }
+    }
+
+    /// A restart AFTER expiry leaves it shut. Restarting is not consent, and a
+    /// process dying must not reopen a window that already closed.
+    #[test]
+    fn a_restart_after_expiry_stays_closed() {
+        let d = Dir::new("spent");
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 1;
+        std::fs::write(d.0.join(WINDOW_MARKER), past.to_string()).unwrap();
+
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+        // And it stays spent however many times the container bounces.
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+    }
+
+    /// Opening a NEW window is a deliberate act: clear the marker.
+    #[test]
+    fn clearing_the_marker_is_how_a_new_window_is_asked_for() {
+        let d = Dir::new("reopen");
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 1;
+        std::fs::write(d.0.join(WINDOW_MARKER), past.to_string()).unwrap();
+        assert_eq!(open_persisted_window(&d.0, 30), WindowDecision::Spent);
+
+        std::fs::remove_file(d.0.join(WINDOW_MARKER)).unwrap();
+        assert_eq!(
+            open_persisted_window(&d.0, 30),
+            WindowDecision::Opened { mins: 30 }
+        );
+    }
+
+    /// The empty marker a crashed write leaves behind (codex on #82).
+    /// `fs::write` truncates before writing, so a kill between those steps
+    /// leaves a zero-byte file. Reading that as "no marker" would let the
+    /// automatic restart renew the window the marker exists to preserve.
+    #[test]
+    fn an_empty_marker_is_untrustworthy_not_absent() {
+        let d = Dir::new("empty");
+        std::fs::write(d.0.join(WINDOW_MARKER), "").unwrap();
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+        // Still empty: a marker we refused to trust is not one we overwrite.
+        assert_eq!(
+            std::fs::read_to_string(d.0.join(WINDOW_MARKER)).unwrap(),
+            ""
+        );
+    }
+
+    /// Same for garbage — a partial write, a corrupted volume, a human edit.
+    #[test]
+    fn a_malformed_marker_is_untrustworthy_not_absent() {
+        let d = Dir::new("garbage");
+        std::fs::write(d.0.join(WINDOW_MARKER), "soon-ish").unwrap();
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+    }
+
+    /// A marker that exists but cannot be READ is not permission either. A
+    /// directory in its place is the portable way to produce an I/O error that
+    /// is not NotFound (and unlike chmod, it holds when tests run as root).
+    #[test]
+    fn an_unreadable_marker_is_untrustworthy_not_absent() {
+        let d = Dir::new("unreadable");
+        std::fs::create_dir(d.0.join(WINDOW_MARKER)).unwrap();
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+    }
+
+    /// The write is atomic, so the truncated-empty state above cannot be
+    /// produced by a normal open: temp file, then rename, and no leftovers.
+    #[test]
+    fn opening_leaves_no_temp_file_behind() {
+        let d = Dir::new("atomic");
+        assert_eq!(
+            open_persisted_window(&d.0, 45),
+            WindowDecision::Opened { mins: 45 }
+        );
+        assert!(
+            !d.0.join(format!("{WINDOW_MARKER}.tmp")).exists(),
+            "the temp file must be renamed, not left"
+        );
+        assert!(marker_secs(&d) > 0);
+    }
+
+    /// A deadline further ahead than any window may be is CLOCK SKEW, not a
+    /// long window (codex on #82). A restored snapshot or a boot before NTP can
+    /// leave this host's clock behind the one that wrote the marker, and
+    /// converting that gap into a monotonic duration would hold the route open
+    /// for days — with a later clock correction unable to shorten it.
+    #[test]
+    fn a_deadline_beyond_the_maximum_is_skew_not_a_window() {
+        let d = Dir::new("skew");
+        let far = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + MAX_WINDOW_MINS * 60
+            + 60;
+        std::fs::write(d.0.join(WINDOW_MARKER), far.to_string()).unwrap();
+        assert_eq!(open_persisted_window(&d.0, 120), WindowDecision::Spent);
+    }
+
+    /// The boundary the arm above turns on: exactly at the maximum still
+    /// resumes, so an ordinary window written by a peer with a slightly fast
+    /// clock is not thrown away.
+    #[test]
+    fn a_deadline_at_exactly_the_maximum_still_resumes() {
+        let d = Dir::new("edge");
+        let at_max = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + MAX_WINDOW_MINS * 60;
+        std::fs::write(d.0.join(WINDOW_MARKER), at_max.to_string()).unwrap();
+        match open_persisted_window(&d.0, 120) {
+            WindowDecision::Resumed { secs_left } => {
+                assert!(secs_left <= MAX_WINDOW_MINS * 60);
+            }
+            other => panic!("the boundary must resume, not refuse: {other:?}"),
+        }
+    }
+
+    /// If the deadline cannot be recorded it cannot be enforced across a
+    /// restart, so the window does not open at all — fail closed.
+    #[test]
+    fn an_unwritable_marker_fails_closed() {
+        let missing = std::path::Path::new("/nonexistent-ciris-window-dir");
+        assert_eq!(open_persisted_window(missing, 60), WindowDecision::Spent);
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    /// No window opened at all = the gate is the only control, which is how
+    /// this behaved before the expiry existed. An unopened window must not
+    /// read as an EXPIRED one, or a node running with diagnostics genuinely
+    /// off would start 404ing routes that were never gated.
+    #[test]
+    fn an_unopened_window_does_not_read_as_closed() {
+        // `CLOSES_AT` is a process-global OnceLock, so this only holds in a
+        // process where `open_window` was never called. Asserting the default
+        // rather than mutating it keeps the two tests independent.
+        if CLOSES_AT.get().is_none() {
+            assert!(window_open());
+        }
+    }
+}

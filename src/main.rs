@@ -97,7 +97,7 @@ async fn async_main(arena_cap: diag::ArenaCap) -> anyhow::Result<()> {
 
     // Default: serve the node + StatusAdapter. Reconstruct the arg iterator
     // (`first` was consumed by the subcommand peek).
-    let (home, key_id, diagnostics_flag) = parse_args(first.into_iter().chain(args))?;
+    let (home, key_id, diagnostics_window) = parse_args(first.into_iter().chain(args))?;
 
     // THE OPENER. 0.3.69 gated `/api/v1/debug/memory` on
     // `ciris_server::diag::enabled()` (CIRISStatus#73) — correct switch, and it
@@ -112,14 +112,50 @@ async fn async_main(arena_cap: diag::ArenaCap) -> anyhow::Result<()> {
     // `CIRIS_DIAGNOSTICS=1` (its env, read through its own parser so the truthy
     // set cannot drift from theirs). Before `serve_with_adapter`, because
     // `routers()` asks `enabled()` while building.
-    if diagnostics_flag {
-        ciris_server::diag::enable("ciris-status --diagnostics");
-    } else if ciris_server::diag::env_requests() {
-        ciris_server::diag::enable("ciris-status CIRIS_DIAGNOSTICS");
-    }
+    let diagnostics_mins = diagnostics_window
+        .or_else(|| ciris_server::diag::env_requests().then_some(diag::DEFAULT_WINDOW_MINS));
 
     // Zero-env node config: derived entirely from `--home`/`--key-id` + config:*.
     let cfg = ciris_server::ServerConfig::from_home(home, key_id)?;
+
+    // The window is decided HERE — after `data_dir` is known, because the
+    // deadline lives on the volume rather than in this process, and before
+    // `serve_with_adapter`, because `routers()` asks `enabled()` while building.
+    if let Some(mins) = diagnostics_mins {
+        let source = if diagnostics_window.is_some() {
+            "ciris-status --diagnostics"
+        } else {
+            "ciris-status CIRIS_DIAGNOSTICS"
+        };
+        match diag::open_persisted_window(&cfg.data_dir, mins) {
+            diag::WindowDecision::Opened { mins } => {
+                ciris_server::diag::enable(source);
+                tracing::warn!(
+                    source,
+                    window_mins = mins,
+                    "diagnostics OPEN — /api/v1/debug/memory answers until the window expires, \
+                     then 404s. NOT loopback-gated here; keep it off the public edge"
+                );
+            }
+            diag::WindowDecision::Resumed { secs_left } => {
+                ciris_server::diag::enable(source);
+                tracing::warn!(
+                    source,
+                    secs_left,
+                    "diagnostics RESUMED — restarting does not extend the window; the original \
+                     deadline stands"
+                );
+            }
+            diag::WindowDecision::Spent => {
+                // Deliberately NOT enabled: a restart is not consent.
+                tracing::info!(
+                    marker = %cfg.data_dir.join(diag::WINDOW_MARKER).display(),
+                    "diagnostics requested but the window is SPENT — remove the marker to open a \
+                     new one; a restart alone will not"
+                );
+            }
+        }
+    }
     // The status page, as an adapter folded onto the node's shared core. It
     // resolves its own config:* at runtime from the AdapterContext; here it just
     // primes the HTTP client + live channel (no env, no corpus read yet).
@@ -224,10 +260,62 @@ fn parse_config_value(raw: &str) -> ciris_server::ConfigValue {
 /// Parse `--home <path>` / `--key-id <name>` (both optional; `--flag=value` also
 /// accepted). Unknown args are an error — fail loud, never silently ignore a
 /// misspelled flag on the boot path. Mirrors ciris-server's `parse_serve_flags`.
-fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, String, bool)> {
+/// `--diagnostics` / `--diagnostics=<minutes>` → the window length.
+///
+/// # Two things this refuses, both on purpose
+///
+/// **An unbounded window.** `--diagnostics=3000` is fifty hours, which is not an
+/// expiry — it is the forgotten-switch failure with extra steps, and this route
+/// is not loopback-bound. Bounded at [`diag::MAX_WINDOW_MINS`], which also puts
+/// the value far inside the range where `mins * 60` cannot overflow.
+///
+/// **The 0.3.71 boolean spelling.** That release accepted `--diagnostics=1` and
+/// IGNORED the value, so it meant "on, for as long as the process lives". Here
+/// a number means minutes, so the same string would silently become a
+/// one-minute window — most of which a node spends booting, leaving an operator
+/// who copied a working command with an endpoint that vanished before they
+/// could read it. A meaning change that small and that quiet is worse than an
+/// error, so anything under [`diag::MIN_WINDOW_MINS`] is refused by name.
+fn parse_diagnostics_window(value: Option<&str>) -> anyhow::Result<u64> {
+    let Some(raw) = value else {
+        return Ok(diag::DEFAULT_WINDOW_MINS);
+    };
+    let mins: u64 = raw.trim().parse().map_err(|_| {
+        anyhow::anyhow!(
+            "--diagnostics takes minutes, e.g. --diagnostics=30, or bare --diagnostics for {} \
+             (got {raw:?})",
+            diag::DEFAULT_WINDOW_MINS
+        )
+    })?;
+    if mins < diag::MIN_WINDOW_MINS {
+        return Err(anyhow::anyhow!(
+            "--diagnostics={mins} is {mins} MINUTE(S), not a boolean. 0.3.71 accepted \
+             `--diagnostics=1` and ignored the value; here a number is the window length, so that \
+             spelling would open for one minute and close during boot. Use bare `--diagnostics` \
+             for {} minutes, or --diagnostics=<{}..{}>",
+            diag::DEFAULT_WINDOW_MINS,
+            diag::MIN_WINDOW_MINS,
+            diag::MAX_WINDOW_MINS
+        ));
+    }
+    if mins > diag::MAX_WINDOW_MINS {
+        return Err(anyhow::anyhow!(
+            "--diagnostics={mins} exceeds the {} minute maximum. This route is not loopback-bound; \
+             a window you can forget for two days is the failure the expiry exists to remove",
+            diag::MAX_WINDOW_MINS
+        ));
+    }
+    Ok(mins)
+}
+
+/// Returns `(home, key_id, diagnostics_window_mins)`. `None` for the window
+/// means diagnostics stay closed.
+fn parse_args(
+    args: impl Iterator<Item = String>,
+) -> anyhow::Result<(PathBuf, String, Option<u64>)> {
     let mut home: Option<String> = None;
     let mut key_id: Option<String> = None;
-    let mut diagnostics = false;
+    let mut diagnostics: Option<u64> = None;
 
     let mut it = args;
     while let Some(arg) = it.next() {
@@ -246,10 +334,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, St
         match name.as_str() {
             "--home" => home = Some(take("--home")?),
             "--key-id" => key_id = Some(take("--key-id")?),
-            // Mirrors ciris-server's own flag. Takes no value; `--diagnostics=1`
-            // is accepted too so an operator who types it either way gets what
-            // they meant rather than "needs a value".
-            "--diagnostics" => diagnostics = true,
+            // Mirrors ciris-server's own flag, plus an optional window:
+            // `--diagnostics` opens for the default, `--diagnostics=30` for
+            // thirty minutes. The value is optional via `=` only, so a bare
+            // `--diagnostics` never swallows the argument after it.
+            "--diagnostics" => diagnostics = Some(parse_diagnostics_window(eq_value.as_deref())?),
             other => {
                 return Err(anyhow::anyhow!(
                     "unknown arg: {other} (usage: ciris-status [--home <path>] [--key-id <name>] \
@@ -270,7 +359,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, St
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> anyhow::Result<(PathBuf, String, bool)> {
+    fn parse(args: &[&str]) -> anyhow::Result<(PathBuf, String, Option<u64>)> {
         parse_args(args.iter().map(|s| s.to_string()))
     }
 
@@ -279,7 +368,10 @@ mod tests {
         let (home, key_id, diagnostics) = parse(&[]).unwrap();
         assert_eq!(home, PathBuf::from(DEFAULT_HOME));
         assert_eq!(key_id, DEFAULT_KEY_ID);
-        assert!(!diagnostics, "diagnostics stay OFF unless asked for");
+        assert!(
+            diagnostics.is_none(),
+            "diagnostics stay OFF unless asked for"
+        );
     }
 
     /// CIRISStatus#73 gated the memory route on the server's switch; 0.3.69
@@ -289,14 +381,67 @@ mod tests {
     /// not gated, it is gone.
     #[test]
     fn diagnostics_flag_is_accepted_and_off_by_default() {
-        let (_, _, on) = parse(&["--diagnostics"]).unwrap();
-        assert!(on);
-        // Takes no value, and does not swallow the next argument.
-        let (home, key_id, on) =
+        let (_, _, w) = parse(&["--diagnostics"]).unwrap();
+        assert_eq!(w, Some(diag::DEFAULT_WINDOW_MINS));
+
+        // Bare form takes no value, so it must not swallow the next argument.
+        let (home, key_id, w) =
             parse(&["--diagnostics", "--home", "/data", "--key-id", "node-b"]).unwrap();
-        assert!(on);
+        assert_eq!(w, Some(diag::DEFAULT_WINDOW_MINS));
         assert_eq!(home, PathBuf::from("/data"));
         assert_eq!(key_id, "node-b");
+    }
+
+    /// The window is the point: an operator who wants a short exposure gets to
+    /// ask for one, and a typo does not silently become something else.
+    #[test]
+    fn the_diagnostics_window_is_settable_and_a_bad_value_is_refused() {
+        let (_, _, w) = parse(&["--diagnostics=30"]).unwrap();
+        assert_eq!(w, Some(30));
+        assert!(parse(&["--diagnostics=soon"]).is_err());
+        assert!(parse(&["--diagnostics="]).is_err());
+    }
+
+    /// Codex on #82: an expiry that accepts 3000 minutes is not an expiry. The
+    /// bound also keeps the value far below where `mins * 60` could overflow.
+    #[test]
+    fn an_over_long_window_is_refused() {
+        assert_eq!(
+            parse(&["--diagnostics=240"]).unwrap().2,
+            Some(diag::MAX_WINDOW_MINS)
+        );
+        for absurd in [
+            "--diagnostics=241",
+            "--diagnostics=3000",
+            "--diagnostics=18446744073709551615",
+        ] {
+            let e = parse(&[absurd]).unwrap_err().to_string();
+            assert!(
+                e.contains("maximum") || e.contains("minutes"),
+                "{absurd} must be refused with a reason: {e}"
+            );
+        }
+    }
+
+    /// Codex on #82: 0.3.71 accepted `--diagnostics=1` and ignored the value,
+    /// so it meant "on". Here a number is minutes — the same string would open
+    /// a one-minute window that closes during boot, and an operator who copied
+    /// a working command would find the endpoint gone before they could read
+    /// it. Refused by name rather than silently reinterpreted.
+    #[test]
+    fn the_0_3_71_boolean_spelling_is_refused_not_reinterpreted() {
+        for legacy in ["--diagnostics=1", "--diagnostics=0", "--diagnostics=4"] {
+            let e = parse(&[legacy]).unwrap_err().to_string();
+            assert!(
+                e.contains("0.3.71") && e.contains("bare `--diagnostics`"),
+                "{legacy} must name the meaning change and the fix: {e}"
+            );
+        }
+        // And the spelling it points at works.
+        assert_eq!(
+            parse(&["--diagnostics"]).unwrap().2,
+            Some(diag::DEFAULT_WINDOW_MINS)
+        );
     }
 
     #[test]

@@ -293,8 +293,15 @@ async fn scoring(State(st): State<AppState>) -> impl IntoResponse {
 /// Read-only and allocation-free in the sense that matters — it reports, it
 /// does not trim. Deciding to release memory is a separate act from measuring
 /// it, and this endpoint deliberately does not take that decision.
-async fn debug_memory() -> impl IntoResponse {
-    Json(crate::diag::memory_report())
+async fn debug_memory() -> Response {
+    // The window closes itself (`diag::window_open`). Past it, this answers
+    // exactly as it does when the gate was never opened — a 404, not a 403 —
+    // so an expired window and an absent route are indistinguishable to a
+    // caller. Nothing to remember, and no hint that there is something here.
+    if !crate::diag::window_open() {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    Json(crate::diag::memory_report()).into_response()
 }
 
 /// `GET /api/v1/ci` — the substrate's last-N build states per repo, served from
