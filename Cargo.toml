@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.72"
+version = "0.3.73"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -233,7 +233,19 @@ libc = "0.2"
 # that path runs here — the pin moves so the two nodes on the canonical host
 # run one server build. Substrate unchanged: persist v42.0.0 / edge v21.0.0 /
 # verify v15.0.0 / leviculum v0.25.0+ciris.1.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.204" }
+# PINNED TO A SHA, NOT A TAG — deliberately, and temporarily.
+#
+# CIRISServer#576 (the loop-stagger fix for our CIRISStatus#69/CIRISServer#575
+# burst measurements) and #578 (a worker-thread cap) are on main and not yet in
+# a release. This node is the one that measured the stalls those fix, so it is
+# the one that should verify them; waiting for a tag means the evidence goes
+# stale on the box that produced it.
+#
+# What a SHA costs, stated so the next repin fixes it rather than inherits it:
+# it is not reproducible from a tag, `cargo update -p ciris-server` cannot move
+# it, and a force-push to main would strip the commit out from under the lock.
+# Move this back to `tag =` at the next release that contains 2d9d9fa.
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", rev = "2d9d9fa50b17026642790bc2faadbdf1a47ec41a" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
