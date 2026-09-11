@@ -880,8 +880,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-crypto"
-version = "15.0.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.0.0#3531334e829395f0c2664aff1a3277981bcbd086"
+version = "15.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.1.0#cbd75fed3e7513eed53a0c34a0b232a6430105ad"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -907,8 +907,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "21.1.0"
-source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v21.1.0#4dca38d77fdbb3ff15fb08735ab0457a3cba4cdc"
+version = "23.0.0"
+source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v23.0.0#681d5999f6ff74083247097b70057d8a8b37ea83"
 dependencies = [
  "async-trait",
  "axum",
@@ -959,8 +959,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-keyring"
-version = "15.0.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.0.0#3531334e829395f0c2664aff1a3277981bcbd086"
+version = "15.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.1.0#cbd75fed3e7513eed53a0c34a0b232a6430105ad"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -997,7 +997,7 @@ dependencies = [
 [[package]]
 name = "ciris-lens-core"
 version = "1.4.4"
-source = "git+https://github.com/CIRISAI/CIRISServer?rev=2d9d9fa50b17026642790bc2faadbdf1a47ec41a#2d9d9fa50b17026642790bc2faadbdf1a47ec41a"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.205#4239e429af33dfdd6e2b3b5de580588e56889ce4"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1023,8 +1023,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "42.1.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v42.1.0#00bc08e52a114c1099cb083af9d043ebfa73800f"
+version = "44.0.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v44.0.0#8d5e8601ee13fe0ed35031e1520034ec6d50374e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1068,8 +1068,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-server"
-version = "0.5.204"
-source = "git+https://github.com/CIRISAI/CIRISServer?rev=2d9d9fa50b17026642790bc2faadbdf1a47ec41a#2d9d9fa50b17026642790bc2faadbdf1a47ec41a"
+version = "0.5.205"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.205#4239e429af33dfdd6e2b3b5de580588e56889ce4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-status"
-version = "0.3.73"
+version = "0.3.74"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1137,8 +1137,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-verify-core"
-version = "15.0.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.0.0#3531334e829395f0c2664aff1a3277981bcbd086"
+version = "15.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.1.0#cbd75fed3e7513eed53a0c34a0b232a6430105ad"
 dependencies = [
  "android_system_properties",
  "async-trait",
@@ -3506,7 +3506,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 [[package]]
 name = "leviculum-ble-tx"
 version = "0.1.0"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.25.0%2Bciris.1#381bc31d2b2c33e35bf8f2a7880aaf0803c11ca1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.26.0%2Bciris.1#85fb1eaa82350490b06070e63f233303f27a9bcb"
 dependencies = [
  "embassy-sync",
  "leviculum-core",
@@ -3514,8 +3514,8 @@ dependencies = [
 
 [[package]]
 name = "leviculum-core"
-version = "0.25.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.25.0%2Bciris.1#381bc31d2b2c33e35bf8f2a7880aaf0803c11ca1"
+version = "0.26.0+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.26.0%2Bciris.1#85fb1eaa82350490b06070e63f233303f27a9bcb"
 dependencies = [
  "aes",
  "cbc",
@@ -3532,8 +3532,8 @@ dependencies = [
 
 [[package]]
 name = "leviculum-lxmf"
-version = "0.25.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.25.0%2Bciris.1#381bc31d2b2c33e35bf8f2a7880aaf0803c11ca1"
+version = "0.26.0+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.26.0%2Bciris.1#85fb1eaa82350490b06070e63f233303f27a9bcb"
 dependencies = [
  "leviculum-core",
  "rand_core 0.6.4",
@@ -3543,8 +3543,8 @@ dependencies = [
 
 [[package]]
 name = "leviculum-std"
-version = "0.25.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.25.0%2Bciris.1#381bc31d2b2c33e35bf8f2a7880aaf0803c11ca1"
+version = "0.26.0+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.26.0%2Bciris.1#85fb1eaa82350490b06070e63f233303f27a9bcb"
 dependencies = [
  "bluer",
  "clap",
