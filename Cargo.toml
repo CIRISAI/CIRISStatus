@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.74"
+version = "0.3.75"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -279,7 +279,40 @@ libc = "0.2"
 # direction it was promised: 2d9d9fa is an ancestor of v0.5.205 (verified with
 # `git merge-base --is-ancestor`), so the same code arrives reproducibly, moves
 # under `cargo update -p ciris-server`, and survives a force-push to main.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.205" }
+# 0.5.206 — THE UNBRICK (2026-09-11, CIRISServer#588/#587). Substrate:
+# persist v44.0.0 -> v44.1.1 / edge v23.0.0 -> v23.1.1; verify v15.1.0 and
+# leviculum v0.26.0+ciris.1 unchanged.
+#
+# 0.5.205 — WHICH THIS REPO TAGGED AS 0.3.74 AND, BY LUCK RATHER THAN JUDGEMENT,
+# NEVER DEPLOYED — could not open a database that had history. CIRISPersist#840:
+# a one-word edit inside a SQL COMMENT in migration V070 changed its refinery
+# checksum, so any node that applied V070 before 2026-09-09 failed validation
+# inside `Engine::with_*` BEFORE ANYTHING BOUND. persist v43.0.0 through v44.1.0
+# are all in that range. It took the canonical down ~7 minutes and crash-looped
+# it 16 times. v44.1.1 reverts V070 to its v42.1.0 bytes (verified byte-identical
+# upstream, both dialects), normalises the history row for nodes created under
+# the broken releases, and pins every migration checksum so the class cannot
+# recur.
+#
+# THIS NODE IS SQUARELY IN THE AFFECTED CLASS and would have crash-looped the
+# same way: prod carries a real corpus whose V070 predates the edit. It survived
+# only because 0.3.74 sat undeployed — prod is still on 0.3.70 / persist v42.1.0,
+# below the broken range. The deploy that was recommended the night before this
+# tag would have bricked it.
+#
+# WHY NOTHING CAUGHT IT, AND WHY THAT INDICTS OUR CI TOO. A FRESH database
+# applies the current migration and records the current checksum, so there is
+# nothing to mismatch — the failure is invisible to every node that starts from
+# an empty data dir. Upstream's 122 integration binaries and both ladders were
+# green on the broken pin. So is our `image-runtime-smoke`: it boots the image on
+# a clean volume, which is precisely the shape of test that cannot see this. A
+# node whose whole job is to hold a corpus across restarts is not covered by a
+# lane that never restarts onto one (CIRISStatus#86).
+#
+# edge v23.1.1 (CIRISEdge#586/#581): `chat::Body` gains `Pointer` — group content
+# moves to the room's encrypted blob store and the row carries a pointer. No chat
+# surface here. `BlobChunkVerifier` has no call sites in this crate.
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.206" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
