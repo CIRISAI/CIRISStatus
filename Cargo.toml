@@ -1,6 +1,6 @@
 [package]
 name = "ciris-status"
-version = "0.3.73"
+version = "0.3.74"
 edition = "2021"
 description = "The ciris.ai public health/status surface — now a ciris-server fabric node + a StatusAdapter (mirrors CIRISAgent's adapter model). Serves /health, /v1/status, /api/v1/status, /api/v1/status/history + the public scoring roster (Flow A, own corpus) + live SSE/WS, by live outbound probes + a SQLite uptime history. The federation node (engine, edge, consent:replication, read API, ownership, safety, NAT-traversal) is ciris-server's serve; the status page is the adapter."
 license = "AGPL-3.0-or-later"
@@ -233,19 +233,53 @@ libc = "0.2"
 # that path runs here — the pin moves so the two nodes on the canonical host
 # run one server build. Substrate unchanged: persist v42.0.0 / edge v21.0.0 /
 # verify v15.0.0 / leviculum v0.25.0+ciris.1.
-# PINNED TO A SHA, NOT A TAG — deliberately, and temporarily.
+# 0.5.205 — THE READ POOL LANDS, AND THE SHA PIN GOES BACK TO A TAG
+# (2026-09-10, CIRISServer#585/#584). The substrate MOVES, hard: persist
+# v42.1.0 -> v44.0.0 (across two majors) / edge v21.1.0 -> v23.0.0 (two
+# majors) / verify v15.0.0 -> v15.1.0 / leviculum v0.25.0+ciris.1 ->
+# v0.26.0+ciris.1. Every one of those is transitive through this single pin,
+# which is why this repo has no second copy to keep in step.
 #
-# CIRISServer#576 (the loop-stagger fix for our CIRISStatus#69/CIRISServer#575
-# burst measurements) and #578 (a worker-thread cap) are on main and not yet in
-# a release. This node is the one that measured the stalls those fix, so it is
-# the one that should verify them; waiting for a tag means the evidence goes
-# stale on the box that produced it.
+# THIS IS THE OTHER HALF OF OUR OWN MEASUREMENT. CIRISStatus#69 -> CIRISServer#575
+# is where this node reported that GET /v1/identity went p50 1.1 ms -> 780 ms
+# inside a burst at 6.9% duty with zero non-200s, and CIRISPersist#829 is where
+# that bottomed out: every read ran inline-sync on the request-serving runtime
+# behind ONE connection mutex, so two readers serialised no matter how the
+# callers were phased. v0.5.204 (adopted here in 0.3.70) de-phased the colliding
+# loops — the part a scheduler fix can reach. persist v43.1.0, carried by v44,
+# reaches the rest: one writer connection plus a POOL of read-only WAL
+# connections, and every SQL call — and the wait for its connection — dispatched
+# off the tokio worker onto the blocking pool
+# (FSD/SQLITE_CONNECTION_MODEL.md). This node is Flow A: the roster walks
+# `list_scores` over its own corpus while the same runtime serves the status
+# API, which is precisely the two-reader case.
 #
-# What a SHA costs, stated so the next repin fixes it rather than inherits it:
-# it is not reproducible from a tag, `cargo update -p ciris-server` cannot move
-# it, and a force-push to main would strip the commit out from under the lock.
-# Move this back to `tag =` at the next release that contains 2d9d9fa.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", rev = "2d9d9fa50b17026642790bc2faadbdf1a47ec41a" }
+# THE WORKER CAP FROM 0.3.73 IS RE-AIMED BY ITS OWN EVIDENCE. CIRISServer#578
+# (which we carried by SHA) capped worker threads; #577's own table shows
+# `ciris-edge-tran` flat at 2/2 on both a 32-core and a 4-core host, so the 64
+# unnamed `tokio-rt-worker` threads it counted were never edge's workers. What
+# was uncapped is `max_blocking_threads` — tokio's default is 512 PER RUNTIME —
+# and the read pool is exactly what makes that pool load-bearing. `node_runtime`
+# now caps it at 32 with a HARD floor of 16, because `block_in_place` draws its
+# replacement worker from that same pool: starve it and the runtime WEDGES
+# rather than slows (CIRISServer#446/#501, one pool over). We call
+# `node_runtime::build` and inherit the cap; we set no override. The env var
+# that tunes it (`CIRIS_RUNTIME_MAX_BLOCKING_THREADS`) is an upstream escape
+# hatch we do not use — DEPLOY.md §2 is intact, the default applies unset.
+#
+# Neither source break in this cut touches us: `register_observed_claim` now
+# names what a claim PROVED (CIRISEdge#582 — signing a holding claim required
+# holding nothing, so Sybils could vote honest copies into deletion) and
+# `BlobChunkSource` changed shape; this crate has no call site for either, and
+# `AvDispatcherError::Congested` breaks no exhaustive match of ours.
+#
+# And the pin is a TAG again. 0.3.73 carried #576 + #578 by SHA because this is
+# the node that measured the stalls they fix and waiting for a release meant the
+# evidence going stale on the box that produced it. That debt is now paid in the
+# direction it was promised: 2d9d9fa is an ancestor of v0.5.205 (verified with
+# `git merge-base --is-ancestor`), so the same code arrives reproducibly, moves
+# under `cargo update -p ciris-server`, and survives a force-push to main.
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.205" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
