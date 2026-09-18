@@ -907,8 +907,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "23.1.1"
-source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v23.1.1#c9a6e728b0bd6d364a4aff853b21ac87ee52f6ef"
+version = "24.2.0"
+source = "git+https://github.com/CIRISAI/CIRISEdge?tag=v24.2.0#647271edc3b8c4003d784788d5cabfdcf6e92f3d"
 dependencies = [
  "async-trait",
  "axum",
@@ -997,7 +997,7 @@ dependencies = [
 [[package]]
 name = "ciris-lens-core"
 version = "1.4.4"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.206#44883c4cea3a11f83fd7e6172e90cb9b6febc6cc"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.209#a20d1d167b058eb6e52b1f202ae324d59321841d"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1023,8 +1023,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "44.1.1"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v44.1.1#38af167f8110fde390afad0e8372306657bca3c0"
+version = "44.4.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v44.4.0#2136da8b49052cb37c250af07a2d54551c4f9845"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1068,8 +1068,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-server"
-version = "0.5.206"
-source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.206#44883c4cea3a11f83fd7e6172e90cb9b6febc6cc"
+version = "0.5.209"
+source = "git+https://github.com/CIRISAI/CIRISServer?tag=v0.5.209#a20d1d167b058eb6e52b1f202ae324d59321841d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-status"
-version = "0.3.75"
+version = "0.3.76"
 dependencies = [
  "anyhow",
  "async-trait",
