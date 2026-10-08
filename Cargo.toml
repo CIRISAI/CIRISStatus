@@ -312,7 +312,47 @@ libc = "0.2"
 # edge v23.1.1 (CIRISEdge#586/#581): `chat::Body` gains `Pointer` — group content
 # moves to the room's encrypted blob store and the row carries a pointer. No chat
 # surface here. `BlobChunkVerifier` has no call sites in this crate.
-ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.206" }
+# 0.5.224 — EIGHTEEN RELEASES IN ONE STEP (2026-10-08). The substrate moves
+# further than any repin before it, and every bit of it transitively through
+# this one pin: persist v44.1.1 -> v53.1.8 (NINE majors), edge v23.1.1 ->
+# v40.0.8 (SEVENTEEN), verify v15.1.0 -> v19.0.0 (FOUR), leviculum
+# v0.26.0+ciris.1 -> v0.27.0+ciris.1 (plus two new member crates,
+# announce-policy and channel-access).
+#
+# ZERO SOURCE BREAKS, and that is a fact about our surface rather than luck.
+# This crate calls `serve_with_adapter`, `node_runtime::build`, `graph_config`,
+# `run_config_get/set`, and a narrow slice of persist's federation types. Nine
+# persist majors went past without touching any of it. Stated because the
+# opposite would also be worth knowing: the span that reshaped chat, drive,
+# device rosters, genesis and the trace plane did not reach the status page,
+# which is what being a thin adapter over `serve` is supposed to buy.
+#
+# THE MIGRATION PATH IS VERIFIED, NOT ASSUMED — the CIRISStatus#86 lesson
+# applied by hand because the lane does not exist yet. Nine persist majors mean
+# migrations, and migrations are what bricked 0.5.205 while passing every gate.
+# So: prod's schema + `refinery_schema_history` were exported (no row data),
+# rebuilt locally, and opened with this substrate:
+#
+#   current version: 143 -> going to apply 33 migrations -> V144..V181, exit 0
+#   V070 checksum 7163486563775091993 intact, no validation refusal
+#
+# That covers the checksum-validation class exactly. It does NOT cover a
+# data-dependent backfill, because the reconstruction carries no rows — the
+# honest limit of a hand check, and the reason #86 wants a real volume.
+#
+# WHAT MATTERS HERE FOR THE PENDING CONSENT WORK (the bridge's ask: have the
+# canonical replicate `capacity:*` to this node). 0.5.219 made a consent a
+# claim — `consent` and `watchlist_config` rows now ride `scores`. And the
+# prefix semantics are NOT what FSD/CONSENT_DX_FOR_CAPACITY_SCORING.md says:
+# that doc's floor is 0.5.139 and it is now half stale. In 0.5.224
+# `POST /v1/federation/consent` REFUSES an empty `attestation_prefixes`
+# (federation_admin.rs:621), but the withhold is still decided on send-set
+# membership BEFORE any prefix is consulted (peer.rs:270) — prefixes gate which
+# rows the consent sweep PLACES, via `resolve_row_placement`, not which rows a
+# peer in the send-set receives. So `["capacity:"]` is the correct declaration
+# and is not a containment boundary. Any grant naming this node opens the
+# non-`trace:` federation-tier plane the offer filter passes.
+ciris-server = { git = "https://github.com/CIRISAI/CIRISServer", tag = "v0.5.224" }
 
 # NO ciris-persist PIN. persist arrives through ciris-server's `pub use
 # ciris_persist` re-export, so this crate cannot resolve a different persist
